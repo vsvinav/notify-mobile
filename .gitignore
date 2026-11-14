@@ -1,0 +1,13 @@
+node_modules/
+artifacts/
+.impeccable/review/
+test-results/
+playwright-report/
+.test-data/
+.impeccable/
+.github/skills/impeccable/
+.github/agents/impeccable-*.agent.md
+.github/hooks/impeccable.json
+DESIGN.md
+PRODUCT.md
+docs/superpowers/

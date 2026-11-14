@@ -1,0 +1,15 @@
+{
+  "id": "/",
+  "name": "Notify",
+  "short_name": "Notify",
+  "description": "Review Notify requests on your local network.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#eae3d8",
+  "theme_color": "#f0e8dc",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "notify-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "NODE_TLS_REJECT_UNAUTHORIZED=1 node --test test/*.test.mjs",
+    "test:browser": "NODE_TLS_REJECT_UNAUTHORIZED=1 PLAYWRIGHT_BROWSERS_PATH=0 playwright test"
+  },
+  "dependencies": { "web-push": "4.0.0" },
+  "devDependencies": { "@playwright/test": "1.65.1" }
+}
