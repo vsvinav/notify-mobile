@@ -30,6 +30,46 @@ test('pairing requires comparison confirmation and consumes a single expiring in
   assert.equal((await stat(`${f.directory}/state.json`)).mode & 0o777, 0o600);
 });
 
+test('pending comparison survives consumed invite and emits authoritative clear on expiry', async t => {
+  let clock = Date.now();
+  const f = await fixture({ now: () => clock }); t.after(f.close);
+  await f.app.command({ type: 'invite' });
+  const code = f.events.at(-1).status.pairingCode;
+  const pending = await f.call('/api/pair', { code, name: 'Pending phone' });
+  const id = f.events.findLast(e => e.type === 'pairing').id;
+  const consumed = f.events.findLast(e => e.type === 'status').status;
+  assert.equal(consumed.pairingCode, undefined);
+  assert.deepEqual(consumed.pendingPairingIDs, [id]);
+  await f.app.command({ type: 'snapshot', requests: [], total: 0 });
+  assert.deepEqual(f.events.findLast(e => e.type === 'status').status.pendingPairingIDs, [id]);
+  await f.app.command({ type: 'offline' });
+  const eventCount = f.events.length;
+  clock += 180001;
+  // The real server timer must emit a clear without another native command.
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  const expired = f.events.slice(eventCount).filter(e => e.type === 'status').at(-1);
+  assert.ok(expired, 'expiry must emit an unsolicited status update');
+  assert.deepEqual(expired.status.pendingPairingIDs, []);
+  assert.equal((await f.call('/api/pair-status', {}, { cookie: pending.cookie })).status, 401);
+  await assert.rejects(f.app.command({ type: 'pair', id, allow: true }), /expired/);
+});
+
+test('accepting or rejecting a comparison clears only that pending ID', async t => {
+  const f = await fixture(); t.after(f.close);
+  const ids = [];
+  for (const name of ['Accepted phone', 'Declined phone']) {
+    await f.app.command({ type: 'invite' });
+    const code = f.events.at(-1).status.pairingCode;
+    await f.call('/api/pair', { code, name });
+    ids.push(f.events.findLast(e => e.type === 'pairing').id);
+  }
+  assert.deepEqual(f.events.findLast(e => e.type === 'status').status.pendingPairingIDs, ids);
+  await f.app.command({ type: 'pair', id: ids[0], allow: true });
+  assert.deepEqual(f.events.findLast(e => e.type === 'status').status.pendingPairingIDs, [ids[1]]);
+  await f.app.command({ type: 'pair', id: ids[1], allow: false });
+  assert.deepEqual(f.events.findLast(e => e.type === 'status').status.pendingPairingIDs, []);
+});
+
 test('HTTPS authentication, origin, host, content type, body limits and bootstrap isolation', async t => {
   const f = await fixture(); t.after(f.close);
   const { cookie } = await pair(f);

@@ -124,6 +124,9 @@ export async function createCompanion({
     emit({ type: 'status', status: {
       url: app.url, setupURL: app.setupURL, fingerprint: tls.fingerprint,
       ...(invite ? { pairingCode: invite.code } : {}),
+      pendingPairingIDs: [...pendingPairs.values()]
+        .filter(pending => pending.state === 'pending' && pending.expires > now())
+        .map(pending => pending.id),
       devices: state.devices.map(d => ({
         id: d.id, name: d.name,
         online: d.expires > now() && now() - (lastSeen.get(d.id) ?? -Infinity) < 10000,
@@ -132,6 +135,16 @@ export async function createCompanion({
       ...(pushMessage ? { pushMessage } : {})
     } });
   };
+  function expirePendingPairs() {
+    let expired = false;
+    for (const [id, pending] of pendingPairs) {
+      if (pending.expires <= now()) {
+        pendingPairs.delete(id);
+        expired = true;
+      }
+    }
+    if (expired) status();
+  }
   const report = message => emit({ type: 'error', message: message.slice(0, 500) });
   function rate(key, max, interval) {
     const previous = rates.get(key);
@@ -285,7 +298,7 @@ export async function createCompanion({
     rate(`api:${peer}`, 120, 60000);
     if (path === '/api/pair') {
       rate('pair:global', 20, 60000); rate(`pair:${peer}`, 5, 60000);
-      for (const [id, pending] of pendingPairs) if (pending.expires <= now()) pendingPairs.delete(id);
+      expirePendingPairs();
       if (state.devices.length >= MAX_DEVICES) fail(409, 'Eight phones are paired. Revoke one on the Mac first.');
       if (!invite || invite.expires <= now() || !safeEqual(input.code, invite.code)) fail(403, 'Incorrect, used, or expired code. Create a new pairing code on your Mac.');
       if (typeof input.name !== 'string' || !input.name.trim() || input.name.length > 80 || /[\x00-\x1f\x7f]/.test(input.name)) {
@@ -421,7 +434,7 @@ export async function createCompanion({
     void close();
   });
   const timer = setInterval(() => {
-    for (const [id, pending] of pendingPairs) if (pending.expires <= now()) pendingPairs.delete(id);
+    expirePendingPairs();
     if (invite?.expires <= now()) { invite = undefined; status(); }
     if (available && !fresh()) {
       available = false;
