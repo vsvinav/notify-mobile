@@ -94,7 +94,7 @@ test('service worker caches only shell files, never authenticated requests or an
     return requests.flat();
   });
   expect(cachePaths.length).toBeGreaterThan(0);
-  expect(cachePaths.every(path => ['/', '/index.html', '/app.mjs', '/styles.css', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'].includes(path))).toBe(true);
+  expect(cachePaths.every(path => ['/', '/index.html', '/app.mjs', '/workspace.mjs', '/styles.css', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'].includes(path))).toBe(true);
   expect(cachePaths.some(path => path.startsWith('/api/'))).toBe(false);
 });
 
