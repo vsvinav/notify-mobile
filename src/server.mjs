@@ -8,6 +8,7 @@ import { privateDirectory, stateStore } from './storage.mjs';
 import { selectNetwork, privateIPv4, sameSubnet, networkPresent } from './network.mjs';
 import { genericPayload, generateVAPIDKeys, validSubscription, pushSender } from './push.mjs';
 import { object, validSnapshot, validReply } from './validation.mjs';
+import { Workspace } from './workspace.mjs';
 
 const BODY_LIMIT = 131072, LEASE = 12000, PAIR_TTL = 180000, DEVICE_TTL = 90 * 86400000;
 const MAX_DEVICES = 8, MAX_SEEN = 2048;
@@ -72,6 +73,7 @@ const mime = {
   '/': ['index.html', 'text/html; charset=utf-8'],
   '/index.html': ['index.html', 'text/html; charset=utf-8'],
   '/app.mjs': ['app.mjs', 'text/javascript; charset=utf-8'],
+  '/workspace.mjs': ['workspace.mjs', 'text/javascript; charset=utf-8'],
   '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
   '/sw.js': ['sw.js', 'text/javascript; charset=utf-8'],
   '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'],
@@ -119,6 +121,7 @@ export async function createCompanion({
   let pushQueue = Promise.resolve(), pushQueued = 0, activeRequests = 0;
   const app = { ca: tls.ca, url: '', setupURL: '', command, close, flushPush: () => pushQueue };
   const fresh = () => available && now() - snapshotAt < LEASE;
+  const workspace = new Workspace({ emit, now, fail, ackTimeout, devices: () => state.devices });
   const status = () => {
     if (invite && invite.expires <= now()) invite = undefined;
     emit({ type: 'status', status: {
@@ -214,6 +217,8 @@ export async function createCompanion({
   async function command(message) {
     if (!object(message) || typeof message.type !== 'string') throw new Error('Invalid mobile command.');
     switch (message.type) {
+      case 'workspace': case 'workspace_detail': case 'control_result':
+        workspace.command(message); break;
       case 'snapshot': {
         if (Buffer.byteLength(JSON.stringify(message)) > 1048576 || !validSnapshot(message)) {
           available = false; requests = []; total = 0;
@@ -267,6 +272,7 @@ export async function createCompanion({
         lastSeen.delete(message.id);
         for (const [id, p] of pendingPairs) if (p.device?.id === message.id) pendingPairs.delete(id);
         cancelReplies('This phone was revoked on the Mac.', 401, message.id);
+        workspace.revoke(message.id);
         await store.write(state); status(); break;
       }
       case 'result': {
@@ -280,6 +286,7 @@ export async function createCompanion({
       }
       case 'test-push': enqueuePush(); break;
       case 'offline':
+        workspace.invalidate('The Mac is unavailable. Reconnect before using the workspace.');
         available = false; requests = []; total = 0;
         cancelReplies('The Mac is unavailable. Review a fresh request after reconnecting.', 503);
         status(); break;
@@ -295,7 +302,7 @@ export async function createCompanion({
     }
     const input = await body(request);
     const peer = request.socket.remoteAddress;
-    rate(`api:${peer}`, 120, 60000);
+    if (path !== '/api/workspace') rate(`api:${peer}`, 120, 60000);
     if (path === '/api/pair') {
       rate('pair:global', 20, 60000); rate(`pair:${peer}`, 5, 60000);
       expirePendingPairs();
@@ -324,6 +331,11 @@ export async function createCompanion({
       return json(response, 200, { state: 'accepted', device: { id: pending.device.id, name: pending.name } });
     }
     const device = authenticate(request);
+    if (path === '/api/workspace' || path === '/api/control') {
+      rate(`${path}:${device.id}`, path === '/api/workspace' ? 900 : 30, 60000);
+      const result = path === '/api/workspace' ? await workspace.read(input, device, response) : await workspace.control(input, device);
+      return json(response, result.status, result.data);
+    }
     if (path === '/api/state') {
       return json(response, 200, {
         paired: true, device: { id: device.id, name: device.name }, connected: fresh(),
@@ -375,7 +387,8 @@ export async function createCompanion({
     if (!sameSubnet(request.socket.remoteAddress, network)) fail(403, 'Same-subnet LAN connections only.');
     if (request.headers.host !== expectedHost) fail(403, 'Unrecognized host.');
     if (request.url.length > 4096) fail(414, 'URL too long.');
-    rate(`all:${request.socket.remoteAddress}`, 240, 60000);
+    if (request.url === '/api/workspace') rate(`workspace-peer:${request.socket.remoteAddress}`, 900, 60000);
+    else rate(`all:${request.socket.remoteAddress}`, 240, 60000);
     if (activeRequests >= 32) fail(503, 'Too many active requests. Try again shortly.');
     activeRequests++;
     let done = false;
@@ -437,6 +450,7 @@ export async function createCompanion({
     void close();
   });
   const timer = setInterval(() => {
+    workspace.tick();
     expirePendingPairs();
     if (invite?.expires <= now()) { invite = undefined; status(); }
     if (available && !fresh()) {
@@ -454,6 +468,8 @@ export async function createCompanion({
     if (closed) return;
     closed = true; available = false; requests = [];
     clearInterval(timer);
+    workspace.invalidate('Mobile disabled on the Mac.');
+    for (const waiter of workspace.waiters.values()) waiter.finish(503, { error: 'Mobile disabled on the Mac.' });
     cancelReplies('Mobile was disabled on the Mac.', 503);
     pendingPairs.clear(); lastSeen.clear();
     for (const server of [secure, setup]) server.closeAllConnections();

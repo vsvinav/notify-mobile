@@ -1,9 +1,12 @@
+import { createWorkspace } from './workspace.mjs';
+
 const root = document.querySelector('#app');
 const connection = document.querySelector('#connection');
 const cards = new Map();
 let paired = false, connected = false, polling = false, lastRefresh = 0, pairingTimer;
 let list, banner, deviceBar, pushButton, pushNote, state, registration;
 let workerError, pendingInstall;
+let workspace, workspaceVisible = false;
 const installed = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 const isApple = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -24,15 +27,16 @@ function status(text, live = false) {
   connection.textContent = text;
   connection.dataset.connected = String(live);
 }
-async function api(path, data = {}, timeout = 25000) {
+async function api(path, data = {}, timeout = 25000, signal) {
   let response;
   try {
     response = await fetch(`/api/${path}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin', cache: 'no-store', body: JSON.stringify(data),
-      signal: AbortSignal.timeout(timeout)
+      signal: signal ?? AbortSignal.timeout(timeout)
     });
   } catch {
+    if (signal?.aborted) { const error = new Error('Request cancelled.'); error.aborted = true; throw error; }
     const error = new Error('Cannot reach your Mac. Connect to the same Wi-Fi and keep the Mac awake. No reply was retried.');
     error.network = true; throw error;
   }
@@ -71,11 +75,13 @@ function setupHelp() {
 
 function showPairing(message) {
   paired = false; connected = false;
+  workspace?.clear(); workspace = undefined; workspaceVisible = false;
   cards.clear(); root.replaceChildren();
   const intro = el('section', undefined, 'intro');
-  intro.append(el('h1', 'Your Mac, within reach.'), el('p', 'Review requests and reply from your phone. Request details and replies stay on your local network.', 'muted'));
+  intro.append(el('h1', 'Your Mac, within reach.'), el('p', 'Review requests, follow sessions and message supported agents. Details and replies stay on your local network.', 'muted'));
   const panel = el('form', undefined, 'pair-panel');
-  panel.append(el('h2', 'Pair with your Mac'), el('p', 'Install Notify first, then pair from the Home Screen app with a fresh code from Mac Settings.', 'support'));
+  panel.append(el('h2', 'Pair with your Mac'), el('p', 'Install Notify first, then pair from the Home Screen app with a fresh code from Mac Settings.', 'support'),
+    el('p', 'Pairing lets this phone read session activity and send supported agent instructions. Sending messages can use your agent’s model credits.', 'support'));
   const nameLabel = el('label', 'Phone name', 'input-label');
   const name = el('input'); name.type = 'text'; name.id = 'phone-name'; name.maxLength = 80; name.autocomplete = 'off';
   name.value = isApple ? 'My iPhone' : 'My phone'; name.required = true; nameLabel.htmlFor = name.id;
@@ -124,7 +130,25 @@ function buildWorkspace() {
   const heading = el('div', undefined, 'section-heading');
   heading.append(el('h1', 'Needs your attention'), el('span', '', 'count'));
   list = el('div');
-  root.append(deviceBar, banner, heading, list);
+  const requests = el('section');
+  requests.append(heading, list);
+  workspace = createWorkspace({ api, el, button,
+    onUnauthorized: showPairing,
+    onNetworkError: () => { connected = false; workspace.setConnected(false); void refresh(); }
+  });
+  const navigation = el('nav', undefined, 'workspace-tabs primary-navigation');
+  navigation.setAttribute('aria-label', 'Notify views');
+  const requestsButton = button('Requests', '', () => selectView(false));
+  const sessionsButton = button('Sessions', '', () => selectView(true));
+  function selectView(sessions) {
+    workspaceVisible = sessions; requests.hidden = sessions;
+    requestsButton.setAttribute('aria-pressed', String(!sessions));
+    sessionsButton.setAttribute('aria-pressed', String(sessions));
+    workspace.setVisible(sessions);
+  }
+  navigation.append(requestsButton, sessionsButton);
+  root.append(deviceBar, banner, navigation, requests, workspace.node);
+  selectView(false);
   const settings = el('details', undefined, 'settings');
   settings.append(el('summary', 'Alerts & this phone'));
   pushNote = el('p');
@@ -340,8 +364,10 @@ async function refresh() {
       for (const card of cards.values()) updateCard(card);
     }
     updatePush();
+    workspace?.setConnected(connected);
   } catch (error) {
     connected = false;
+    workspace?.setConnected(false);
     if (error.status === 401) {
       if (paired) showPairing(error.message);
       else if (!root.children.length) showPairing();
@@ -356,6 +382,7 @@ async function refresh() {
 
 window.addEventListener('offline', () => {
   connected = false; status('Offline');
+  workspace?.setConnected(false);
   if (banner) { banner.hidden = false; banner.textContent = 'Offline. Connect to the Mac’s Wi-Fi to review the latest requests. Replies are disabled.'; }
   for (const card of cards.values()) updateCard(card);
   updatePush();
@@ -363,6 +390,7 @@ window.addEventListener('offline', () => {
 window.addEventListener('online', () => { void refresh(); });
 window.addEventListener('pageshow', () => { void refresh(); });
 document.addEventListener('visibilitychange', () => {
+  workspace?.setVisible(!document.hidden && workspaceVisible);
   if (!document.hidden) {
     connected = false;
     for (const card of cards.values()) updateCard(card);

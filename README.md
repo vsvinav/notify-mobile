@@ -4,6 +4,8 @@
 
 Approve a command, pick an option, or write your own answer without returning to your terminal. Notify Mobile connects to your Copilot and Claude Code sessions through [Notify on your Mac](https://github.com/vsvinav/notify).
 
+**Now with a session workspace:** follow live messages, chat with supported agents and explore their hierarchy without leaving your phone.
+
 [Quickstart](#quickstart) · [Install on iPhone](#install-on-iphone) · [Install on Android](#install-on-android) · [Using the app](#using-notify)
 
 ## Keep work moving
@@ -13,6 +15,8 @@ Approve a command, pick an option, or write your own answer without returning to
 - **Answer in your own words.** Choices, multi-select and custom answers match what the agent supports.
 - **Get a nudge when you're away.** Optional generic lock-screen alerts let you know Notify needs you, without putting commands or project details in the notification.
 - **Know your answer arrived.** Sending is not success: Notify waits for the Mac's agent acknowledgment.
+- **Follow your sessions.** Open Sessions for live status, main-agent and subagent chat, with tool and thinking updates kept separate.
+- **See the real team.** The org chart groups idle helpers into one expandable tile and labels unreported parents instead of guessing.
 - **Keep control on your Mac.** Confirm each phone before connecting, see its status, and revoke access whenever you want.
 - **Make yourself at home.** Install to your Home Screen, with warm light and dark appearances that match Notify.
 
@@ -28,6 +32,17 @@ Approve a command, pick an option, or write your own answer without returning to
 
 <p align="center"><sub>Actual phone web-app screens with example requests, captured at a phone-sized viewport. Not mockups or physical-device photos.</sub></p>
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/workspace-chat-dark.png">
+    <img src="docs/images/workspace-chat-light.png" alt="Phone session chat with separate thinking updates and a fixed message composer" width="280">
+  </picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/workspace-hierarchy-dark.png">
+    <img src="docs/images/workspace-hierarchy-light.png" alt="Phone org chart showing the main agent, one working helper and a single expandable tile for nineteen idle helpers" width="280">
+  </picture>
+</p>
+
 ## Quickstart
 
 You'll need **Notify running on your Mac**, a phone on the **same Wi-Fi**, and a few minutes for first-time setup. There is no App Store download yet: this version installs as a web app from your Mac.
@@ -38,7 +53,9 @@ You'll need **Notify running on your Mac**, a phone on the **same Wi-Fi**, and a
 4. **Pair from the installed app.** Open the new Notify icon, enter the Mac's eight-digit pairing code and give your phone a name. Check that the six-digit confirmation matches on both devices, then choose **Confirm phone** on the Mac.
 5. **Turn on alerts.** Tap **Enable alerts** in the phone app and allow notifications. Use **Send test alert** on the Mac to try a generic notification.
 
-**Need the Mac app first?** Follow [Notify's Mac installation quickstart](https://github.com/vsvinav/notify#install-on-macos). If it is already installed, run `open ~/Applications/Notify.app`. The current release is a local build, not a notarized installer. You do not run Node or build anything on your phone.
+**Need the Mac app first?** Get [Notify 0.2.0 beta 3](https://github.com/vsvinav/notify/releases/tag/v0.2.0-beta.3) or follow the [Mac installation quickstart](https://github.com/vsvinav/notify#install-on-macos). If it is already installed, run `open ~/Applications/Notify.app`. The Mac download is not notarized; its included installation instructions explain Apple's manual approval. You do not run Node or build anything on your phone.
+
+**Updating an existing phone installation:** update Notify on your Mac, then close and reopen the phone web app while connected to that Mac. The same HTTPS address retains pairing. If Sessions says the workspace is unavailable, check that the Mac app was updated; refreshing the phone alone cannot add Mac-side support.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/mac-pairing-dark.png">
@@ -96,6 +113,18 @@ When an alert arrives, open Notify to fetch the current request. Read the comman
 
 Keep the app open until your reply is acknowledged. If the Mac is offline or the request has changed, Notify disables the action rather than queuing an approval for later.
 
+### Sessions, chat and hierarchy
+
+Open **Sessions**, choose a session, then select **Chat** or **Hierarchy**. Sessions without an active connection stay visible but cannot receive instructions. Chat shows recent reported messages, not a complete copy of terminal history; **Tools & thinking** is separate and can be collapsed. Copy buttons preserve message and code text.
+
+Use **Chat with** or select an org-chart tile to choose the exact main agent or helper. **Send** uses that target only. Main-agent **Interrupt** and **Stop** ask for confirmation; stopping a helper can also stop its descendants. Controls are enabled only where the connection supports them. In particular, unsupported Claude connections remain read-only: Notify does not redirect a helper message to the main agent.
+
+The org chart initially shows running helpers, with idle helpers grouped into **+N idle subagents**. Expand that tile to see them, then use **Hide idle** to collapse it. Ended helpers are in a separate inactive group. **Fit** shows the whole chart; **100%** restores readable-size tiles with scrolling. Parent relationships must be reported by the agent; missing or conflicting ancestry is shown separately.
+
+Phone drafts stay separate for each target and do not overwrite Mac drafts. They are held only in the open phone page: reloading or losing pairing clears them. Sending instructions can use your existing model credits. **Queued** means accepted into the agent's queue, not finished; failures and uncertain delivery are shown explicitly, and instructions are never retried automatically.
+
+Updates arrive while Sessions is open; hidden pages stop watching. Details are loaded only for the selected session, and earlier messages or very large teams can be omitted with a visible notice. Creating/removing subagents and automation settings remain Mac-only.
+
 **Connected** means the phone app recently reached your Mac. **Push enabled** means a notification subscription exists, not that every alert has been delivered. Focus and battery settings can delay alerts.
 
 To disconnect a phone, choose **Revoke** beside it in the Mac's Phone connections settings. If you're finished with Notify, also remove its Home Screen app and certificate profile from your phone.
@@ -103,7 +132,7 @@ To disconnect a phone, choose **Revoke** beside it in the Mac's Phone connection
 ## A few things to know
 
 - **Same network for now.** Your Mac must be awake. An alert can arrive elsewhere, but reading and answering requests requires reaching the Mac on its local network.
-- **Private request details.** Requests and replies travel over local HTTPS. Generic background alerts use Apple, Google or Mozilla push services; there is no hosted Notify relay.
+- **Private request and conversation details.** Requests, session activity and instructions travel over local HTTPS and are not stored in the phone's offline cache. Generic background alerts use Apple, Google or Mozilla push services; there is no hosted Notify relay.
 - **First-time setup is still hands-on.** Phone certificate trust, installation and real lock-screen delivery have not yet been verified on physical iPhone/Android devices. Try setup and a test alert on your own phone before relying on it.
 
 ---
