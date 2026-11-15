@@ -84,6 +84,9 @@ test('HTTPS authentication, origin, host, content type, body limits and bootstra
   assert.equal((await fetch(`${f.app.setupURL}/api/state`)).status, 404);
   const setup = await (await fetch(f.app.setupURL)).text();
   assert.match(setup, /fingerprint/i);
+  assert.ok(setup.includes(`href="${f.app.url}/">Continue to Notify</a>`),
+    'Setup must link to the actual HTTPS app port, not the setup port or a hard-coded address');
+  assert.match(setup, /After verifying and installing the certificate/);
   assert.doesNotMatch(setup, /ticket-1|pairingCode|PRIVATE KEY/);
 });
 

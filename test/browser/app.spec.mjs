@@ -27,6 +27,19 @@ async function connect(page) {
   await expect(page.getByText('Connected', { exact: true })).toBeVisible();
 }
 
+test('certificate setup continues to the actual app without automatic navigation', async ({ page }) => {
+  await page.goto(f.app.setupURL);
+  const continueLink = page.getByRole('link', { name: 'Continue to Notify', exact: true });
+  await expect(continueLink).toHaveAttribute('href', `${f.app.url}/`);
+  await expect(page.getByText('After verifying and installing the certificate', { exact: false })).toBeVisible();
+  await expect(page).toHaveURL(`${f.app.setupURL}/`);
+  await mkdir('.impeccable/review', { recursive: true });
+  await page.screenshot({ path: '.impeccable/review/certificate-continue-390.png', fullPage: true });
+  await continueLink.click();
+  await expect(page).toHaveURL(`${f.app.url}/`);
+  await expect(page.getByRole('button', { name: 'Pair with Mac', exact: true })).toBeVisible();
+});
+
 test('pairing, exact targets, native acknowledgment and screenshots in both themes', async ({ page }) => {
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
