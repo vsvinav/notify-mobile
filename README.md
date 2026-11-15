@@ -58,11 +58,34 @@ Pair inside the installed app, not just in Safari: they can have separate storag
 
 ### Install on Android
 
-1. **Install the verified certificate.** Open **Settings > Security > Encryption & credentials > Install a CA certificate**. Names vary; some phones use **More security settings**.
-2. **Add the app.** Open the Mac's HTTPS app address in **Chrome**, then choose **Install app** or **Add to Home screen**.
-3. **Pair and allow alerts.** Open the installed Notify app, enter the Mac's pairing code, confirm the matching code on the Mac, then tap **Enable alerts**.
+**There is no APK or Play Store download.** Notify installs from Chrome as a Home Screen web app. Nothing needs to be built or run on your phone.
 
-Keep the Mac awake and both devices on the same network during setup.
+1. **Start on the Mac.** Open Notify, then **Settings > Phone connections**. Turn on **Allow phone connections**, wait for the connection details, and click **Pair a phone**. Keep Notify running and the Mac awake.
+2. **Open the setup page on Android.** Connect to the same regular Wi-Fi as the Mac. Scan Notify's QR with your camera, or type the complete **setup address** into Chrome. It starts with **`http://`** and normally ends in **`:8080/`**. Use the address currently shown on your Mac, not an address from a screenshot.
+3. **Download and verify the certificate.** On the setup page, tap **Notify local CA certificate** to download `Notify-Local-CA.cer`. Before installing it, inspect the downloaded certificate with a trusted certificate viewer and compare its full **SHA-256 fingerprint** with Notify Settings on your Mac. A fingerprint shown by the HTTP setup page is not independent verification. If you cannot verify the certificate, stop.
+4. **Install that verified certificate.** Open Android **Settings** and search for **Install a certificate** or **CA certificate**. A common path is **Security & privacy > More security settings > Encryption & credentials > Install a certificate > CA certificate**. Some Samsung phones use **Other security settings > Install from device storage**. Choose the downloaded `Notify-Local-CA.cer` and follow Android's confirmation/unlock steps. Menu names vary by Android version.
+5. **Install the app from Chrome.** Return to Notify on the Mac and expand **Connection address**. Open that complete address in Chrome: it starts with **`https://`** and normally uses **`:8443/`**. The page must load without a certificate warning. In Chrome's **⋮** menu, choose **Add to Home screen > Install**, or **Install app**, then confirm. If Chrome offers only a shortcut, check that HTTPS trust is working before relying on background alerts.
+6. **Open and pair Notify.** Open the new **Notify** icon from your Home Screen/app drawer. Enter the **eight-digit pairing code** shown on the Mac and name your phone. Compare the **six-digit confirmation code** on both screens, then click **Confirm phone** on the Mac. If the pairing code expired, click **Pair a phone** again.
+7. **Enable notifications.** In the installed phone app, tap **Enable alerts** and allow notifications. On the Mac, click **Send test alert**. Android's notification, Do Not Disturb and battery settings can affect delivery.
+
+### If the phone says “Site can't be reached”
+
+**Resolve this before installing certificates or pairing.** A certificate cannot fix an unreachable server.
+
+| Address | Purpose |
+| --- | --- |
+| `http://YOUR-MAC-IP:8080/` | First-time setup and public certificate download |
+| `https://YOUR-MAC-IP:8443/` | The actual app, after certificate trust |
+
+Replace `YOUR-MAC-IP` with the address in Notify Settings. Keep the protocol and port together: HTTPS on port 8080, or HTTP on port 8443, will not work.
+
+- Confirm **Allow phone connections** is on and no startup error is displayed on the Mac.
+- Keep both devices on the same Wi-Fi, not mobile data or an isolated guest network. Being on the same network name or subnet alone does not prove devices can reach each other.
+- Check whether a phone VPN or the router's **client/AP isolation** blocks local connections. Ask the network administrator for managed networks; do not weaken managed security settings.
+- If macOS asks about incoming connections for Notify's Node companion, local access must be allowed. Do not disable the entire firewall.
+- Recheck the current address after changing networks. The Mac's IP address can change.
+
+If the setup page opens on the Mac but not the phone, the listener is running; investigate the phone-to-Mac network path. If the HTTPS page instead shows a certificate warning, verify the certificate and trust setup rather than bypassing the warning.
 
 > **Only trust your own Mac's certificate.** Compare the downloaded certificate's fingerprint using a trusted certificate viewer, not a fingerprint displayed by the HTTP download page itself. If you cannot verify it, stop. Installing a certificate is a trust decision, not just dismissing a browser warning.
 
