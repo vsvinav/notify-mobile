@@ -4,6 +4,8 @@
 
 Approve a command, pick an option, or write your own answer without returning to your terminal. Notify Mobile connects to your Copilot and Claude Code sessions through [Notify on your Mac](https://github.com/vsvinav/notify).
 
+[Quickstart](#quickstart) · [Install on iPhone](#install-on-iphone) · [Install on Android](#install-on-android) · [Using the app](#using-notify)
+
 ## Keep work moving
 
 - **Approve or deny from your phone.** Review the request and send your decision back to the waiting session.
@@ -24,7 +26,7 @@ Approve a command, pick an option, or write your own answer without returning to
   <img src="docs/images/questions.png" alt="Notify Mobile showing multiple-choice answers and a custom reply field" width="280">
 </p>
 
-<p align="center"><sub>Real app captures with fictional requests. Tap an image for a closer look.</sub></p>
+<p align="center"><sub>Actual phone web-app screens with example requests, captured at a phone-sized viewport. Not mockups or physical-device photos.</sub></p>
 
 ## Quickstart
 
@@ -36,19 +38,31 @@ You'll need **Notify running on your Mac**, a phone on the **same Wi-Fi**, and a
 4. **Pair from the installed app.** Open the new Notify icon, enter the Mac's eight-digit pairing code and give your phone a name. Check that the six-digit confirmation matches on both devices, then choose **Confirm phone** on the Mac.
 5. **Turn on alerts.** Tap **Enable alerts** in the phone app and allow notifications. Use **Send test alert** on the Mac to try a generic notification.
 
-**Need the Mac app first?** Follow [Notify's build and install quickstart](https://github.com/vsvinav/notify#try-it). The current release is a local build, not a notarized installer.
+**Need the Mac app first?** Follow [Notify's Mac installation quickstart](https://github.com/vsvinav/notify#install-on-macos). If it is already installed, run `open ~/Applications/Notify.app`. The current release is a local build, not a notarized installer. You do not run Node or build anything on your phone.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/mac-pairing-dark.png">
+  <img src="docs/images/mac-pairing-light.png" alt="Notify's native Mac phone-connection panel showing paired status, confirmation, setup QR and certificate fingerprint" width="520">
+</picture>
+
+<sub>The Mac pairing panel with example data. Generate your own QR and codes in Settings; the ones in this screenshot will not connect a phone.</sub>
 
 ### Install on iPhone
 
-Use **Safari**. Install the downloaded certificate profile in **Settings > General > VPN & Device Management**, then enable it under **General > About > Certificate Trust Settings**.
+1. **Install the verified certificate.** In iPhone Settings, open **General > VPN & Device Management** and install the downloaded Notify certificate profile.
+2. **Enable website trust.** Open **General > About > Certificate Trust Settings** and enable trust for that verified certificate.
+3. **Add the app.** Open the Mac's HTTPS app address in **Safari**, choose **Share > Add to Home Screen**, then open the new Notify icon.
+4. **Pair and allow alerts.** Enter the Mac's pairing code from inside the installed app, confirm the matching code on the Mac, then tap **Enable alerts**.
 
-Open the HTTPS app address in Safari, choose **Share > Add to Home Screen**, and open Notify from its new icon. Pair **inside that installed app**, not just in Safari. Background alerts require **iOS 16.4 or newer** and Home Screen installation.
+Pair inside the installed app, not just in Safari: they can have separate storage. Background alerts require **iOS 16.4 or newer** and Home Screen installation.
 
 ### Install on Android
 
-Install the verified certificate through **Settings > Security > Encryption & credentials > Install a CA certificate**. Names vary by phone; some put this under **More security settings**.
+1. **Install the verified certificate.** Open **Settings > Security > Encryption & credentials > Install a CA certificate**. Names vary; some phones use **More security settings**.
+2. **Add the app.** Open the Mac's HTTPS app address in **Chrome**, then choose **Install app** or **Add to Home screen**.
+3. **Pair and allow alerts.** Open the installed Notify app, enter the Mac's pairing code, confirm the matching code on the Mac, then tap **Enable alerts**.
 
-Open the HTTPS app address in Chrome, choose **Install app** or **Add to Home screen**, then open the installed Notify app and pair it with your Mac.
+Keep the Mac awake and both devices on the same network during setup.
 
 > **Only trust your own Mac's certificate.** Compare the downloaded certificate's fingerprint using a trusted certificate viewer, not a fingerprint displayed by the HTTP download page itself. If you cannot verify it, stop. Installing a certificate is a trust decision, not just dismissing a browser warning.
 
