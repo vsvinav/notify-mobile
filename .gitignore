@@ -1,9 +1,5 @@
 node_modules/
 artifacts/
-.impeccable/review/
-test-results/
-playwright-report/
-.test-data/
 .impeccable/
 .github/skills/impeccable/
 .github/agents/impeccable-*.agent.md
@@ -11,3 +7,6 @@ playwright-report/
 DESIGN.md
 PRODUCT.md
 docs/superpowers/
+test-results/
+playwright-report/
+.test-data/
