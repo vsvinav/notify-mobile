@@ -4,7 +4,7 @@
 
 Approve a command, pick an option, or write your own answer without returning to your terminal. Notify Mobile connects to your Copilot and Claude Code sessions through [Notify on your Mac](https://github.com/vsvinav/notify).
 
-**Now with a session workspace:** follow live messages, chat with supported agents and explore their hierarchy without leaving your phone.
+**A focused phone workspace:** review one request at a time, switch straight into chat, and keep setup out of your way.
 
 [Quickstart](#quickstart) · [Install on iPhone](#install-on-iphone) · [Install on Android](#install-on-android) · [Using the app](#using-notify)
 
@@ -51,7 +51,7 @@ You'll need **Notify running on your Mac**, a phone on the **same Wi-Fi**, and a
 2. **Scan the QR code.** Follow the local setup page to download Notify's certificate. Compare its full SHA-256 fingerprint with the one shown on your Mac before trusting it.
 3. **Install Notify on your phone.** Trust the verified certificate, open the Mac's HTTPS app address, and add it to your Home Screen. Platform steps are below.
 4. **Pair from the installed app.** Open the new Notify icon, enter the Mac's eight-digit pairing code and give your phone a name. Check that the six-digit confirmation matches on both devices, then choose **Confirm phone** on the Mac.
-5. **Turn on alerts.** Tap **Enable alerts** in the phone app and allow notifications. Use **Send test alert** on the Mac to try a generic notification.
+5. **Turn on alerts.** Open **Settings** in the phone app, tap **Enable alerts** and allow notifications. Use **Send test alert** on the Mac to try a generic notification.
 
 **Need the Mac app first?** Get [Notify 0.2.0 beta 3](https://github.com/vsvinav/notify/releases/tag/v0.2.0-beta.3) or follow the [Mac installation quickstart](https://github.com/vsvinav/notify#install-on-macos). If it is already installed, run `open ~/Applications/Notify.app`. The Mac download is not notarized; its included installation instructions explain Apple's manual approval. You do not run Node or build anything on your phone.
 
@@ -69,7 +69,7 @@ You'll need **Notify running on your Mac**, a phone on the **same Wi-Fi**, and a
 1. **Install the verified certificate.** In iPhone Settings, open **General > VPN & Device Management** and install the downloaded Notify certificate profile.
 2. **Enable website trust.** Open **General > About > Certificate Trust Settings** and enable trust for that verified certificate.
 3. **Add the app.** Open the Mac's HTTPS app address in **Safari**, choose **Share > Add to Home Screen**, then open the new Notify icon.
-4. **Pair and allow alerts.** Enter the Mac's pairing code from inside the installed app, confirm the matching code on the Mac, then tap **Enable alerts**.
+4. **Pair and allow alerts.** Enter the Mac's pairing code from inside the installed app, confirm the matching code on the Mac, then open **Settings > Enable alerts**.
 
 Pair inside the installed app, not just in Safari: they can have separate storage. Background alerts require **iOS 16.4 or newer** and Home Screen installation.
 
@@ -83,7 +83,7 @@ Pair inside the installed app, not just in Safari: they can have separate storag
 4. **Install that verified certificate.** Open Android **Settings** and search for **Install a certificate** or **CA certificate**. A common path is **Security & privacy > More security settings > Encryption & credentials > Install a certificate > CA certificate**. Some Samsung phones use **Other security settings > Install from device storage**. Choose the downloaded `Notify-Local-CA.cer` and follow Android's confirmation/unlock steps. Menu names vary by Android version.
 5. **Continue to the app and install it.** Return to the setup page in Chrome and tap **Continue to Notify**. The link shows your Mac's HTTPS app address, normally on port **8443**; installing a certificate does not move you there automatically. You can also find this address under **Connection address** in Notify on the Mac. The app must load without a certificate warning. In Chrome's **⋮** menu, choose **Add to Home screen > Install**, or **Install app**, then confirm. If Chrome offers only a shortcut, check that HTTPS trust is working before relying on background alerts.
 6. **Open and pair Notify.** Open the new **Notify** icon from your Home Screen/app drawer. Enter the **eight-digit pairing code** shown on the Mac and name your phone. Compare the **six-digit confirmation code** on both screens, then click **Confirm phone** on the Mac. If the pairing code expired, click **Pair a phone** again.
-7. **Enable notifications.** In the installed phone app, tap **Enable alerts** and allow notifications. On the Mac, click **Send test alert**. Android's notification, Do Not Disturb and battery settings can affect delivery.
+7. **Enable notifications.** In the installed phone app, open **Settings**, tap **Enable alerts** and allow notifications. On the Mac, click **Send test alert**. Android's notification, Do Not Disturb and battery settings can affect delivery.
 
 ### If the phone says “Site can't be reached”
 
@@ -109,19 +109,21 @@ If the setup page opens on the Mac but not the phone, the listener is running; i
 
 ## Using Notify
 
-When an alert arrives, open Notify to fetch the current request. Read the command, address or question, then approve, deny or answer. Custom input appears only when the agent allows it; permission scopes are the ones it actually offers.
+Use the bottom navigation to move between **Inbox**, **Sessions** and **Settings**. Alerts, phone information and installation help live in Settings, separate from requests and chat.
 
-Keep the app open until your reply is acknowledged. If the Mac is offline or the request has changed, Notify disables the action rather than queuing an approval for later.
+When an alert arrives, open **Inbox** to review one request at a time. Read the command, address or question, then approve, deny or answer. Scroll the request for longer details; decision buttons stay in the action area below. Use the request picker or **Next request** to switch without losing an unsent answer. **Add denial instructions** opens optional feedback. Custom input appears only when the agent allows it; permission scopes are the ones it actually offers.
+
+Keep the app open until your reply is acknowledged. The disabled receipt stays in place until you choose **Next request** or **Done**, so another approval cannot replace the button you just tapped. Requests answered elsewhere also remain disabled until you move on. If the Mac is offline or the request has changed, Notify disables the action rather than queuing an approval for later.
 
 ### Sessions, chat and hierarchy
 
-Open **Sessions**, choose a session, then select **Chat** or **Hierarchy**. Sessions without an active connection stay visible but cannot receive instructions. Chat shows recent reported messages, not a complete copy of terminal history; **Tools & thinking** is separate and can be collapsed. Copy buttons preserve message and code text.
+Open **Sessions**, choose a session, then select **Chat** or **Hierarchy**. Sessions without an active connection stay visible but cannot receive instructions. Chat uses the available screen space with its composer below the conversation. It shows recent reported messages, not a complete copy of terminal history; **Tools & thinking** starts collapsed and opens when needed. New replies do not pull you away from older messages: use **Jump to latest** to catch up. Copy buttons preserve message and code text.
 
 Use **Chat with** or select an org-chart tile to choose the exact main agent or helper. **Send** uses that target only. Main-agent **Interrupt** and **Stop** ask for confirmation; stopping a helper can also stop its descendants. Controls are enabled only where the connection supports them. In particular, unsupported Claude connections remain read-only: Notify does not redirect a helper message to the main agent.
 
 The org chart initially shows running helpers, with idle helpers grouped into **+N idle subagents**. Expand that tile to see them, then use **Hide idle** to collapse it. Ended helpers are in a separate inactive group. **Fit** shows the whole chart; **100%** restores readable-size tiles with scrolling. Parent relationships must be reported by the agent; missing or conflicting ancestry is shown separately.
 
-Phone drafts stay separate for each target and do not overwrite Mac drafts. They are held only in the open phone page: reloading or losing pairing clears them. Sending instructions can use your existing model credits. **Queued** means accepted into the agent's queue, not finished; failures and uncertain delivery are shown explicitly, and instructions are never retried automatically.
+Phone drafts stay separate for each target and do not overwrite Mac drafts. Switching views or using browser Back/Forward keeps them; they are held only in the open phone page, so reloading or losing pairing clears them. Sending instructions can use your existing model credits. **Queued** means accepted into the agent's queue, not finished; failures and uncertain delivery are shown explicitly, and instructions are never retried automatically.
 
 Updates arrive while Sessions is open; hidden pages stop watching. Details are loaded only for the selected session, and earlier messages or very large teams can be omitted with a visible notice. Creating/removing subagents and automation settings remain Mac-only.
 

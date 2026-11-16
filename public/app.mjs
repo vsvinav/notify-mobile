@@ -7,6 +7,8 @@ let paired = false, connected = false, polling = false, lastRefresh = 0, pairing
 let list, banner, deviceBar, pushButton, pushNote, state, registration;
 let workerError, pendingInstall;
 let workspace, workspaceVisible = false;
+let view = 'inbox', currentSessionID = null, activeTicket = null, selectView;
+let requestPicker, requestPosition, nextRequest, emptyView, inboxBadge;
 const installed = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 const isApple = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -23,6 +25,24 @@ function button(text, className, action) {
   if (action) node.addEventListener('click', action);
   return node;
 }
+function navigationIcon(path) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  const shape = document.createElementNS(svg.namespaceURI, 'path');
+  shape.setAttribute('d', path); svg.append(shape);
+  return svg;
+}
+function rememberView(replace = false) {
+  history[replace ? 'replaceState' : 'pushState'](
+    { notifyView: view, notifySession: currentSessionID }, '', `#${view}`);
+}
+function resizeViewport() {
+  document.documentElement.style.setProperty('--app-height', `${window.visualViewport?.height ?? innerHeight}px`);
+}
+window.addEventListener('resize', resizeViewport);
+window.visualViewport?.addEventListener('resize', resizeViewport);
+resizeViewport();
 function status(text, live = false) {
   connection.textContent = text;
   connection.dataset.connected = String(live);
@@ -76,6 +96,10 @@ function setupHelp() {
 function showPairing(message) {
   paired = false; connected = false;
   workspace?.clear(); workspace = undefined; workspaceVisible = false;
+  selectView = undefined; activeTicket = null; currentSessionID = null;
+  document.body.classList.remove('paired');
+  document.body.dataset.detail = 'false';
+  document.querySelector('.brand span').textContent = 'Notify';
   cards.clear(); root.replaceChildren();
   const intro = el('section', undefined, 'intro');
   intro.append(el('h1', 'Your Mac, within reach.'), el('p', 'Review requests, follow sessions and message supported agents. Details and replies stay on your local network.', 'muted'));
@@ -125,37 +149,115 @@ function showComparison(code) {
 
 function buildWorkspace() {
   root.replaceChildren();
+  document.body.classList.add('paired');
   deviceBar = el('div', undefined, 'device-bar');
   banner = el('p', '', 'banner'); banner.hidden = true; banner.setAttribute('role', 'status');
-  const heading = el('div', undefined, 'section-heading');
-  heading.append(el('h1', 'Needs your attention'), el('span', '', 'count'));
-  list = el('div');
-  const requests = el('section');
-  requests.append(heading, list);
+  const requests = el('section', undefined, 'review-screen');
+  const toolbar = el('div', undefined, 'review-toolbar');
+  requestPosition = el('span', '', 'review-position');
+  requestPosition.setAttribute('role', 'status');
+  requestPicker = el('select', undefined, 'request-picker');
+  requestPicker.setAttribute('aria-label', 'Review request');
+  requestPicker.addEventListener('change', () => { activeTicket = requestPicker.value; renderReview(); });
+  nextRequest = button('Next request', 'next-request', () => {
+    const pending = [...cards.values()].filter(card => card.present && !card.succeeded);
+    const index = pending.findIndex(card => card.item.ticket === activeTicket);
+    activeTicket = pending.length ? pending[(index + 1) % pending.length].item.ticket : null;
+    renderReview();
+  });
+  const positionRow = el('div', undefined, 'review-position-row');
+  positionRow.append(requestPosition, nextRequest);
+  toolbar.append(positionRow, requestPicker);
+  list = el('div', undefined, 'review-list');
+  emptyView = el('section', undefined, 'empty');
+  emptyView.append(el('h2', 'All caught up'), el('p', 'New requests appear here. Open Sessions to follow your agents, or Settings to enable alerts.'));
+  list.append(emptyView); requests.append(toolbar, list);
   workspace = createWorkspace({ api, el, button,
     onUnauthorized: showPairing,
-    onNetworkError: () => { connected = false; workspace.setConnected(false); void refresh(); }
+    onNetworkError: () => { connected = false; workspace.setConnected(false); void refresh(); },
+    onNavigate: id => {
+      currentSessionID = id;
+      document.body.dataset.detail = String(view === 'sessions' && id !== null);
+      rememberView();
+    }
   });
-  const navigation = el('nav', undefined, 'workspace-tabs primary-navigation');
-  navigation.setAttribute('aria-label', 'Notify views');
-  const requestsButton = button('Requests', '', () => selectView(false));
-  const sessionsButton = button('Sessions', '', () => selectView(true));
-  function selectView(sessions) {
-    workspaceVisible = sessions; requests.hidden = sessions;
-    requestsButton.setAttribute('aria-pressed', String(!sessions));
-    sessionsButton.setAttribute('aria-pressed', String(sessions));
-    workspace.setVisible(sessions);
-  }
-  navigation.append(requestsButton, sessionsButton);
-  root.append(deviceBar, banner, navigation, requests, workspace.node);
-  selectView(false);
-  const settings = el('details', undefined, 'settings');
-  settings.append(el('summary', 'Alerts & this phone'));
+  const settings = el('section', undefined, 'phone-settings');
+  const alerts = el('section', undefined, 'settings');
+  alerts.append(el('h2', 'Alerts & this phone'));
   pushNote = el('p');
   pushButton = button('Enable alerts', 'primary', enablePush);
-  settings.append(pushNote, pushButton, el('p', 'Alerts contain only “Notify needs you.” Open Notify on the same network to see the current request. Permission and OS Focus may delay alerts. Test from Notify Settings on the Mac.'));
-  root.append(settings, setupHelp());
+  alerts.append(pushNote, pushButton, el('p', 'Alerts contain only “Notify needs you.” Open Notify on the same network to see the current request. Permission and OS Focus may delay alerts. Test from Notify Settings on the Mac.'));
+  settings.append(deviceBar, alerts, setupHelp());
+  const navigation = el('nav', undefined, 'primary-navigation');
+  navigation.setAttribute('aria-label', 'Notify views');
+  const destinations = [
+    ['inbox', 'Inbox', 'M4 4h16v16H4zM4 13h5l2 3h2l2-3h5'],
+    ['sessions', 'Sessions', 'M4 4h16v13H9l-5 4zM8 8h8M8 12h5'],
+    ['settings', 'Settings', 'M20 12a8 8 0 1 1-16 0 8 8 0 0 1 16 0M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0']
+  ];
+  for (const [id, label, path] of destinations) {
+    const item = button('', '', () => selectView(id));
+    item.dataset.view = id; item.setAttribute('aria-label', label);
+    item.append(navigationIcon(path), el('span', label));
+    if (id === 'inbox') {
+      inboxBadge = el('span', '', 'inbox-badge'); inboxBadge.setAttribute('aria-hidden', 'true'); item.append(inboxBadge);
+    }
+    navigation.append(item);
+  }
+  selectView = (name, remember = true) => {
+    const next = destinations.some(([id]) => id === name) ? name : 'inbox';
+    const changed = view !== next; view = next;
+    workspaceVisible = view === 'sessions';
+    requests.hidden = view !== 'inbox'; settings.hidden = view !== 'settings';
+    document.querySelector('.brand span').textContent = view === 'inbox' ? 'Review' : view === 'sessions' ? 'Sessions' : 'Settings';
+    document.body.dataset.detail = String(workspaceVisible && currentSessionID !== null);
+    for (const item of navigation.children) item.setAttribute('aria-pressed', String(item.dataset.view === view));
+    workspace.setVisible(workspaceVisible);
+    if (remember && changed) rememberView();
+  };
+  root.append(banner, requests, workspace.node, settings, navigation);
+  currentSessionID = typeof history.state?.notifySession === 'string' ? history.state.notifySession : null;
+  if (currentSessionID) workspace.selectSession(currentSessionID);
+  selectView(location.hash.slice(1), false);
+  rememberView(true);
 }
+
+function renderReview() {
+  if (!paired || !requestPicker) return;
+  const pending = [...cards.values()].filter(card => card.present && !card.succeeded);
+  if (!activeTicket) activeTicket = pending[0]?.item.ticket ?? null;
+  const active = cards.get(activeTicket);
+  for (const card of cards.values()) card.node.hidden = card !== active;
+  emptyView.hidden = !!active;
+  emptyView.querySelector('h2').textContent = connected ? 'All caught up' : 'Waiting for your Mac';
+  const choices = active && !pending.includes(active) ? [active, ...pending] : pending;
+  const signature = JSON.stringify(choices.map(card => [card.item.ticket, card.item.sessionName, card.item.request.title]));
+  if (requestPicker.dataset.signature !== signature) {
+    requestPicker.dataset.signature = signature;
+    requestPicker.replaceChildren(...choices.map(card => {
+      const option = el('option', `${card.item.sessionName} · ${card.item.request.title}`);
+      option.value = card.item.ticket; return option;
+    }));
+  }
+  requestPicker.value = activeTicket ?? '';
+  requestPicker.hidden = choices.length < 2;
+  requestPicker.disabled = !!active?.busy;
+  requestPosition.textContent = !active ? '' : active.succeeded ? 'Reply acknowledged' :
+    active.expired ? 'No longer waiting' : `Request ${pending.indexOf(active) + 1} of ${pending.length}` +
+      (state.total > pending.length ? ` · ${state.total} reported` : '');
+  const other = pending.some(card => card !== active);
+  nextRequest.textContent = !other && (active?.succeeded || active?.expired) ? 'Done' : 'Next request';
+  nextRequest.disabled = !!active?.busy || (!other && !active?.succeeded && !active?.expired);
+  nextRequest.hidden = !active;
+  inboxBadge.textContent = state.total;
+  inboxBadge.hidden = state.total === 0;
+}
+window.addEventListener('popstate', event => {
+  if (!paired || !selectView) return;
+  const id = typeof event.state?.notifySession === 'string' ? event.state.notifySession : null;
+  if (currentSessionID !== id) { currentSessionID = id; workspace.selectSession(id); }
+  selectView(event.state?.notifyView ?? location.hash.slice(1), false);
+});
 
 function updatePush() {
   if (!pushButton) return;
@@ -210,8 +312,9 @@ function requestHeader(item) {
 function makeCard(item) {
   const node = el('article', undefined, 'request');
   const header = requestHeader(item);
-  node.append(header);
-  const card = { node, header, item, forms: new Map(), submitted: false, busy: false, error: '', succeeded: false };
+  const body = el('div', undefined, 'request-body');
+  body.append(header); node.append(body);
+  const card = { node, header, item, forms: new Map(), submitted: false, busy: false, error: '', succeeded: false, present: true };
   const controls = el('div');
   if (item.request.kind === 'question') {
     for (const [index, q] of item.request.questions.entries()) {
@@ -256,32 +359,37 @@ function makeCard(item) {
       actions.append(scope);
     }
     if (item.request.supportsFeedback) {
+      const feedback = el('details', undefined, 'denial-feedback');
+      feedback.append(el('summary', 'Add denial instructions'));
       const label = el('label', 'Optional feedback when denying', 'input-label');
       card.feedback = el('textarea'); card.feedback.maxLength = 4000; card.feedback.setAttribute('aria-label', 'Optional feedback when denying');
-      label.append(card.feedback); controls.append(label);
+      label.append(card.feedback); feedback.append(label); controls.append(feedback);
     }
   } else {
     actions.append(button('Send answer', 'primary', () => send(card, 'answer')),
       button('Decline request', 'deny', () => send(card, 'deny')));
   }
-  card.controls = controls; controls.append(actions);
+  card.controls = controls;
   card.message = el('p', '', 'message'); card.message.setAttribute('role', 'status');
-  node.append(controls, card.message);
+  const actionArea = el('div', undefined, 'request-actions');
+  actionArea.append(actions, card.message);
+  body.append(controls); node.append(actionArea);
   return card;
 }
 
 function updateCard(card) {
-  const disabled = !connected || card.busy || card.submitted || card.item.sending;
-  for (const control of card.controls.querySelectorAll('button, input, textarea')) control.disabled = disabled;
+  const disabled = !connected || card.busy || card.submitted || card.item.sending || card.expired;
+  for (const control of card.node.querySelectorAll('button, input, textarea')) control.disabled = disabled;
   card.message.classList.toggle('error', !!card.error || !!card.item.error);
   card.message.textContent = card.error || (card.busy ? 'Waiting for agent acknowledgment…' :
     card.succeeded ? 'Agent acknowledged your reply.' : card.item.error ||
+    (card.expired ? 'This request is no longer waiting. Choose the next request to continue.' :
     (card.item.sending ? 'Already sent. Waiting for the Mac to update this request.' :
-      !connected ? 'Replies disabled until the Mac reconnects with a fresh request.' : ''));
+      !connected ? 'Replies disabled until the Mac reconnects with a fresh request.' : '')));
 }
 
 async function send(card, decision, permissionOptionID) {
-  if (!connected || card.busy || card.submitted || card.item.sending) return;
+  if (!connected || card.busy || card.submitted || card.item.sending || card.expired) return;
   const answers = {};
   if (decision === 'answer') {
     for (const q of card.item.request.questions) {
@@ -296,7 +404,7 @@ async function send(card, decision, permissionOptionID) {
       answers[q.id] = [...new Set(values)];
     }
   }
-  card.busy = true; card.submitted = true; card.error = ''; updateCard(card);
+  card.busy = true; card.submitted = true; card.error = ''; updateCard(card); renderReview();
   const item = card.item;
   try {
     await api('reply', {
@@ -311,7 +419,7 @@ async function send(card, decision, permissionOptionID) {
     if (error.network) connected = false;
     if (error.status === 401) { showPairing(error.message); return; }
   } finally {
-    card.busy = false; updateCard(card);
+    card.busy = false; updateCard(card); renderReview();
   }
   void refresh();
 }
@@ -327,13 +435,13 @@ async function refresh() {
     deviceBar.replaceChildren(el('span', `Paired · ${state.device.name}`), el('span', state.pushEnabled ? 'Push enabled' : 'Push not enabled'));
     banner.hidden = connected;
     banner.textContent = connected ? '' : 'The Mac is unavailable or its requests are stale. Keep it awake and reconnect before replying.';
-    root.querySelector('.count').textContent = connected ? `${state.total} pending` : '';
     if (connected) {
       const keys = new Set(state.requests.map(item => item.ticket));
       for (const [key, card] of cards) {
-        if (!keys.has(key)) { card.node.remove(); cards.delete(key); }
+        card.present = keys.has(key); card.expired = !card.present;
+        if (!card.present && key !== activeTicket && !card.busy) { card.node.remove(); cards.delete(key); }
+        else updateCard(card);
       }
-      list.querySelector('.empty')?.remove();
       for (const item of state.requests) {
         let card = cards.get(item.ticket);
         const signature = JSON.stringify({
@@ -352,17 +460,12 @@ async function refresh() {
           const header = requestHeader(item); card.header.replaceWith(header); card.header = header;
           card.headerSignature = headerSignature;
         }
-        card.item = item; updateCard(card);
-      }
-      if (!cards.size) {
-        const empty = el('section', undefined, 'empty');
-        empty.append(el('div', '✓', 'empty-mark'), el('h2', 'All caught up'),
-          el('p', 'New requests will appear here. You can leave this app open or enable alerts below.'));
-        list.append(empty);
+        card.item = item; card.present = true; card.expired = false; updateCard(card);
       }
     } else {
       for (const card of cards.values()) updateCard(card);
     }
+    renderReview();
     updatePush();
     workspace?.setConnected(connected);
   } catch (error) {
