@@ -113,7 +113,7 @@ Use the bottom navigation to move between **Inbox**, **Sessions** and **Settings
 
 When an alert arrives, open **Inbox** to review one request at a time. Read the command, address or question, then approve, deny or answer. Scroll the request for longer details; decision buttons stay in the action area below. Use the request picker or **Next request** to switch without losing an unsent answer. **Add denial instructions** opens optional feedback. Custom input appears only when the agent allows it; permission scopes are the ones it actually offers.
 
-Keep the app open until your reply is acknowledged. The disabled receipt stays in place until you choose **Next request** or **Done**, so another approval cannot replace the button you just tapped. Requests answered elsewhere also remain disabled until you move on. If the Mac is offline or the request has changed, Notify disables the action rather than queuing an approval for later.
+Keep the app open until your reply is acknowledged. Completed requests disappear automatically and the next waiting request opens; there is no **Done** step. Requests answered elsewhere also disappear. Failed or unconfirmed replies stay visible while still pending. If the Mac is offline or the request has changed, Notify disables the action rather than queuing an approval for later.
 
 ### Sessions, chat and hierarchy
 

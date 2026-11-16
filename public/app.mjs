@@ -225,9 +225,16 @@ function buildWorkspace() {
 function renderReview() {
   if (!paired || !requestPicker) return;
   const pending = [...cards.values()].filter(card => card.present && !card.succeeded);
-  if (!activeTicket) activeTicket = pending[0]?.item.ticket ?? null;
+  const previous = cards.get(activeTicket);
+  if (!previous?.busy && (!previous?.present || previous.succeeded)) activeTicket = pending[0]?.item.ticket ?? null;
   const active = cards.get(activeTicket);
-  for (const card of cards.values()) card.node.hidden = card !== active;
+  for (const [ticket, card] of cards) {
+    if (card.succeeded || (!card.present && !card.busy)) {
+      card.node.remove();
+      // Retain acknowledged tickets until the Mac drops them, so a stale snapshot cannot reopen them.
+      if (!card.present) cards.delete(ticket);
+    } else card.node.hidden = card !== active;
+  }
   emptyView.hidden = !!active;
   emptyView.querySelector('h2').textContent = connected ? 'All caught up' : 'Waiting for your Mac';
   const choices = active && !pending.includes(active) ? [active, ...pending] : pending;
@@ -242,15 +249,13 @@ function renderReview() {
   requestPicker.value = activeTicket ?? '';
   requestPicker.hidden = choices.length < 2;
   requestPicker.disabled = !!active?.busy;
-  requestPosition.textContent = !active ? '' : active.succeeded ? 'Reply acknowledged' :
-    active.expired ? 'No longer waiting' : `Request ${pending.indexOf(active) + 1} of ${pending.length}` +
-      (state.total > pending.length ? ` · ${state.total} reported` : '');
+  requestPosition.textContent = !active ? '' : active.expired ? 'Waiting for acknowledgment' :
+    `Request ${pending.indexOf(active) + 1} of ${pending.length}`;
   const other = pending.some(card => card !== active);
-  nextRequest.textContent = !other && (active?.succeeded || active?.expired) ? 'Done' : 'Next request';
-  nextRequest.disabled = !!active?.busy || (!other && !active?.succeeded && !active?.expired);
+  nextRequest.disabled = !!active?.busy || !other;
   nextRequest.hidden = !active;
-  inboxBadge.textContent = state.total;
-  inboxBadge.hidden = state.total === 0;
+  inboxBadge.textContent = pending.length;
+  inboxBadge.hidden = pending.length === 0;
 }
 window.addEventListener('popstate', event => {
   if (!paired || !selectView) return;

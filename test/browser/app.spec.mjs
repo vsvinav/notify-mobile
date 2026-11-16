@@ -54,7 +54,7 @@ test('focused review keeps one request, stable drafts and separate settings', as
   expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThanOrEqual(844);
 });
 
-test('focused review holds an acknowledged request until explicit next, without a second approval', async ({ page }) => {
+test('focused review removes acknowledged requests and advances without another tap or approval', async ({ page }) => {
   const second = { ...permission('second-ticket'), notificationID: 'second-notification',
     request: { ...permission().request, id: 'second-request', title: 'Second request' } };
   current = [permission(), second];
@@ -62,31 +62,27 @@ test('focused review holds an acknowledged request until explicit next, without 
   await connect(page);
   await page.getByRole('button', { name: 'Allow once', exact: true }).click();
   await expect(page.getByText('Waiting for agent acknowledgment…', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: permission().request.title, exact: true })).toBeVisible();
   const command = f.events.findLast(e => e.type === 'reply');
   await f.app.command({ type: 'result', id: command.id, ok: true });
-  current = [second];
-  await f.app.command({ type: 'snapshot', requests: current, total: 1 });
-  await expect(page.getByText('Agent acknowledged your reply.', { exact: true })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Second request', exact: true })).toBeHidden();
-  await expect(page.getByRole('button', { name: 'Allow once', exact: true })).toBeDisabled();
-  expect(f.events.filter(e => e.type === 'reply')).toHaveLength(1);
-  await page.getByRole('button', { name: 'Next request', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Second request', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: permission().request.title, exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toHaveCount(0);
+  await expect(page.locator('.inbox-badge')).toHaveText('1');
+  await page.waitForResponse(response => new URL(response.url()).pathname === '/api/state');
+  await expect(page.getByRole('heading', { name: permission().request.title, exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Allow once', exact: true })).toBeEnabled();
   expect(f.events.filter(e => e.type === 'reply')).toHaveLength(1);
 });
 
-test('focused review does not replace a request answered elsewhere with another live approval', async ({ page }) => {
+test('focused review removes a request answered elsewhere without submitting the next one', async ({ page }) => {
   current = [permission(), question()];
   await f.app.command({ type: 'snapshot', requests: current, total: 2 });
   await connect(page);
   current = [question()];
   await f.app.command({ type: 'snapshot', requests: current, total: 1 });
-  await expect(page.getByText('This request is no longer waiting. Choose the next request to continue.', { exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Allow once', exact: true })).toBeDisabled();
-  await expect(page.getByRole('heading', { name: 'How should we ship this?', exact: true })).toBeHidden();
-  await page.getByRole('button', { name: 'Next request', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'How should we ship this?', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Allow once', exact: true })).toHaveCount(0);
   expect(f.events.filter(e => e.type === 'reply')).toHaveLength(0);
 });
 
@@ -100,7 +96,9 @@ test('denial instructions stay optional and send only with the exact denial', as
   const command = f.events.findLast(e => e.type === 'reply');
   expect(command).toMatchObject({ decision: 'deny', ticket: permission().ticket, feedback: 'Use the local preview instead.' });
   await f.app.command({ type: 'result', id: command.id, ok: true });
-  await expect(page.getByText('Agent acknowledged your reply.', { exact: true })).toBeVisible();
+  await expect(page.getByText('All caught up', { exact: true })).toBeVisible();
+  await expect(page.locator('.request')).toHaveCount(0);
+  await expect(page.locator('.inbox-badge')).toBeHidden();
 });
 
 test('certificate setup continues to the actual app without automatic navigation', async ({ page }) => {
@@ -133,7 +131,6 @@ test('pairing, exact targets, native acknowledgment and screenshots in both them
   await f.app.command({ type: 'result', id: command.id, ok: true });
   current = [];
   await f.app.command({ type: 'snapshot', requests: [], total: 0 });
-  await page.getByRole('button', { name: 'Done', exact: true }).click();
   await expect(page.getByText('All caught up')).toBeVisible();
   expect(errors).toEqual([]);
 });
