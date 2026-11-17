@@ -50,6 +50,7 @@ function signed(record, signature) {
 }
 const sameAccount = (a, b) => a?.issuer === b?.issuer && a?.subject === b?.subject;
 const accountCopy = account => account && ({ issuer: account.issuer, subject: account.subject });
+const pushToken = value => typeof value === 'string' && /^[A-Za-z0-9_:.-]{16,2048}$/.test(value);
 
 // Enrollment flows and routing are memory-only. A local Mac allowlist
 // and end-to-end key verification remain mandatory, including for pending grants.
@@ -76,7 +77,16 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
         !Array.isArray(initialState.macs) || initialState.macs.length > 64) throw new Error();
       const hashes = new Set();
       for (const mac of initialState.macs) {
-        shape(mac, ['macID', 'publicKey', 'credentialHash', 'account', 'devices']);
+        shape(mac, ['macID', 'publicKey', 'credentialHash', 'account', 'devices'], ['attention']);
+        if (mac.attention !== undefined) {
+          shape(mac.attention, ['lastAt', 'events']);
+          if (!Number.isSafeInteger(mac.attention.lastAt) || mac.attention.lastAt < 0 ||
+            !Array.isArray(mac.attention.events) || mac.attention.events.length > 8 ||
+            !mac.attention.events.every(e => {
+              shape(e, ['eventID', 'issuedAt']);
+              return uuid(e.eventID) && Number.isSafeInteger(e.issuedAt) && e.issuedAt >= 0;
+            })) throw new Error();
+        }
         shape(mac.account, ['issuer', 'subject']);
         if (!uuid(mac.macID) || macs.has(mac.macID) || typeof mac.credentialHash !== 'string' ||
           !/^[a-f0-9]{64}$/.test(mac.credentialHash) ||
@@ -85,7 +95,8 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
         hashes.add(mac.credentialHash);
         const devices = new Map();
         for (const device of mac.devices) {
-          shape(device, ['deviceID', 'publicKey', 'name']);
+          shape(device, ['deviceID', 'publicKey', 'name'], ['pushToken']);
+          if (device.pushToken !== undefined && !pushToken(device.pushToken)) throw new Error();
           if (!uuid(device.deviceID) || devices.has(device.deviceID) || !identity(device.name) ||
             device.name.length > 128 || device.name.trim() !== device.name) throw new Error();
           devices.set(device.deviceID, { ...device, key: key(device.publicKey),
@@ -97,6 +108,7 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     } catch { throw new Error('Invalid remote trust storage. Inspect it before starting the service.'); }
   }
   const subscriptions = new Map();
+  const pendingAttention = new Map();
   let closed = false, fault = false, mono = -Infinity, wall = -Infinity, timer, active = 0;
 
   function unwatch(record) {
@@ -147,6 +159,7 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     for (const mac of macs.values()) if (mac.pending) unwatch(mac.pending);
     bootstraps.clear();
     macs.clear();
+    pendingAttention.clear();
   }
   function close() { closed = true; clear(); }
   function time() {
@@ -184,6 +197,7 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     }
     for (const record of challenges.values()) if (!valid(record)) dropChallenge(record);
     for (const record of grants.values()) if (!valid(record)) dropGrant(record);
+    for (const [id, record] of pendingAttention) if (wall - record.event.issuedAt >= 120000) pendingAttention.delete(id);
   }
   function schedule() {
     // Abort callbacks only remove deadlines; they must not re-arm from stale mono.
@@ -375,7 +389,7 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     shape(input, ['id', 'signature']);
     decode(input.id, 32);
     const record = challenges.get(input.id);
-    if (!record) fail(401, 'Routing challenge unavailable.');
+    if (!record || record.purpose === 'push') fail(401, 'Routing challenge unavailable.');
     let finishProof;
     if (record.role === 'phone') {
       if (req?.headers?.origin !== origin) fail(403, 'Authorization origin rejected.');
@@ -505,16 +519,97 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     schedule();
     return { deviceID: device.deviceID, revoked: true };
   }
+  async function beginPush(req, input) {
+    return accountOperation(async () => {
+      shape(input, ['macID', 'deviceID', 'token']);
+      if (!uuid(input.macID) || !(input.token === null || pushToken(input.token)))
+        fail(400, 'Invalid push registration.');
+      if (req?.headers?.origin !== origin) fail(403, 'Authorization origin rejected.');
+      const accountProof = await proof(req, false), mac = macs.get(input.macID);
+      if (!mac) fail(401, 'Mac enrollment unavailable.');
+      if (!sameAccount(mac.account, accountProof)) fail(403, 'Approved device and owner required.');
+      if (input.token === null && uuid(input.deviceID) && !mac.devices.has(input.deviceID) &&
+        mac.pending?.deviceID !== input.deviceID)
+        return { enabled: false, absent: true, macID: mac.macID, deviceID: input.deviceID };
+      const device = target(mac, input.deviceID);
+      if (!device.approved || !sameAccount(mac.account, accountProof))
+        fail(403, 'Approved device and owner required.');
+      if (challenges.size >= 128) fail(429, 'Authorization capacity reached.');
+      const record = { ...flow('push', { macID: mac.macID, deviceID: device.deviceID,
+        token: input.token }, device.key, GRANT_TTL), purpose: 'push', mac, device,
+        token: input.token, proof: accountProof };
+      challenges.set(record.id, record);
+      watch(record, accountProof.signal, () => dropChallenge(record));
+      schedule();
+      return publicFlow(record);
+    });
+  }
+  function finishPush(req, input) {
+    check();
+    shape(input, ['id', 'signature']);
+    decode(input.id, 32);
+    if (req?.headers?.origin !== origin) fail(403, 'Authorization origin rejected.');
+    const record = challenges.get(input.id);
+    if (record?.purpose !== 'push') fail(401, 'Push challenge unavailable.');
+    const finishProof = checkedProof(accounts.authorize(req, { requireFresh: false }));
+    check();
+    if (!sameAccount(finishProof, record.proof)) fail(403, 'Account does not own this challenge.');
+    dropChallenge(record);
+    signed(record, input.signature);
+    if (!valid(record) || !record.device.approved) fail(401, 'Push authorization expired.');
+    if (record.token === null) delete record.device.pushToken;
+    else record.device.pushToken = record.token;
+    // Older outstanding token changes must not overwrite this explicit decision.
+    for (const other of challenges.values())
+      if (other.purpose === 'push' && other.device === record.device) dropChallenge(other);
+    return { enabled: record.token !== null };
+  }
+  function attentionEvent(input) {
+    shape(input, ['eventID', 'issuedAt']);
+    if (!uuid(input.eventID) || !Number.isSafeInteger(input.issuedAt) ||
+      input.issuedAt > wall + 5000 || wall - input.issuedAt >= 120000)
+      fail(400, 'Invalid attention event.');
+  }
+  function reserveAttention(credential, input) {
+    check();
+    attentionEvent(input);
+    const mac = host(credential);
+    const previous = mac.attention;
+    if (previous && (wall - previous.lastAt < 30000 ||
+      previous.events.some(e => e.eventID === input.eventID))) return { accepted: false };
+    const devices = [...mac.devices.values()].filter(d => d.pushToken);
+    if (!devices.length) return { accepted: false };
+    mac.attention = { lastAt: wall, events: [
+      ...(previous?.events ?? []).filter(e => wall - e.issuedAt < 120000), { ...input }
+    ].slice(-8) };
+    pendingAttention.set(input.eventID, { mac, event: { ...input },
+      devices: devices.map(device => ({ device, token: device.pushToken })) });
+    return { accepted: true };
+  }
+  function dispatchAttention(credential, input, send) {
+    check();
+    attentionEvent(input);
+    const mac = host(credential), pending = pendingAttention.get(input.eventID);
+    if (!pending || pending.mac !== mac || pending.event.issuedAt !== input.issuedAt) return [];
+    pendingAttention.delete(input.eventID);
+    const data = { type: 'attention', version: '1', eventID: input.eventID, issuedAt: String(input.issuedAt) };
+    return pending.devices.filter(({ device, token }) =>
+      mac.devices.get(device.deviceID) === device && device.pushToken === token)
+      .map(({ token }) => send(token, data));
+  }
   function snapshot() {
     return { version: 1, origin, macs: [...macs.values()].filter(mac => mac.account).map(mac => ({
       macID: mac.macID, publicKey: mac.publicKey, credentialHash: mac.credentialHash,
       account: accountCopy(mac.account),
-      devices: [...mac.devices.values()].map(({ deviceID, publicKey, name }) => ({ deviceID, publicKey, name }))
+      ...(mac.attention ? { attention: structuredClone(mac.attention) } : {}),
+      devices: [...mac.devices.values()].map(({ deviceID, publicKey, name, pushToken }) =>
+        ({ deviceID, publicKey, name, ...(pushToken ? { pushToken } : {}) }))
     })) };
   }
   time();
   return Object.freeze({ beginMac, registerMac, requestPair, macStatus, invite, decidePair,
-    beginGrant, finishGrant, renewGrant, authorizeRelay, revokeDevice, close, snapshot });
+    beginGrant, finishGrant, renewGrant, authorizeRelay, revokeDevice, beginPush, finishPush,
+    reserveAttention, dispatchAttention, close, snapshot });
 }
 
 async function storedAuthority({ store, ...options }) {
@@ -535,6 +630,11 @@ async function storedAuthority({ store, ...options }) {
       queued++;
       const pending = serial.then(async () => {
         if (closed) fail(503, 'Remote authorization unavailable.');
+        if (name === 'dispatchAttention') {
+          try { await store.check(); } catch { close(); fail(503, 'Remote trust storage unavailable.'); }
+          if (closed) fail(503, 'Remote authorization unavailable.');
+          return operation(...args);
+        }
         const before = JSON.stringify(authority.snapshot());
         const value = await operation(...args);
         const next = authority.snapshot();

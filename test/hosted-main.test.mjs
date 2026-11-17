@@ -83,6 +83,7 @@ async function fixture(t, options = {}) {
   async function start() {
     const stores = await options.storageFactory?.();
     app = await createHostedService({ origin, managedIngress: 'render-free', android: options.android,
+      fcm: options.fcm,
       publicDirectory: directory, store: stores?.accounts ?? { read: async () => null, write: async () => {} },
       trustStore: stores?.trust, persistence: stores, reportError: error => errors.push(error.message) });
     app.server.listen(0, '127.0.0.1');
@@ -118,6 +119,39 @@ async function fixture(t, options = {}) {
   return { get server() { return app.server; }, close: () => app.close(), request, errors,
     restart: async () => { await app.close(); await start(); } };
 }
+
+test('hosted push endpoints bind exact signed device and dispatch generic attention once', async t => {
+  const sent = [];
+  const app = await fixture(t, { fcm: { prepare: async () => (token, data) => { sent.push({ token, data }); } } });
+  const cookie = await registerAccount(app), mac = deviceKey(), phone = deviceKey();
+  const macID = randomUUID(), deviceID = randomUUID();
+  const call = async (path, body, headers) => {
+    const result = await app.request(`/v1/remote/${path}`, { body, headers });
+    assert.equal(result.status, 200, path);
+    return result.json();
+  };
+  const bootstrap = await call('mac/begin', { macID, publicKey: mac.publicKey });
+  const host = await call('mac/register', mac.finish(bootstrap));
+  const native = { authorization: `Bearer ${host.credential}` }, account = { origin, cookie };
+  const pending = await call('pair', { setupID: host.setupID, deviceID, publicKey: phone.publicKey, name: 'Phone' }, account);
+  await call('mac/decision', { id: pending.id, allow: true }, native);
+  const input = { macID, deviceID, token: 'synthetic-provider-token' };
+  assert.equal((await app.request('/v1/remote/push/begin', { body: input, headers: native })).status, 403);
+  const flow = await call('push/begin', input, account);
+  await call('push/finish', phone.finish(flow), account);
+  const event = { eventID: randomUUID(), issuedAt: Date.now() };
+  assert.equal((await app.request('/v1/remote/mac/attention', { body: event, headers: account })).status, 403);
+  await call('mac/attention', event, native);
+  await call('mac/attention', event, native);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].token, input.token);
+  assert.equal(sent[0].data.type, 'attention');
+  assert.ok(!JSON.stringify(await call('mac/status', {}, native)).includes(input.token));
+  const remove = await call('push/begin', { ...input, token: null }, account);
+  await call('push/finish', phone.finish(remove), account);
+  await call('mac/revoke', { deviceID }, native);
+  assert.equal((await app.request('/v1/remote/push/begin', { body: input, headers: account })).status, 401);
+});
 
 test('hosted durable accounts and approved pairing survive reconstruction without saving sessions or grants', async t => {
   const db = firestoreFixture();

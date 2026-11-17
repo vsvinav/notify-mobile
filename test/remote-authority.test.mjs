@@ -117,6 +117,80 @@ const renewalInput = (grant, key) => ({
   id: grant.renewal.id, signature: key.sign(grant.renewal.challenge)
 });
 
+test('push registration requires live owner and approved device signature over exact token', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  const input = { macID: host.macID, deviceID: phone.deviceID, token: 'synthetic-token-123' };
+  await assert.rejects(f.authority.beginPush(phone.session.req, input), status(403));
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  await assert.rejects(f.authority.beginPush(f.account('other').req, input), status(403));
+  await assert.rejects(f.authority.beginPush(phone.session.req, { ...input, token: '\ninvalid' }), status(400));
+  const flow = await f.authority.beginPush(phone.session.req, input);
+  assert.equal(JSON.parse(flow.challenge).token, input.token);
+  assert.equal(JSON.parse(flow.challenge).purpose, 'push');
+  assert.throws(() => f.authority.finishGrant({ id: flow.id, signature: phone.key.sign(flow.challenge) }, phone.session.req), status(401));
+  assert.throws(() => f.authority.finishPush(f.account('other').req,
+    { id: flow.id, signature: phone.key.sign(flow.challenge) }), status(403));
+  assert.throws(() => f.authority.finishPush(phone.session.req,
+    { id: flow.id, signature: host.key.sign(flow.challenge) }), status(401));
+  const fresh = await f.authority.beginPush(phone.session.req, input);
+  assert.deepEqual(f.authority.finishPush(phone.session.req,
+    { id: fresh.id, signature: phone.key.sign(fresh.challenge) }), { enabled: true });
+  assert.ok(!JSON.stringify(f.authority.macStatus(host.credential)).includes(input.token));
+  const stale = await f.authority.beginPush(phone.session.req, { ...input, token: 'replacement-token-123' });
+  f.advance(30001);
+  assert.throws(() => f.authority.finishPush(phone.session.req,
+    { id: stale.id, signature: phone.key.sign(stale.challenge) }), status(401));
+  const remove = await f.authority.beginPush(phone.session.req, { ...input, token: null });
+  assert.deepEqual(f.authority.finishPush(phone.session.req,
+    { id: remove.id, signature: phone.key.sign(remove.challenge) }), { enabled: false });
+  assert.ok(!JSON.stringify(f.authority.snapshot()).includes(input.token));
+});
+
+test('generic attention is durable, deduplicated, bounded and cannot outlive revocation or opt-out', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const update = async token => {
+    const flow = await f.authority.beginPush(phone.session.req, { macID: host.macID, deviceID: phone.deviceID, token });
+    return f.authority.finishPush(phone.session.req, { id: flow.id, signature: phone.key.sign(flow.challenge) });
+  };
+  await update('synthetic-token-123');
+  const event = { eventID: randomUUID(), issuedAt: 1800000000000 };
+  assert.equal(f.authority.reserveAttention(host.credential, event).accepted, true);
+  const sent = [];
+  const send = (token, data) => { sent.push({ token, data }); };
+  f.authority.dispatchAttention(host.credential, event, send);
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].data, { type: 'attention', version: '1', eventID: event.eventID,
+    issuedAt: String(event.issuedAt) });
+  f.authority.dispatchAttention(host.credential, event, send);
+  assert.equal(sent.length, 1);
+  assert.equal(f.authority.reserveAttention(host.credential, event).accepted, false);
+  assert.equal(f.authority.reserveAttention(host.credential, { ...event, eventID: randomUUID() }).accepted, false);
+  const restored = createRemoteAuthority({ origin, accounts: { authorize() { throw Error(); } },
+    initialState: f.authority.snapshot(), now: () => 1000, wallNow: () => event.issuedAt });
+  t.after(() => restored.close());
+  assert.equal(restored.reserveAttention(host.credential, event).accepted, false);
+  f.advance(30001);
+  const next = { eventID: randomUUID(), issuedAt: event.issuedAt + 30001 };
+  assert.equal(f.authority.reserveAttention(host.credential, next).accepted, true);
+  await update(null);
+  f.authority.dispatchAttention(host.credential, next, send);
+  assert.equal(sent.length, 1);
+  await update('rotated-token-123');
+  f.advance(30001);
+  const last = { eventID: randomUUID(), issuedAt: next.issuedAt + 30001 };
+  f.authority.reserveAttention(host.credential, last);
+  f.authority.revokeDevice(host.credential, { deviceID: phone.deviceID });
+  f.authority.dispatchAttention(host.credential, last, send);
+  assert.equal(sent.length, 1);
+  await assert.rejects(update('revoked-token-123'), status(401));
+  assert.deepEqual(await f.authority.beginPush(phone.session.req,
+    { macID: host.macID, deviceID: phone.deviceID, token: null }),
+  { enabled: false, absent: true, macID: host.macID, deviceID: phone.deviceID });
+  await assert.rejects(f.authority.beginPush(f.account('other').req,
+    { macID: host.macID, deviceID: phone.deviceID, token: null }), status(403));
+});
+
 test('durable approval retains exact owner and public keys, but no grants or account proofs, after restart', async t => {
   let saved = null;
   const store = { read: async () => structuredClone(saved),
@@ -182,6 +256,50 @@ async function durableFixture(t) {
     publicKey: phone.publicKey, name: 'Phone' });
   return { db, authority, start, req, otherReq, controller, mac, phone, macID, deviceID, host, pending };
 }
+
+test('push routes persist without grants; failed rotation and removal cannot acknowledge or erase the previous route', async t => {
+  const f = await durableFixture(t);
+  await f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true });
+  const change = async (authority, token) => {
+    const flow = await authority.beginPush(f.req, { macID: f.macID, deviceID: f.deviceID, token });
+    return authority.finishPush(f.req, { id: flow.id, signature: f.phone.sign(flow.challenge) });
+  };
+  await change(f.authority, 'first-synthetic-token');
+  let current = await f.start();
+  let serialized = JSON.stringify([...f.db.documents]);
+  assert.ok(serialized.includes('first-synthetic-token'));
+  assert.ok(!serialized.includes('Notify remote authorization'));
+  const event = { eventID: randomUUID(), issuedAt: Date.now() };
+  await current.reserveAttention(f.host.credential, event);
+  const sent = [];
+  await current.dispatchAttention(f.host.credential, event, token => sent.push(token));
+  assert.deepEqual(sent, ['first-synthetic-token']);
+  for (const token of ['second-synthetic-token', null]) {
+    const flow = await current.beginPush(f.req, { macID: f.macID, deviceID: f.deviceID, token });
+    f.db.beforeCommit(() => { throw new Error('Synthetic unavailable'); });
+    await assert.rejects(current.finishPush(f.req, { id: flow.id, signature: f.phone.sign(flow.challenge) }), status(503));
+    serialized = JSON.stringify([...f.db.documents]);
+    assert.ok(serialized.includes('first-synthetic-token'));
+    assert.ok(!serialized.includes('second-synthetic-token'));
+    f.db.beforeCommit(undefined);
+    current = await f.start();
+  }
+  await change(current, null);
+  assert.ok(!JSON.stringify([...f.db.documents]).includes('first-synthetic-token'));
+});
+
+test('a replaced fence prevents attention dispatch even after the old process reserved an event', async t => {
+  const f = await durableFixture(t);
+  await f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true });
+  const flow = await f.authority.beginPush(f.req, { macID: f.macID, deviceID: f.deviceID, token: 'synthetic-provider-token' });
+  await f.authority.finishPush(f.req, { id: flow.id, signature: f.phone.sign(flow.challenge) });
+  const event = { eventID: randomUUID(), issuedAt: Date.now() };
+  await f.authority.reserveAttention(f.host.credential, event);
+  await f.start();
+  let sent = false;
+  await assert.rejects(f.authority.dispatchAttention(f.host.credential, event, () => { sent = true; }), status(503));
+  assert.equal(sent, false);
+});
 
 test('durable trust rejects wrong owner/key and fences stale leases and pending decisions after takeover/revocation', async t => {
   const f = await durableFixture(t);

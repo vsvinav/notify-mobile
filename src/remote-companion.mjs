@@ -64,6 +64,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
   let message = 'Waiting for phone sign-in.', fault, enrollmentError;
   const channels = new Map();
   const channelWork = new Set(), lifetime = new AbortController();
+  let attentionWork, lastAttention = -Infinity;
   const openCrypto = () => cryptoProcess(executable, ['load-identity', state.macID, JSON.stringify([...Buffer.from(state.publicKey, 'base64url')])]);
   const raw = await readPrivate(file);
   if (raw === null) {
@@ -100,6 +101,14 @@ export async function createRemoteCompanion({ directory, origin, emit,
     return next;
   }
   const actions = new RemoteActions({
+    attention() {
+      if (closed || paused || fault || enrollmentError || !state.owner || !state.credential ||
+        !state.devices.length || attentionWork || performance.now() - lastAttention < 30000) return;
+      lastAttention = performance.now();
+      attentionWork = api('mac/attention', { eventID: randomUUID(), issuedAt: Date.now() }, state.credential)
+        .catch(() => { /* Best effort only; never replay a request or its attention event. */ })
+        .finally(() => { attentionWork = undefined; });
+    },
     emit, devices: () => [...channels.values()].filter(c => c.handle && !c.signal.aborted)
       .map(c => ({ id: c.device.id, name: c.device.name, expires: c.expiresAt }))
   });
@@ -497,6 +506,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
     for (const channel of channels.values()) channel.controller.abort();
     await signer.close();
     await polling;
+    await attentionWork;
     await Promise.all(channelWork);
     await writer;
   } };

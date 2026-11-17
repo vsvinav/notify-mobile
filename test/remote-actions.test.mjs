@@ -3,6 +3,26 @@ import assert from 'node:assert/strict';
 import { permission } from './fixtures.mjs';
 import { RemoteActions } from '../src/remote-actions.mjs';
 
+test('attention observes only new validated waiting requests, not snapshot polling or replies', () => {
+  let attention = 0;
+  const actions = new RemoteActions({ emit() {}, devices: () => [], attention: () => attention++ });
+  const item = permission();
+  const snapshot = requests => ({ type: 'snapshot', total: requests.length, requests });
+  actions.command(snapshot([item]));
+  actions.command(snapshot([item]));
+  actions.command(snapshot([{ ...item, sending: true }]));
+  actions.command(snapshot([item]));
+  assert.equal(attention, 1);
+  actions.close();
+  actions.command(snapshot([item]));
+  assert.equal(attention, 1, 'transient disconnect must not replay attention');
+  actions.command(snapshot([{ ...item, ticket: 'new-ticket' }]));
+  assert.equal(attention, 2);
+  assert.throws(() => actions.command({ type: 'snapshot', requests: [{}] }));
+  assert.equal(attention, 2);
+  actions.close();
+});
+
 test('remote replies wait for native ACK and cannot be resent in the same generation', async () => {
   const events = [];
   const device = { id: 'phone', name: 'Phone', expires: Date.now() + 30000 };

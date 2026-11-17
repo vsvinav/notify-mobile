@@ -10,8 +10,10 @@ const keyOf = item => `${item.sessionID}\0${item.request.id}\0${item.ticket}`;
 export class RemoteActions {
   #emit; #now; #workspace; #requests = []; #total = 0; #updated = -Infinity;
   #pending = new Map(); #blocked = new Set(); #ackTimeout;
-  constructor({ emit, devices, now = Date.now, ackTimeout = 20000 }) {
+  #seen = new Set(); #attention;
+  constructor({ emit, devices, now = Date.now, ackTimeout = 20000, attention = () => {} }) {
     this.#emit = emit; this.#now = now; this.#ackTimeout = ackTimeout;
+    this.#attention = attention;
     this.#workspace = new Workspace({ emit, devices, now, ackTimeout, fail });
   }
   #finish(id, status, data) {
@@ -38,9 +40,12 @@ export class RemoteActions {
     }
     this.#requests = message.requests; this.#total = message.total; this.#updated = this.#now();
     const keys = new Set(this.#requests.map(keyOf));
+    const newlyWaiting = this.#requests.some(item => !item.sending && !this.#seen.has(keyOf(item)));
+    this.#seen = keys;
     for (const key of this.#blocked) if (!keys.has(key)) this.#blocked.delete(key);
     for (const [id, pending] of this.#pending) if (!keys.has(pending.key))
       this.#finish(id, 409, { ok: false, error: 'Request changed. Its earlier reply outcome may be unknown.' });
+    if (newlyWaiting) this.#attention();
   }
   async request(path, input, device, signal) {
     if (!object(input) || signal?.aborted) fail(400, 'Invalid or disconnected remote request.');

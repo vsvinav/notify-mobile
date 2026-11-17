@@ -176,7 +176,7 @@ export async function createFirestoreStores({ firestore, origin, now = () => per
   });
 }
 
-export async function createFirebaseStores({ origin, env = process.env, Firestore } = {}) {
+export async function firebaseConfiguration(env = process.env) {
   const projectId = env.NOTIFY_FIREBASE_PROJECT_ID, file = env.NOTIFY_FIREBASE_CREDENTIALS_FILE;
   if (projectId === undefined && file === undefined) return null;
   let handle, credentials;
@@ -209,6 +209,13 @@ export async function createFirebaseStores({ origin, env = process.env, Firestor
   } finally {
     await handle?.close();
   }
+  return { projectId, credentials };
+}
+
+export async function createFirebaseStores({ origin, env = process.env, Firestore } = {}) {
+  const config = await firebaseConfiguration(env);
+  if (!config) return null;
+  const { projectId, credentials } = config;
   let firestore;
   try {
     Firestore ??= (await import('@google-cloud/firestore')).Firestore;

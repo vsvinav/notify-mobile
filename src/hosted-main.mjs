@@ -8,7 +8,8 @@ import { createIngressPolicy } from './managed-ingress.mjs';
 import { createRemoteAuthority } from './remote-authority.mjs';
 import { createRemoteRelay } from './remote-relay.mjs';
 import { privateDirectory, stateStore } from './storage.mjs';
-import { createFirebaseStores } from './firestore-store.mjs';
+import { createFirebaseStores, firebaseConfiguration } from './firestore-store.mjs';
+import { createFcmSender } from './fcm.mjs';
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const BODY_LIMIT = 16384;
@@ -34,6 +35,9 @@ const FIELDS = new Map([
   ['/v1/remote/mac/invite', [[]]],
   ['/v1/remote/mac/decision', [['id', 'allow']]],
   ['/v1/remote/mac/revoke', [['deviceID']]],
+  ['/v1/remote/mac/attention', [['eventID', 'issuedAt']]],
+  ['/v1/remote/push/begin', [['macID', 'deviceID', 'token']]],
+  ['/v1/remote/push/finish', [['id', 'signature']]],
   ['/v1/remote/grant/begin', [['role', 'deviceID'], ['macID']]],
   ['/v1/remote/grant/finish', [['id', 'signature']]],
   ['/v1/remote/grant/renew', [['id', 'signature']]]
@@ -109,7 +113,7 @@ async function json(req, res) {
 }
 
 // Only the outer server listens. Inner modules receive the original request/socket.
-export async function createHostedService({ origin, managedIngress, store, trustStore, persistence, android,
+export async function createHostedService({ origin, managedIngress, store, trustStore, persistence, android, fcm,
   publicDirectory = resolve(ROOT, 'public'), reportError = () => {} } = {}) {
   if (typeof origin !== 'string' || new URL(origin).origin !== origin) throw new Error('An exact HTTPS origin is required.');
   const server = http.createServer({ maxHeaderSize: 8192, connectionsCheckingInterval: 1000 });
@@ -273,6 +277,23 @@ export async function createHostedService({ origin, managedIngress, store, trust
         case '/v1/remote/mac/invite': result = await authority.invite(bearer(req)); break;
         case '/v1/remote/mac/decision': result = await authority.decidePair(bearer(req), data); break;
         case '/v1/remote/mac/revoke': result = await authority.revokeDevice(bearer(req), data); break;
+        case '/v1/remote/push/begin':
+          browser(req, origin);
+          if (!fcm && data.token !== null) fail(503);
+          result = await authority.beginPush(req, data); break;
+        case '/v1/remote/push/finish':
+          browser(req, origin);
+          result = await authority.finishPush(req, data); break;
+        case '/v1/remote/mac/attention': {
+          const credential = bearer(req);
+          if (!fcm) fail(503);
+          result = await authority.reserveAttention(credential, data);
+          if (result.accepted) {
+            const send = await fcm.prepare();
+            await Promise.all(await authority.dispatchAttention(credential, data, send));
+          }
+          break;
+        }
         case '/v1/remote/grant/begin':
           if (data.role === 'mac') {
             native(req);
@@ -370,7 +391,11 @@ export async function main() {
       await privateDirectory(directory);
       store = stateStore(directory);
     }
+    const pushConfig = process.env.NOTIFY_FCM_ENABLED === 'true' ? await firebaseConfiguration() : null;
+    if (process.env.NOTIFY_FCM_ENABLED === 'true' && !pushConfig)
+      throw new Error('FCM requires explicit Notify Firebase configuration.');
     app = await createHostedService({ origin, managedIngress: 'render-free', android,
+      fcm: pushConfig ? createFcmSender(pushConfig) : undefined,
       store, trustStore: durable?.trust, persistence: durable,
       reportError: () => process.stderr.write('Hosted service operation failed.\n') });
     await new Promise((resolve, reject) => {

@@ -140,3 +140,46 @@ To disconnect a phone, choose **Revoke** beside it in the Mac's Phone connection
 ---
 
 [Get Notify for Mac](https://github.com/vsvinav/notify) · [Report an issue](https://github.com/vsvinav/notify-mobile/issues)
+
+## Android background attention (hosted preview)
+
+The hosted service can deliver generic FCM data messages to an explicitly opted-in,
+locally approved Android device. Enable with `NOTIFY_FCM_ENABLED=true`, using the
+existing explicit `NOTIFY_FIREBASE_PROJECT_ID` and
+`NOTIFY_FIREBASE_CREDENTIALS_FILE`. No application-default credentials are used.
+The matching Notify-only service account needs `cloudmessaging.messages.create`
+(for example the Firebase Cloud Messaging API Admin role) in that project, and
+the Firebase Cloud Messaging API must be enabled. Keep the credential file private;
+never place it in source, logs or the Android APK. No new paid service is required.
+When FCM is off/unconfigured, new token registration and attention fail closed;
+signed token removal remains available.
+Disable delivery using this flag while retaining the new server binary for rollback:
+older binaries do not understand the added private trust-record fields and fail
+closed rather than silently dropping routes. Do not edit production trust documents.
+
+`POST /v1/remote/push/begin` uses the existing exact-origin account session and
+`{macID, deviceID, token}` (`null` removes). Only the enrolled, Mac-approved
+P-256 device key can finish `/push/finish` with `{id, signature}`. The existing
+`Notify remote authorization v1\0` signature domain covers an exact `push`
+challenge, origin, Mac/device IDs, raw token and nonce, expiring within 30 seconds.
+Account proof is checked again at finish. Removing an already-revoked device is a
+read-only owner-authorized absence confirmation, not a trust replacement.
+Private routing is persisted inside the existing fenced trust record; public
+Mac status and browser state contain no provider token.
+
+The companion observes validated native `snapshot` messages. Only a newly waiting
+request emits bearer-authenticated `/v1/remote/mac/attention` with a random
+`eventID` and `issuedAt`. Requests/conversations never leave encrypted channels.
+There is no Swift IPC extension and no status-poll-triggered FCM write or send.
+The service persists a bounded two-minute event history and a 30-second per-Mac
+send limit, then rechecks the current storage fence and device route immediately
+before sending. Revocation/opt-out before that point prevents sending; already
+issued provider messages may arrive for up to two minutes but carry no authority.
+No provider-send retries, cached action buttons, or mutation replay are introduced.
+
+FCM uses `google-auth-library` 11.3.4 (Apache-2.0, already present transitively)
+with explicit service-account credentials. OAuth and FCM use Google's fixed
+HTTPS endpoints; sends do not follow redirects or retry. Deployment acceptance
+must separately verify Google authorization, public-service pairing/controller
+paths, and physical Android delivery/channel settings. Local tests use synthetic
+credentials and captured messages, never real FCM.

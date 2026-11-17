@@ -288,8 +288,14 @@ test('helper requires full-key local approval and native ACK (injected crypto fi
     async close() {}
   });
   let decisions = 0;
+  const attention = [];
   const fetchRequest = async (url, options) => {
     const path = new URL(url).pathname;
+    if (path.endsWith('/mac/attention')) {
+      assert.equal(options.headers.Authorization, `Bearer ${'c'.repeat(43)}`);
+      attention.push(JSON.parse(options.body));
+      return Response.json({ accepted: true });
+    }
     if (path.endsWith('/mac/status')) return Response.json({
       macID, pending: decisions ? null : pending,
       devices: decisions ? [{ deviceID, publicKey: phoneKey, name: 'Phone' }] : []
@@ -328,6 +334,9 @@ test('helper requires full-key local approval and native ACK (injected crypto fi
     assert.ok(ready.epoch);
     assert.equal(events.findLast(e => e.type === 'status').status.state, 'connected');
     await helper.command({ type: 'snapshot', total: 1, requests: [permission()] });
+    await helper.command({ type: 'snapshot', total: 1, requests: [permission()] });
+    assert.equal(attention.length, 1);
+    assert.deepEqual(Object.keys(attention[0]).sort(), ['eventID', 'issuedAt']);
     const id = randomUUID();
     await receiver(Buffer.from(JSON.stringify({ id, epoch: ready.epoch, payload: { path: 'reply', data: {
       sessionID: 'session-1', requestID: 'request-1', ticket: 'ticket-1', decision: 'deny', answers: {}
@@ -345,6 +354,7 @@ test('helper requires full-key local approval and native ACK (injected crypto fi
       await until(() => frames.some(f => f.id === readID));
       assert.equal(frames.find(f => f.id === readID).status, 200, 'Read polling must not exhaust action history');
     }
+    assert.equal(attention.length, 1, 'Polling and reply acknowledgment never generate further provider events');
     const previousReceiver = receiver;
     closeRelay();
     await until(() => events.findLast(e => e.type === 'status').status.state !== 'connected');
