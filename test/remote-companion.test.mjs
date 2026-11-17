@@ -166,6 +166,83 @@ for (const path of ['mac/begin', 'mac/invite']) {
   });
 }
 
+for (const outcome of ['registered', 'retry', 'cancelled']) {
+  test(`startup and immediate pairing share one enrollment: ${outcome}`, async t => {
+    const directory = join(process.cwd(), '.test-data', randomUUID());
+    await mkdir(directory, { recursive: true });
+    const origin = 'https://notify.example', events = [];
+    const { publicKey: publicObject, privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = publicObject.export({ format: 'jwk' });
+    const publicKey = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]).toString('base64url');
+    const saved = { version: 1, origin, macID: randomUUID(), publicKey, owner: null, devices: [],
+      credential: null, setupID: null };
+    const file = join(directory, 'identity.json');
+    await writeFile(file, JSON.stringify(saved), { mode: 0o600 });
+    const authority = createRemoteAuthority({ origin, accounts: { authorize: async () => {
+      throw new Error('Enrollment must not authorize a phone');
+    } } });
+    const gate = Promise.withResolvers();
+    let begins = 0, registrations = 0;
+    const helper = await createRemoteCompanion({ directory, origin, emit: event => events.push(event),
+      cryptoProcess: () => ({
+        async call(op, args) {
+          if (op === 'identity') return [...Buffer.from(publicKey, 'base64url')];
+          assert.equal(op, 'sign');
+          return [...sign('sha256', Buffer.concat([
+            Buffer.from('Notify remote authorization v1\0'), Buffer.from(args.bytes)
+          ]), privateKey)];
+        }, async close() {}
+      }),
+      fetchRequest: async (url, options) => {
+        const path = new URL(url).pathname, input = JSON.parse(options.body);
+        try {
+          let result;
+          if (path.endsWith('/mac/begin')) {
+            const first = ++begins === 1;
+            if (!first || outcome !== 'retry') result = authority.beginMac(input);
+            if (first) {
+              await gate.promise;
+              options.signal.throwIfAborted();
+              if (outcome === 'retry') return Response.json({ error: 'Temporarily unavailable' }, { status: 503 });
+            }
+          } else if (path.endsWith('/mac/register')) {
+            registrations++;
+            result = authority.registerMac(input);
+          } else {
+            assert.ok(path.endsWith('/mac/status'));
+            result = authority.macStatus(options.headers.Authorization?.slice(7));
+          }
+          return Response.json(result);
+        } catch (error) {
+          if (!error.status) throw error;
+          return Response.json({ error: error.message }, { status: error.status });
+        }
+      }
+    });
+    t.after(async () => { gate.resolve(); await helper.close(); authority.close(); await rm(directory, { recursive: true }); });
+    await until(() => begins === 1);
+    const invitation = helper.command({ type: 'invite' }).then(() => null, error => error);
+    await settle();
+    const closing = outcome === 'cancelled' ? helper.close() : undefined;
+    gate.resolve();
+    await closing;
+    const error = await invitation;
+    if (outcome === 'registered') assert.equal(error, null, 'Immediate pairing must not conflict with startup enrollment');
+    else {
+      assert.ok(error, 'Failure or shutdown must reject the pending invitation');
+      assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), saved);
+    }
+    assert.equal(begins, 1, 'Only one bootstrap may run while the startup enrollment is pending');
+    if (outcome === 'cancelled') return;
+    if (outcome === 'retry') await helper.command({ type: 'invite' });
+    const registered = JSON.parse(await readFile(file, 'utf8'));
+    assert.equal(registrations, 1);
+    assert.deepEqual(registered, { ...saved, credential: registered.credential, setupID: registered.setupID });
+    assert.equal(authority.macStatus(registered.credential).macID, saved.macID);
+    assert.ok(events.findLast(event => event.type === 'status').status.setupURL);
+  });
+}
+
 test('explicit invitation refreshes a restarted service locator without replacing saved Mac trust', async t => {
   const directory = join(process.cwd(), '.test-data', randomUUID());
   await mkdir(directory, { recursive: true });

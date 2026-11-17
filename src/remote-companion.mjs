@@ -62,7 +62,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
   await privateDirectory(directory);
   const file = join(directory, 'identity.json');
   let state, writer = Promise.resolve(), auth, signer, policyWork;
-  let closed = false, paused = false, polling, pollController, pending, approving, setupID, serverDevices = [];
+  let closed = false, paused = false, polling, pollController, registration, pending, approving, setupID, serverDevices = [];
   let message = 'Waiting for phone sign-in.', fault, enrollmentError;
   const channels = new Map();
   const channelWork = new Set(), lifetime = new AbortController();
@@ -208,7 +208,11 @@ export async function createRemoteCompanion({ directory, origin, emit,
       fail(502, 'Invalid Mac relay grant.');
     return localLease(grant, started);
   }
-  async function register(signal) {
+  function register(signal) {
+    registration ??= registerOnce(signal).finally(() => { registration = undefined; });
+    return registration;
+  }
+  async function registerOnce(signal) {
     const begin = await api('mac/begin', { macID: state.macID, publicKey: state.publicKey }, undefined, signal);
     const result = await api('mac/register', { id: begin.id, signature: await sign(begin.challenge) }, undefined, signal);
     if (result.macID !== state.macID || typeof result.credential !== 'string' ||
