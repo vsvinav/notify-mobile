@@ -1,4 +1,3 @@
-import https from 'node:https';
 import { isIP } from 'node:net';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
@@ -8,6 +7,7 @@ import {
 } from '@simplewebauthn/server';
 import { decodeAttestationObject, decodeClientDataJSON, decodeCredentialPublicKey } from '@simplewebauthn/server/helpers';
 import { object } from './validation.mjs';
+import { createIngressPolicy } from './managed-ingress.mjs';
 
 const FLOW = '__Host-notify-account-flow', SESSION = '__Host-notify-account';
 const FLOW_TTL = 180000, SESSION_TTL = 3600000, ALGORITHMS = [-7, -257, -8];
@@ -18,10 +18,10 @@ const shape = (value, fields) => object(value) && Object.keys(value).length === 
 const encoded = (value, limit) => typeof value === 'string' && value.length > 0 &&
   value.length <= Math.ceil(limit * 4 / 3) && /^[\w-]+$/.test(value) &&
   Buffer.from(value, 'base64url').length <= limit && Buffer.from(value, 'base64url').toString('base64url') === value;
-class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+export class AccountServiceError extends Error {
+  constructor(status, message) { super(message); this.name = 'AccountServiceError'; this.status = status; }
 }
-const fail = (status, message) => { throw new HttpError(status, message); };
+const fail = (status, message) => { throw new AccountServiceError(status, message); };
 
 function cookies(req) {
   const header = req.headers.cookie ?? '';
@@ -80,8 +80,9 @@ function validAccount(account) {
 
 // Account identity only, never device trust or relay authority. One private store
 // has one authoritative service writer; restart invalidates every cookie session.
-export async function createAccountService({ server, origin, store, reportError, now = () => performance.now() }) {
-  if (!(server instanceof https.Server) || server.listening || server.listenerCount('request') ||
+export async function createAccountService({ server, origin, store, reportError, now = () => performance.now(), managedIngress }) {
+  const ingress = createIngressPolicy({ server, publicOrigin: origin, managedIngress });
+  if (server.listening || server.listenerCount('request') ||
     server.listenerCount('upgrade')) throw new Error('Accounts require a dedicated unstarted HTTPS server.');
   const endpoint = new URL(origin);
   if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.pathname !== '/' ||
@@ -104,11 +105,21 @@ export async function createAccountService({ server, origin, store, reportError,
   state = structuredClone(state ?? { version: 1, origin, accounts: [] });
   const flows = new Map(), sessions = new Map(), rates = new Map();
   let closed = false, fault = false, clock = -Infinity, active = 0, serial = Promise.resolve();
-  const close = () => { closed = true; flows.clear(); sessions.clear(); rates.clear(); };
+  function revokeSession(key) {
+    const session = sessions.get(key);
+    if (!session) return;
+    sessions.delete(key);
+    clearTimeout(session.timer);
+    session.controller.abort();
+  }
+  function clearSessions() {
+    for (const key of sessions.keys()) revokeSession(key);
+  }
+  const close = () => { closed = true; flows.clear(); clearSessions(); rates.clear(); };
   function time() {
     const value = now();
     if (!Number.isFinite(value) || value < 0 || value < clock) {
-      fault = true; flows.clear(); sessions.clear();
+      fault = true; flows.clear(); clearSessions();
       fail(503, 'Account authorization clock is invalid.');
     }
     clock = value;
@@ -121,15 +132,17 @@ export async function createAccountService({ server, origin, store, reportError,
 
   function prune() {
     const current = time();
-    for (const entries of [flows, sessions, rates])
+    for (const entries of [flows, rates])
       for (const [key, value] of entries) if (value.expires <= current) entries.delete(key);
+    for (const [key, session] of sessions) if (session.expires <= current) revokeSession(key);
+    return current;
   }
 
   async function save(next) {
     if (Buffer.byteLength(JSON.stringify(next)) > 2_097_152) fail(429, 'Account storage limit reached.');
     try { await store.write(structuredClone(next)); }
     catch {
-      fault = true; flows.clear(); sessions.clear();
+      fault = true; flows.clear(); clearSessions();
       reportError(new Error('Account storage write failed.'));
       fail(503, 'Account storage unavailable.');
     }
@@ -139,6 +152,28 @@ export async function createAccountService({ server, origin, store, reportError,
   function accountReply(session) {
     return { account: { issuer: origin, subject: session.accountID }, scope: 'account',
       fresh: time() - session.authenticatedAt <= 300000 };
+  }
+
+  // Account identity only. Callers must separately authorize devices and actions;
+  // retain this session signal to fence authority issued from the returned proof.
+  function authorize(req, { requireFresh = false } = {}) {
+    if (closed || fault) fail(401, 'Account sign-in required.');
+    if (!req?.headers || !req.socket || !Array.isArray(req.rawHeaders) ||
+      !ingress.accepts(req) || req.headers.origin !== origin)
+      fail(403, 'Account origin rejected.');
+    let current, tokens;
+    try { current = prune(); }
+    catch {
+      fault = true; flows.clear(); clearSessions();
+      fail(401, 'Account sign-in required.');
+    }
+    try { tokens = cookies(req); }
+    catch { fail(401, 'Account sign-in required.'); }
+    const session = sessions.get(tokens[SESSION] && hash(tokens[SESSION]));
+    if (closed || fault || !session) fail(401, 'Account sign-in required.');
+    if (requireFresh && current - session.authenticatedAt > 300000)
+      fail(403, 'Fresh account verification required.');
+    return Object.freeze({ issuer: origin, subject: session.accountID, signal: session.controller.signal });
   }
 
   server.on('request', async (req, res) => {
@@ -158,7 +193,8 @@ export async function createAccountService({ server, origin, store, reportError,
     };
     try {
       ensureLive(); prune();
-      if (!req.socket.encrypted || req.headers.host !== endpoint.host || req.headers.origin !== origin)
+      if (ingress.health(req, res)) return;
+      if (!ingress.accepts(req) || req.headers.origin !== origin)
         fail(403, 'Account origin rejected.');
       if (req.method !== 'POST') fail(405, 'Use POST for account requests.');
       if (!['register/options', 'register/verify', 'login/options', 'login/verify', 'session', 'logout']
@@ -181,7 +217,7 @@ export async function createAccountService({ server, origin, store, reportError,
         if (!shape(data, [])) fail(400, 'Unexpected account request fields.');
         const key = tokens[SESSION] && hash(tokens[SESSION]);
         if (!sessions.has(key)) fail(401, 'Account sign-in required.');
-        sessions.delete(key);
+        revokeSession(key);
         const browserFlow = tokens[FLOW] && hash(tokens[FLOW]);
         for (const [id, flow] of flows)
           if (id === browserFlow || flow.sessionKey === key) flows.delete(id);
@@ -280,10 +316,14 @@ export async function createAccountService({ server, origin, store, reportError,
           : state.accounts.map(value => value.id === account.id ? account : value);
         await save({ ...state, accounts });
         ensureFlow();
-        if (tokens[SESSION]) sessions.delete(hash(tokens[SESSION]));
+        if (tokens[SESSION]) revokeSession(hash(tokens[SESSION]));
+        ensureLive(flow.expires);
         const token = secret(), session = { accountID: account.id, authenticatedAt: flow.created,
-          expires: time() + SESSION_TTL };
-        sessions.set(hash(token), session);
+          expires: time() + SESSION_TTL, controller: new AbortController() };
+        const key = hash(token);
+        session.timer = setTimeout(() => revokeSession(key), SESSION_TTL);
+        session.timer.unref();
+        sessions.set(key, session);
         cookie(res, SESSION, token, SESSION_TTL / 1000);
         return accountReply(session);
       });
@@ -291,13 +331,13 @@ export async function createAccountService({ server, origin, store, reportError,
       serial = operation.then(() => undefined, () => undefined);
       respond(200, await operation);
     } catch (error) {
-      if (!(error instanceof HttpError)) reportError(new Error('Account request failed.'));
-      respond(error instanceof HttpError ? error.status : 503,
-        { error: error instanceof HttpError ? error.message : 'Account request failed.' });
+      if (!(error instanceof AccountServiceError)) reportError(new Error('Account request failed.'));
+      respond(error instanceof AccountServiceError ? error.status : 503,
+        { error: error instanceof AccountServiceError ? error.message : 'Account request failed.' });
     } finally {
       if (usedFlow && flows.get(usedFlow.key) === usedFlow.flow) flows.delete(usedFlow.key);
       if (reserved) active--;
     }
   });
-  return Object.freeze({ close });
+  return Object.freeze({ close, authorize });
 }

@@ -19,19 +19,20 @@ const protocol = 'notify-relay-v1';
 const owner = { issuer: 'https://accounts.notify.invalid', subject: 'account-a', macID: 'mac-a' };
 const identity = { ...owner, deviceID: 'phone-a', keyHash: 'a'.repeat(64) };
 
-async function fixture(t, authorizer) {
+async function fixture(t, authorizer, managedIngress) {
   const directory = join(process.cwd(), '.test-data', randomUUID());
   await privateDirectory(directory);
-  const tls = await certificates(directory, '127.0.0.1', true);
-  const server = https.createServer(tls, (_req, res) => { res.writeHead(404); res.end(); });
+  const tls = managedIngress ? {} : await certificates(directory, '127.0.0.1', true);
+  const server = managedIngress ? http.createServer() : https.createServer(tls, (_req, res) => { res.writeHead(404); res.end(); });
   const tokens = new Map(), clients = new Set(), errors = [];
   const relay = createRemoteRelay({
-    server, publicOrigin, webOrigin, reportError: error => errors.push(error),
+    server, publicOrigin: managedIngress ? 'https://notify-relay-test.onrender.com' : publicOrigin,
+    webOrigin, managedIngress, reportError: error => errors.push(error),
     authorize: authorizer ?? (async req => tokens.get(req.headers.authorization)?.() ?? null)
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
-  const url = `wss://127.0.0.1:${server.address().port}/v1/relay`;
+  const url = `${managedIngress ? 'ws' : 'wss'}://127.0.0.1:${server.address().port}/v1/relay`;
   t.after(async () => {
     for (const client of clients) client.terminate();
     await relay.close();
@@ -43,10 +44,11 @@ async function fixture(t, authorizer) {
     tokens.set(token, () => ({ ...owner, deviceID: 'phone-a', role, expiresAt: Date.now() + 10000, signal, ...extra }));
     return token;
   }
-  function connect(token, { origin, host = 'relay.notify.invalid', path, protocols = protocol } = {}) {
+  function connect(token, { origin, host = managedIngress ? 'notify-relay-test.onrender.com' : 'relay.notify.invalid',
+    path, protocols = protocol, headers = {} } = {}) {
     const client = new WebSocket(path ? new URL(path, url) : url, protocols, {
       ca: tls.ca, rejectUnauthorized: true, handshakeTimeout: 4000,
-      headers: { host, ...(token ? { authorization: token } : {}), ...(origin ? { origin } : {}) }
+      headers: { host, ...(token ? { authorization: token } : {}), ...(origin ? { origin } : {}), ...headers }
     });
     clients.add(client);
     client.on('error', () => {});
@@ -104,6 +106,43 @@ test('relay forwards exact binary bytes in both directions without compression',
   mac.client.send(Buffer.from('synthetic opaque receipt'));
   const [receipt] = await toPhone;
   assert.equal(receipt.toString(), 'synthetic opaque receipt');
+});
+
+test('Render relay ingress preserves verified authorization and rejects forwarding confusion', { timeout: 10000 }, async t => {
+  const environment = process.env;
+  process.env = { ...environment, RENDER: 'true', RENDER_EXTERNAL_HOSTNAME: 'notify-relay-test.onrender.com' };
+  t.after(() => { process.env = environment; });
+  const f = await fixture(t, undefined, 'render-free');
+  for (const headers of [
+    { host: 'evil.invalid', 'x-forwarded-host': 'notify-relay-test.onrender.com' },
+    { 'x-forwarded-host': 'evil.invalid' },
+    { 'x-forwarded-proto': 'http' },
+    { 'x-forwarded-proto': 'https, http' },
+    { 'x-forwarded-port': '80' },
+    { forwarded: 'proto=https;host=notify-relay-test.onrender.com' }
+  ]) await assert.rejects(f.connect(f.credential('mac'), { headers }).opened, { status: 403 });
+  await assert.rejects(f.connect(null, { headers: { 'x-forwarded-proto': 'https' } }).opened, { status: 401 });
+  await assert.rejects(f.connect(f.credential('phone'), { origin: 'http://app.notify.invalid' }).opened, { status: 403 });
+  const mac = f.connect(f.credential('mac'), { headers: { 'x-forwarded-proto': 'https' } });
+  await mac.opened;
+  const ready = once(mac.client, 'message');
+  const phone = f.connect(f.credential('phone'), { origin: webOrigin });
+  await phone.opened; await ready;
+  const received = once(mac.client, 'message');
+  phone.client.send(Buffer.from('synthetic opaque ingress payload'));
+  assert.equal((await received)[0].toString(), 'synthetic opaque ingress payload');
+  const health = await new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port: f.server.address().port, path: '/healthz',
+      headers: { host: 'notify-relay-test.onrender.com' } }, res => {
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }));
+    }).on('error', reject);
+  });
+  assert.equal(health.status, 200);
+  assert.deepEqual(JSON.parse(health.body), { status: 'ok' });
+  assert.equal(health.headers['cache-control'], 'no-store');
+  assert.equal(health.headers['set-cookie'], undefined);
 });
 
 test('different account, issuer, Mac and phone remain separate even with matching other IDs', { timeout: 15000 }, async t => {

@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node src/main.mjs",
+    "start:hosted": "node src/hosted-main.mjs",
     "test": "NODE_TLS_REJECT_UNAUTHORIZED=1 node --test test/*.test.mjs",
     "test:browser": "NODE_TLS_REJECT_UNAUTHORIZED=1 PLAYWRIGHT_BROWSERS_PATH=0 playwright test"
   },

@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: notify-remote
+    runtime: node
+    plan: free
+    numInstances: 1
+    autoDeploy: false
+    buildCommand: NODE_TLS_REJECT_UNAUTHORIZED=1 npm ci --ignore-scripts
+    startCommand: node src/hosted-main.mjs
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_TLS_REJECT_UNAUTHORIZED
+        value: "1"

@@ -1,7 +1,7 @@
-import https from 'node:https';
 import { STATUS_CODES } from 'node:http';
 import { performance } from 'node:perf_hooks';
 import WebSocket, { WebSocketServer } from 'ws';
+import { createIngressPolicy } from './managed-ingress.mjs';
 
 const PROTOCOL = 'notify-relay-v1';
 const FRAME_LIMIT = 1_048_576 + 16_384;
@@ -25,12 +25,14 @@ function rejectUpgrade(socket, status) {
 
 // Transport only. authorize must verify service credentials; endpoint crypto must
 // authenticate peers and payloads. Neither routing nor "ready" grants session access.
-export function createRemoteRelay({ server, publicOrigin, webOrigin, authorize, reportError }) {
-  if (!(server instanceof https.Server) || server.listening || server.listenerCount('upgrade'))
+export function createRemoteRelay({ server, publicOrigin, webOrigin, authorize, reportError, managedIngress }) {
+  const ingress = createIngressPolicy({ server, publicOrigin, managedIngress });
+  if (server.listening || server.listenerCount('upgrade'))
     throw new Error('Relay requires a dedicated HTTPS server before it starts listening.');
   if (typeof authorize !== 'function' || typeof reportError !== 'function')
     throw new Error('Relay requires an authorizer and an error reporter.');
-  const host = origin(publicOrigin).host, browserOrigin = origin(webOrigin).origin;
+  origin(publicOrigin);
+  const browserOrigin = origin(webOrigin).origin;
   const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, autoPong: false,
     maxPayload: FRAME_LIMIT, handleProtocols: () => PROTOCOL });
   const rooms = new Map(), pending = new Set();
@@ -101,7 +103,7 @@ export function createRemoteRelay({ server, publicOrigin, webOrigin, authorize, 
     socket.once('error', socketFailed);
     socket.once('close', socketClosed);
     if (closed) return rejectUpgrade(socket, 503);
-    if (!socket.encrypted || req.headers.host !== host) return rejectUpgrade(socket, 403);
+    if (!ingress.accepts(req)) return rejectUpgrade(socket, 403);
     if (req.url !== '/v1/relay') return rejectUpgrade(socket, 404);
     if (req.method !== 'GET' || req.headers['sec-websocket-protocol'] !== PROTOCOL)
       return rejectUpgrade(socket, 400);
@@ -187,11 +189,17 @@ export function createRemoteRelay({ server, publicOrigin, webOrigin, authorize, 
     }
   }
 
+  const request = (req, res) => {
+    if (ingress.health(req, res)) return;
+    res.writeHead(404, { 'Cache-Control': 'no-store' }); res.end();
+  };
+  if (managedIngress && !server.listenerCount('request')) server.on('request', request);
   server.on('upgrade', upgrade);
   return Object.freeze({
     close() {
       if (closing) return closing;
       closed = true;
+      server.off('request', request);
       server.off('upgrade', upgrade);
       for (const record of pending) { record.controller.abort(); record.socket.destroy(); }
       for (const room of rooms.values()) drop(room, 1001, 'Relay shutting down.');

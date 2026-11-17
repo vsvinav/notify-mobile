@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import https from 'node:https';
+import http from 'node:http';
 import { once } from 'node:events';
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto';
 import { join } from 'node:path';
@@ -9,14 +10,14 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { isoCBOR } from '@simplewebauthn/server/helpers';
 import { certificates } from '../src/certificates.mjs';
 import { privateDirectory, stateStore } from '../src/storage.mjs';
-import { createAccountService } from '../src/account-service.mjs';
+import { AccountServiceError, createAccountService } from '../src/account-service.mjs';
 
 const origin = 'https://accounts.notify.invalid', rpID = 'accounts.notify.invalid';
 const flowCookie = '__Host-notify-account-flow', sessionCookie = '__Host-notify-account';
 const b64 = value => Buffer.from(value).toString('base64url');
 const hash = value => createHash('sha256').update(value).digest();
 
-function authenticator() {
+function authenticator(authOrigin = origin) {
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
   const jwk = publicKey.export({ format: 'jwk' });
   const credentialID = randomBytes(32);
@@ -29,14 +30,14 @@ function authenticator() {
     if (registration) userHandle = options.user.id;
     const clientDataJSON = Buffer.from(JSON.stringify({
       type: registration ? 'webauthn.create' : 'webauthn.get',
-      challenge: options.challenge, origin, crossOrigin: false, ...extra.clientData
+      challenge: options.challenge, origin: authOrigin, crossOrigin: false, ...extra.clientData
     }));
     const flags = (extra.up === false ? 0 : 1) | (extra.uv === false ? 0 : 4) | (registration ? 64 : 0) |
       (extra.backupEligible ? 8 : 0) | (extra.backedUp ? 16 : 0);
     const count = Buffer.alloc(4);
     count.writeUInt32BE(extra.counter ?? (registration ? counter : ++counter));
     const length = Buffer.alloc(2); length.writeUInt16BE(credentialID.length);
-    const authData = Buffer.concat([hash(extra.rpID ?? rpID), Buffer.from([flags]), count,
+    const authData = Buffer.concat([hash(extra.rpID ?? new URL(authOrigin).hostname), Buffer.from([flags]), count,
       ...(registration ? [Buffer.alloc(16), length, credentialID, Buffer.from(cose)] : [])]);
     const result = { id: b64(credentialID), rawId: b64(credentialID), type: 'public-key', clientExtensionResults: {},
       response: { clientDataJSON: b64(clientDataJSON) } };
@@ -56,13 +57,14 @@ function authenticator() {
 async function fixture(t, override = {}) {
   const directory = join(process.cwd(), '.test-data', randomUUID());
   await privateDirectory(directory);
-  const tls = await certificates(directory, '127.0.0.1', true), store = override.store ?? stateStore(directory);
+  const tls = override.managedIngress ? {} : await certificates(directory, '127.0.0.1', true);
+  const store = override.store ?? stateStore(directory);
   let clock = 0, server, service;
   const errors = [];
   async function start() {
-    server = https.createServer(tls);
-    service = await createAccountService({ server, origin, store, now: () => clock,
-      reportError: error => errors.push(error) });
+    server = override.managedIngress ? http.createServer() : https.createServer(tls);
+    service = await createAccountService({ server, origin: override.origin ?? origin, store, now: () => clock,
+      managedIngress: override.managedIngress, reportError: error => errors.push(error) });
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
   }
   async function stop() {
@@ -74,13 +76,15 @@ async function fixture(t, override = {}) {
   t.after(async () => { await stop(); await rm(directory, { recursive: true, force: true }); });
   function browser() {
     const cookies = new Map();
-    async function request(path, data = {}, headers = {}) {
+    async function request(path, data = {}, headers = {}, method = 'POST') {
       const body = typeof data === 'string' ? data : JSON.stringify(data);
       return new Promise((resolve, reject) => {
-        const req = https.request({ host: '127.0.0.1', port: server.address().port,
-          ca: tls.ca, rejectUnauthorized: true, servername: '', method: 'POST', path: `/v1/account/${path}`,
-          headers: { host: rpID, origin, 'content-type': 'application/json',
-            cookie: [...cookies].map(([key, value]) => `${key}=${value}`).join(';'), ...headers } }, res => {
+        const req = (override.managedIngress ? http : https).request({ host: '127.0.0.1', port: server.address().port,
+          ca: tls.ca, rejectUnauthorized: true, servername: '', method, path: path.startsWith('/') ? path : `/v1/account/${path}`,
+          headers: Object.fromEntries(Object.entries({
+            host: new URL(override.origin ?? origin).host, origin: override.origin ?? origin, 'content-type': 'application/json',
+            cookie: [...cookies].map(([key, value]) => `${key}=${value}`).join(';'), ...headers
+          }).filter(([, value]) => value !== undefined)) }, res => {
           let text = '';
           res.on('data', chunk => { text += chunk; });
           res.on('error', reject);
@@ -103,7 +107,13 @@ async function fixture(t, override = {}) {
       assert.equal(result.status, 200);
       return { auth, result };
     }
-    return { cookies, request, register };
+    function authorize(options = {}, headers = {}, extra = {}) {
+      const requestHeaders = { host: new URL(override.origin ?? origin).host, origin: override.origin ?? origin,
+        cookie: [...cookies].map(([key, value]) => `${key}=${value}`).join(';'), ...headers };
+      return service.authorize({ headers: requestHeaders, rawHeaders: Object.entries(requestHeaders).flat(),
+        socket: { encrypted: !override.managedIngress }, ...extra }, options);
+    }
+    return { cookies, request, register, authorize };
   }
   return { browser, errors, store, directory, advance: ms => { clock += ms; },
     restart: async () => { await stop(); await start(); }, close: () => service.close() };
@@ -243,6 +253,7 @@ test('storage failure issues no session and disables existing account access', {
     write: async value => { if (broken) throw new Error('private disk detail'); saved = structuredClone(value); }
   } });
   const browser = f.browser(), { auth } = await browser.register();
+  const proof = browser.authorize();
   const options = await browser.request('login/options');
   broken = true;
   const result = await browser.request('login/verify', { response: auth.login(options.body) });
@@ -250,6 +261,8 @@ test('storage failure issues no session and disables existing account access', {
   assert.equal(result.headers['set-cookie']?.some(cookie => cookie.startsWith(`${sessionCookie}=`) &&
     !cookie.startsWith(`${sessionCookie}=;`)) ?? false, false);
   assert.equal((await browser.request('session')).status, 503);
+  assert.equal(proof.signal.aborted, true);
+  assert.throws(() => browser.authorize(), { name: 'AccountServiceError', status: 401 });
   assert.doesNotMatch(JSON.stringify(f.errors.map(error => error.message)), /private disk detail/);
 });
 
@@ -295,6 +308,7 @@ test('logout immediately cancels an in-flight login rather than creating a late 
     }
   } });
   const browser = f.browser(), { auth } = await browser.register();
+  const proof = browser.authorize();
   const options = await browser.request('login/options');
   hold = true;
   const signingIn = browser.request('login/verify', { response: auth.login(options.body) });
@@ -304,6 +318,8 @@ test('logout immediately cancels an in-flight login rather than creating a late 
     const result = await Promise.race([signingOut, delay(500).then(() => null)]);
     assert.ok(result, 'Logout must not wait for the blocked login write.');
     assert.equal(result.status, 200);
+    assert.equal(proof.signal.aborted, true);
+    assert.throws(() => browser.authorize(), { name: 'AccountServiceError', status: 401 });
   } finally {
     release();
     await Promise.allSettled([signingIn, signingOut]);
@@ -370,4 +386,123 @@ test('malformed persisted accounts are rejected without resetting the database',
     }), /Invalid account storage/);
     assert.equal(writes, 0);
   }
+});
+
+test('account HTTP is opt-in and Render ingress denies host, origin and forwarding confusion', async t => {
+  let saved = null;
+  const store = { read: async () => saved, write: async value => { saved = structuredClone(value); } };
+  await assert.rejects(createAccountService({ server: http.createServer(), origin, store, reportError() {} }), /HTTPS/);
+  const environment = process.env;
+  process.env = { ...environment, RENDER: 'true', RENDER_EXTERNAL_HOSTNAME: 'notify-account-test.onrender.com' };
+  t.after(() => { process.env = environment; });
+  const publicOrigin = 'https://notify-account-test.onrender.com';
+  const f = await fixture(t, { origin: publicOrigin, managedIngress: 'render-free', store });
+  const browser = f.browser();
+  const options = await browser.request('login/options', {}, { 'x-forwarded-proto': 'https' });
+  assert.equal(options.status, 200);
+  assert.equal(options.body.rpId, 'notify-account-test.onrender.com');
+  assert.match(options.headers['set-cookie'][0], /Secure; HttpOnly; SameSite=Strict/);
+  for (const headers of [
+    { host: 'evil.invalid', 'x-forwarded-host': 'notify-account-test.onrender.com' },
+    { origin: 'http://notify-account-test.onrender.com' },
+    { origin: 'https://evil.invalid' },
+    { 'x-forwarded-proto': 'http' },
+    { 'x-forwarded-proto': 'https, http' },
+    { 'x-forwarded-host': 'evil.invalid' },
+    { 'x-forwarded-port': '80' },
+    { forwarded: 'proto=https;host=notify-account-test.onrender.com' }
+  ]) assert.equal((await browser.request('login/options', {}, headers)).status, 403);
+  const health = await browser.request('/healthz', {}, { origin: undefined, cookie: 'broken-cookie' }, 'GET');
+  assert.deepEqual(health.body, { status: 'ok' });
+  assert.equal(health.status, 200);
+  assert.equal(health.headers['cache-control'], 'no-store');
+  assert.equal(health.headers['set-cookie'], undefined);
+  assert.equal((await browser.request('/healthz', {}, { host: 'evil.invalid' }, 'GET')).status, 403);
+  assert.equal((await browser.request('/healthz', {}, { 'x-forwarded-proto': 'http' }, 'GET')).status, 403);
+  assert.equal((await browser.request('/healthz')).status, 405);
+  await browser.register(authenticator(publicOrigin));
+  assert.equal((await browser.request('session')).status, 200);
+  const proof = browser.authorize({ requireFresh: true });
+  assert.equal(proof.issuer, publicOrigin);
+  assert.throws(() => browser.authorize({}, { 'x-forwarded-proto': 'http' }),
+    { name: 'AccountServiceError', status: 403 });
+  const beforeRestart = browser.cookies.get(sessionCookie);
+  await f.restart();
+  assert.equal(proof.signal.aborted, true);
+  assert.throws(() => browser.authorize(), { name: 'AccountServiceError', status: 401 });
+  assert.equal((await browser.request('session')).status, 401);
+  assert.equal(browser.cookies.get(sessionCookie), beforeRestart);
+  assert.equal((await browser.request('login/verify', { response: {} })).status, 401);
+});
+
+test('programmatic account proof comes only from live private sessions and enforces fresh UV', async t => {
+  const f = await fixture(t), browser = f.browser(), { result } = await browser.register();
+  const proof = browser.authorize({ requireFresh: true });
+  assert.equal(Object.isFrozen(proof), true);
+  assert.deepEqual(Object.keys(proof).sort(), ['issuer', 'signal', 'subject']);
+  assert.equal(proof.issuer, result.body.account.issuer);
+  assert.equal(proof.subject, result.body.account.subject);
+  assert.ok(proof.signal instanceof AbortSignal);
+  assert.equal(proof.signal, browser.authorize().signal);
+  assert.equal(proof.signal.aborted, false);
+  assert.throws(() => browser.authorize({}, { cookie: '' }),
+    error => error instanceof AccountServiceError && error.status === 401);
+  for (const cookie of ['', 'invalid', `${sessionCookie}=invalid`, `${sessionCookie}=${'a'.repeat(43)}`,
+    `${sessionCookie}=${browser.cookies.get(sessionCookie)}; ${sessionCookie}=${browser.cookies.get(sessionCookie)}`])
+    assert.throws(() => browser.authorize({}, { cookie }, { body: result.body, account: result.body.account }),
+      { name: 'AccountServiceError', status: 401 });
+  for (const headers of [{ origin: undefined }, { origin: 'https://evil.invalid' }, { host: 'evil.invalid' }])
+    assert.throws(() => browser.authorize({}, headers), { name: 'AccountServiceError', status: 403 });
+  assert.throws(() => browser.authorize({}, {}, { socket: { encrypted: false } }),
+    { name: 'AccountServiceError', status: 403 });
+  f.advance(300000);
+  assert.equal(browser.authorize({ requireFresh: true }).signal, proof.signal);
+  f.advance(1);
+  assert.throws(() => browser.authorize({ requireFresh: true }), { name: 'AccountServiceError', status: 403 });
+  assert.equal(browser.authorize().signal, proof.signal);
+  assert.equal(proof.signal.aborted, false);
+  f.advance(3600000 - 300001);
+  assert.throws(() => browser.authorize(), { name: 'AccountServiceError', status: 401 });
+  assert.equal(proof.signal.aborted, true);
+});
+
+test('logout, session replacement and service close revoke previously returned account proofs', async t => {
+  const f = await fixture(t), browser = f.browser(), { auth } = await browser.register();
+  const first = browser.authorize();
+  const login = await browser.request('login/options');
+  assert.equal((await browser.request('login/verify', { response: auth.login(login.body) })).status, 200);
+  assert.equal(first.signal.aborted, true);
+  const second = browser.authorize();
+  assert.notEqual(first.signal, second.signal);
+  assert.equal((await browser.request('logout')).status, 200);
+  assert.equal(second.signal.aborted, true);
+  assert.throws(() => browser.authorize(), { name: 'AccountServiceError', status: 401 });
+  const next = await browser.request('login/options');
+  assert.equal((await browser.request('login/verify', { response: auth.login(next.body) })).status, 200);
+  const last = browser.authorize();
+  f.close();
+  assert.equal(last.signal.aborted, true);
+  assert.throws(() => browser.authorize(), { name: 'AccountServiceError', status: 401 });
+});
+
+test('account proof expires without another request and repeated authorization shares its deadline', async t => {
+  const f = await fixture(t), browser = f.browser();
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await browser.register();
+  const proof = browser.authorize();
+  t.mock.timers.tick(3599999);
+  assert.equal(browser.authorize().signal, proof.signal);
+  assert.equal(proof.signal.aborted, false);
+  t.mock.timers.tick(1);
+  assert.equal(proof.signal.aborted, true);
+  assert.throws(() => browser.authorize(), { name: 'AccountServiceError', status: 401 });
+});
+
+test('programmatic proof is revoked when the service authorization clock fails', async t => {
+  const f = await fixture(t), browser = f.browser();
+  await browser.register();
+  const proof = browser.authorize();
+  f.advance(-1);
+  assert.throws(() => browser.authorize(), { name: 'AccountServiceError', status: 401 });
+  assert.equal(proof.signal.aborted, true);
 });
