@@ -387,7 +387,7 @@ async function renewalFixture(t, { pendingApproval = false, renew, status, finis
     devices: pendingApproval ? [] : [{ id: deviceID, name: 'Phone', publicKey: phoneKey }],
     credential: 'c'.repeat(43), setupID: 'setup'
   }), { mode: 0o600 });
-  let receiver, relaySignal, closeRelay, approved = !pendingApproval;
+  let receiver, relaySignal, closeRelay, approved = !pendingApproval, revoked = false;
   const grant = () => ({ role: 'mac', macID, deviceID, approved, expiresAt: Date.now() + 30000,
     credential: 'r'.repeat(43), renewal: { id, challenge: `renew-${requests.length}` } });
   const helper = await createRemoteCompanion({
@@ -407,7 +407,7 @@ async function renewalFixture(t, { pendingApproval = false, renew, status, finis
       const path = new URL(url).pathname;
       requests.push({ path, options });
       if (path.endsWith('/mac/status')) {
-        const value = { macID, pending: approved ? null : pending,
+        const value = { macID, pending: approved || revoked ? null : pending,
           devices: approved ? [{ deviceID, publicKey: phoneKey, name: 'Phone' }] : [] };
         return status ? status(value, options) : Response.json(value);
       }
@@ -419,6 +419,7 @@ async function renewalFixture(t, { pendingApproval = false, renew, status, finis
         return renew ? await renew(grant(), options) : Response.json(grant());
       }
       if (path.endsWith('/mac/decision')) { approved = true; return Response.json({ approved }); }
+      if (path.endsWith('/mac/revoke')) { approved = false; revoked = true; return Response.json({ revoked }); }
       throw new Error(`Unexpected request ${path}`);
     },
     connectRelay: async ({ receive, signal, expiresAt, onOpen }) => {
@@ -449,6 +450,24 @@ async function renewalFixture(t, { pendingApproval = false, renew, status, finis
     receive: value => receiver(Buffer.from(JSON.stringify(value))), signal: relaySignal, disconnect: () => closeRelay(),
     saved: () => readFile(join(directory, 'identity.json'), 'utf8') };
 }
+
+test('a status poll completing during revocation does not permanently fault the helper', async t => {
+  let hold = false, release;
+  const f = await renewalFixture(t, { status: value => {
+    if (!hold) return Response.json(value);
+    return new Promise(resolve => { release = () => resolve(Response.json(value)); });
+  } });
+  hold = true;
+  await f.helper.command({ type: 'heartbeat' });
+  await until(() => release);
+  const revocation = f.helper.command({ type: 'revoke', id: f.pending.deviceID });
+  hold = false; release();
+  await revocation;
+  await settle();
+  assert.equal(f.events.some(event => event.type === 'error'), false);
+  await f.helper.command({ type: 'heartbeat' });
+  assert.deepEqual(JSON.parse(await f.saved()).devices, []);
+});
 
 test('companion accepts +19ms clock skew and passes only local deadlines to relay and authorization', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });

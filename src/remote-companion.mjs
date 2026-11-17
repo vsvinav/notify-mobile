@@ -60,7 +60,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';
   await privateDirectory(directory);
   const file = join(directory, 'identity.json');
-  let state, writer = Promise.resolve(), auth, signer;
+  let state, writer = Promise.resolve(), auth, signer, policyWork;
   let closed = false, paused = false, polling, pollController, pending, approving, setupID, serverDevices = [];
   let message = 'Waiting for phone sign-in.', fault, enrollmentError;
   const channels = new Map();
@@ -100,6 +100,11 @@ export async function createRemoteCompanion({ directory, origin, emit,
     });
     writer = next.then(() => undefined, () => undefined);
     return next;
+  }
+  async function updatePolicy(work) {
+    policyWork = work;
+    try { await work; }
+    finally { if (policyWork === work) policyWork = undefined; }
   }
   const actions = new RemoteActions({
     attention() {
@@ -387,6 +392,8 @@ export async function createRemoteCompanion({ directory, origin, emit,
         !remote.devices.every(d => uuid(d.deviceID) && validKey(d.publicKey) && text(d.name, 100)))
         fail(502, 'Invalid registered-phone state.');
       serverDevices = remote.devices;
+      while (policyWork) await policyWork;
+      signal.throwIfAborted();
       if (auth) auth.enable();
       if (remote.pending !== null) {
         const p = remote.pending;
@@ -474,7 +481,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
           fail(403, 'The complete phone public key must match the confirmed encrypted channel.');
         if (!auth) await openAuthorization(candidate.account);
         approving = candidate;
-        try { await auth.approveDevice({ deviceID: candidate.deviceID, keyHash: hash(candidate.publicKey) }); }
+        try { await updatePolicy(auth.approveDevice({ deviceID: candidate.deviceID, keyHash: hash(candidate.publicKey) })); }
         finally { approving = undefined; }
         await api('mac/decision', { id: candidate.id, allow: true }, state.credential);
         serverDevices.push({ deviceID: candidate.deviceID, name: candidate.name, publicKey: candidate.publicKey });
@@ -489,7 +496,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
     }
     if (input.type === 'revoke') {
       if (!uuid(input.id) || !auth) fail(400, 'Invalid phone revocation.');
-      await auth.revokeDevice(input.id);
+      await updatePolicy(auth.revokeDevice(input.id));
       channels.get(input.id)?.controller.abort();
       await api('mac/revoke', { deviceID: input.id }, state.credential);
       status(); return;
