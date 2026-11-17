@@ -301,7 +301,7 @@ test('the exact public Digital Asset Links route works over verified TLS without
   const f = await fixture(t, { android: androidConfig() }), browser = f.browser();
   const dal = await browser.request('/.well-known/assetlinks.json', {}, { origin: undefined, cookie: undefined }, 'GET');
   assert.equal(dal.status, 200);
-  assert.deepEqual(dal.body, [{ relation: ['delegate_permission/common.get_login_creds'],
+  assert.deepEqual(dal.body, [{ relation: ['delegate_permission/common.handle_all_urls', 'delegate_permission/common.get_login_creds'],
     target: { namespace: 'android_app', package_name: 'app.notify.android',
       sha256_cert_fingerprints: [androidFingerprint] } }]);
   assert.equal(dal.headers['content-type'], 'application/json; charset=utf-8');

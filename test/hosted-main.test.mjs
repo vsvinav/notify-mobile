@@ -413,7 +413,7 @@ test('hosted ingress exposes only the exact DAL GET and forwards configured Andr
   const app = await fixture(t, { android: { packageName: 'app.notify.android', sha256CertFingerprints: [fingerprint] } });
   const response = await app.request('/.well-known/assetlinks.json');
   assert.equal(response.status, 200);
-  assert.deepEqual(response.json(), [{ relation: ['delegate_permission/common.get_login_creds'],
+  assert.deepEqual(response.json(), [{ relation: ['delegate_permission/common.handle_all_urls', 'delegate_permission/common.get_login_creds'],
     target: { namespace: 'android_app', package_name: 'app.notify.android', sha256_cert_fingerprints: [fingerprint] } }]);
   assert.equal(response.headers['content-type'], 'application/json; charset=utf-8');
   assert.equal(response.headers['cache-control'], 'no-store');

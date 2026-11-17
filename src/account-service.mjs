@@ -91,7 +91,8 @@ function androidPasskeys(config) {
   return {
     // Credential Manager uses the raw SHA-256 digest, not the textual fingerprint or package name.
     origins: fingerprints.map(value => `android:apk-key-hash:${Buffer.from(value.replaceAll(':', ''), 'hex').toString('base64url')}`),
-    assetLinks: [{ relation: ['delegate_permission/common.get_login_creds'], target: {
+    // Google's Android FIDO validation still requires both relationships.
+    assetLinks: [{ relation: ['delegate_permission/common.handle_all_urls', 'delegate_permission/common.get_login_creds'], target: {
       namespace: 'android_app', package_name: config.packageName, sha256_cert_fingerprints: fingerprints
     } }]
   };
