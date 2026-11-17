@@ -171,7 +171,11 @@ test('hardware native pipe ↔ phone WASM: sustained renewal, delayed chat ACK a
       const closed = new Promise(resolve => { finish = resolve; });
       relay = {
         receive, closed, signal, close: () => { finish(); socket?.close(); },
-        renew(expiresAt) { assert.equal(expiresAt, proof.expiresAt); },
+        renew(expiresAt, deadline) {
+          assert.ok(expiresAt <= proof.expiresAt && expiresAt > Date.now(),
+            'Local expiry conservatively subtracts request latency');
+          assert.ok(deadline > performance.now() && deadline <= performance.now() + 30000);
+        },
         async send(bytes) {
           const frame = Buffer.from(bytes);
           wire.push({ direction: 'native', bytes: frame });

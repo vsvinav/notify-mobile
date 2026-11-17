@@ -4,9 +4,21 @@ import WebSocket from 'ws';
 const FRAME_LIMIT = 1_048_576 + 16_384;
 const READY = '{"type":"ready","version":1}';
 
+function lifetime(expiresAt, localDeadline) {
+  const mono = performance.now(), remainingWall = expiresAt - Date.now();
+  if (!Number.isSafeInteger(expiresAt) || remainingWall <= 0 || remainingWall > 30000 ||
+    (localDeadline !== undefined && (!Number.isFinite(localDeadline) ||
+      localDeadline <= mono || localDeadline - mono > 30000)))
+    throw new Error('Invalid remote relay authorization lifetime.');
+  const deadline = localDeadline ?? mono + remainingWall;
+  const remaining = Math.floor(Math.min(remainingWall, deadline - mono));
+  if (remaining <= 0) throw new Error('Invalid remote relay authorization lifetime.');
+  return { deadline, remaining };
+}
+
 // Opaque transport only. receive must authenticate/decrypt before any dispatch.
 // A successful send is a local socket write, never a peer or runtime receipt.
-export async function connectRemoteRelay({ url, credential, expiresAt, signal, receive, ca, onOpen }) {
+export async function connectRemoteRelay({ url, credential, expiresAt, deadline: localDeadline, signal, receive, ca, onOpen }) {
   let endpoint;
   try {
     if (typeof url !== 'string' || url.length > 2048) throw new Error();
@@ -18,9 +30,7 @@ export async function connectRemoteRelay({ url, credential, expiresAt, signal, r
   }
   if (typeof credential !== 'string' || credential.length > 4096 || !/^[a-zA-Z0-9._~+/-]+=*$/.test(credential))
     throw new Error('Invalid remote relay credential.');
-  const remaining = expiresAt - Date.now();
-  if (!Number.isSafeInteger(expiresAt) || !(remaining > 0 && remaining <= 30000))
-    throw new Error('Invalid remote relay authorization lifetime.');
+  const timing = lifetime(expiresAt, localDeadline), remaining = timing.remaining;
   if (!(signal instanceof AbortSignal) || signal.aborted || typeof receive !== 'function')
     throw new Error('Remote relay authorization is revoked or its receiver is invalid.');
   if (ca !== undefined && typeof ca !== 'string' && !Buffer.isBuffer(ca))
@@ -28,7 +38,7 @@ export async function connectRemoteRelay({ url, credential, expiresAt, signal, r
   if (onOpen !== undefined && typeof onOpen !== 'function')
     throw new Error('Invalid remote relay open callback.');
 
-  let deadline = performance.now() + remaining;
+  let deadline = timing.deadline, wallExpiry = expiresAt;
   let ws;
   try {
     ws = new WebSocket(endpoint, 'notify-relay-v1', {
@@ -67,7 +77,7 @@ export async function connectRemoteRelay({ url, credential, expiresAt, signal, r
   function live() {
     if (stopped) return false;
     if (signal.aborted) { revoked(); return false; }
-    if (performance.now() >= deadline) { expired(); return false; }
+    if (performance.now() >= deadline || Date.now() >= wallExpiry) { expired(); return false; }
     return true;
   }
 
@@ -102,13 +112,12 @@ export async function connectRemoteRelay({ url, credential, expiresAt, signal, r
     signal: controller.signal, closed,
     close() { finish(null); return closed; },
     // Caller must first verify a fresh HTTPS proof bound to this connection.
-    renew(expiresAt) {
+    renew(expiresAt, localDeadline) {
       if (!live() || ws.readyState !== WebSocket.OPEN)
         throw terminalError ?? new Error('Remote relay connection closed.');
-      const remaining = expiresAt - Date.now();
-      if (!Number.isSafeInteger(expiresAt) || remaining <= 0 || remaining > 30000)
-        throw new Error('Invalid remote relay authorization lifetime.');
-      deadline = performance.now() + remaining;
+      const { deadline: nextDeadline, remaining } = lifetime(expiresAt, localDeadline);
+      deadline = nextDeadline;
+      wallExpiry = expiresAt;
       clearTimeout(timer);
       timer = setTimeout(expired, remaining);
       timer.unref();

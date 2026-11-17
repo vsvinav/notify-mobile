@@ -1,3 +1,5 @@
+import { leaseStart, localLease } from './remote-lease.mjs';
+
 const MAX_FRAME = 1_064_960;
 const encoder = new TextEncoder(), decoder = new TextDecoder('utf-8', { fatal: true });
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
@@ -157,24 +159,23 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
     onStatus({ state: 'disconnected', message: `${message} Reconnecting safely in ${delay / 1000}s; no actions will be retried.` });
     reconnectTimer = setTimeout(() => { void start().catch(() => {}); }, delay);
   }
-  function validLease(result, id, previousChallenge) {
-    const now = Date.now(), renewal = result?.renewal;
+  function validLease(result, id, started, previousChallenge) {
+    const renewal = result?.renewal;
     if (!object(result) || result.role !== 'phone' || result.macID !== macID || result.deviceID !== deviceID ||
       typeof result.approved !== 'boolean' || (previousChallenge !== undefined && lease.approved && !result.approved) ||
-      !Number.isSafeInteger(result.expiresAt) ||
-      result.expiresAt <= now || result.expiresAt > now + 30000 ||
       !object(renewal) || renewal.id !== id || !/^[A-Za-z0-9_-]{43}$/.test(id) ||
       typeof renewal.challenge !== 'string' || !renewal.challenge.length ||
       encoder.encode(renewal.challenge).length > 4096 || renewal.challenge === previousChallenge)
       throw new Error('Channel authorization does not match this phone.');
+    return localLease(result, started);
   }
   function liveLease() {
     return lease && Date.now() < lease.expiresAt && performance.now() < deadline;
   }
-  function applyLease(result) {
-    lease = result;
-    const remaining = lease.expiresAt - Date.now();
-    deadline = performance.now() + remaining;
+  function applyLease(result, timing) {
+    lease = { ...result, expiresAt: timing.expiresAt };
+    const { remaining } = timing;
+    deadline = timing.deadline;
     clearTimeout(expiryTimer);
     expiryTimer = setTimeout(() => disconnected('Channel authorization expired. No actions were retried.'), remaining);
   }
@@ -188,11 +189,11 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
         if (!liveLease() || socket?.readyState !== 1) throw uncertainty();
         const { id, challenge } = lease.renewal;
         const signature = base64url(peer.sign_authorization(encoder.encode(challenge)));
+        const started = leaseStart();
         const result = await post('/v1/remote/grant/renew', { id, signature }, 10000, signal);
         if (current !== generation || signal.aborted) return;
         if (!liveLease()) throw uncertainty();
-        validLease(result, id, challenge);
-        applyLease(result);
+        applyLease(result, validLease(result, id, started, challenge));
       } catch (error) {
         // An uncertain response may already have consumed the nonce. Never retry it.
         if (current === generation && !signal.aborted) {
@@ -275,10 +276,11 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
       if (current !== generation) return;
       if (!/^[A-Za-z0-9_-]{43}$/.test(grant.id) || typeof grant.challenge !== 'string' || !grant.challenge.length ||
         encoder.encode(grant.challenge).length > 4096) throw new Error('Invalid channel authorization challenge.');
-      const result = await post('/v1/remote/grant/finish', { id: grant.id, signature: base64url(peer.sign_authorization(encoder.encode(grant.challenge))) }, 15000, signal);
+      const signature = base64url(peer.sign_authorization(encoder.encode(grant.challenge)));
+      const started = leaseStart();
+      const result = await post('/v1/remote/grant/finish', { id: grant.id, signature }, 15000, signal);
       if (current !== generation) return;
-      validLease(result, grant.id);
-      applyLease(result);
+      applyLease(result, validLease(result, grant.id, started));
       const url = new URL('/v1/relay', origin);
       if (url.protocol === 'https:') url.protocol = 'wss:';
       else if (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) url.protocol = 'ws:';

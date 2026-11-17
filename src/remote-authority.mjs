@@ -415,7 +415,10 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
       deviceID: grant.device.deviceID, connectionID: grant.id });
   }
   function publicLease(grant) {
-    return { expiresAt: grant.expiresAt, role: grant.role,
+    check();
+    const validForMs = Math.floor(grant.deadline - mono);
+    if (validForMs <= 0 || !valid(grant)) fail(401, 'Routing authorization expired.');
+    return { expiresAt: grant.expiresAt, validForMs, role: grant.role,
       macID: grant.mac.macID, deviceID: grant.device.deviceID, approved: grant.device.approved,
       renewal: { id: grant.id, challenge: grant.renewalChallenge } };
   }

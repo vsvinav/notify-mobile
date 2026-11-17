@@ -75,6 +75,7 @@ test('signed bootstrap, account-bound pending routing and explicit local approva
   assert.equal(state.pending.publicKey, phone.key.publicKey);
   assert.deepEqual(state.devices, []);
   const pendingGrant = await f.grant(host, phone);
+  assert.equal(pendingGrant.validForMs, 30000);
   assert.equal(pendingGrant.approved, false);
   const live = f.relay(pendingGrant);
   assert.deepEqual(Object.keys(live).sort(),
@@ -110,6 +111,7 @@ test('fractional monotonic deadlines produce whole-millisecond pairing and relay
     id: challenge.id, signature: phone.key.sign(challenge.challenge)
   }, phone.session.req);
   assert.equal(grant.expiresAt, challenge.expiresAt);
+  assert.equal(grant.validForMs, 10000, 'Pending approval validity is floored and cannot extend enrollment');
   assert.equal(f.relay(grant).expiresAt, grant.expiresAt);
 });
 

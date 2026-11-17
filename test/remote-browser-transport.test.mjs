@@ -54,6 +54,42 @@ test('full QR key is mandatory and login never invents a user handle', () => {
     response: { clientDataJSON: new Uint8Array([1]), authenticatorData: new Uint8Array([2]), signature: new Uint8Array([3]), userHandle: null } }, 'login'), /user handle/i);
 });
 
+test('phone accepts a +19ms server clock with bounded validity, including renewal', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1800000000000 });
+  const h = harness({ post: async path => path.endsWith('begin') ? { id: grantID, challenge: 'challenge' } :
+    { role: 'phone', macID: 'mac', deviceID: 'phone', approved: true,
+      expiresAt: Date.now() + 30019, validForMs: 30000,
+      renewal: { id: grantID, challenge: path.endsWith('renew') ? 'renew-2' : 'renew-1' } } });
+  t.after(() => h.transport.close());
+  const socket = await h.connect();
+  t.mock.timers.tick(10000); await flush();
+  assert.equal(socket.readyState, 1);
+  assert.equal(h.calls.filter(c => c.path.endsWith('/renew')).length, 1);
+  assert.equal(h.peers.length, 1);
+});
+
+test('phone consumes the complete finish and renewal round trip before accepting actions', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1800000000000 });
+  let renew = false;
+  const h = harness({ post: async path => {
+    if (path.endsWith('begin')) return { id: grantID, challenge: 'challenge' };
+    const requestStart = Date.now();
+    const validForMs = path.endsWith('renew') ? 5000 : 30000;
+    if (path.endsWith('renew')) { renew = true; t.mock.timers.setTime(requestStart + 4000); }
+    return { role: 'phone', macID: 'mac', deviceID: 'phone', approved: true,
+      expiresAt: Date.now() + validForMs + 19, validForMs,
+      renewal: { id: grantID, challenge: renew ? 'renew-2' : 'renew-1' } };
+  } });
+  t.after(() => h.transport.close());
+  const socket = await h.connect();
+  t.mock.timers.tick(10000); await flush();
+  assert.equal(renew, true);
+  const frames = socket.sent.length;
+  t.mock.timers.setTime(Date.now() + 1000);
+  await assert.rejects(h.transport.api('reply'), /uncertain|authorization/i);
+  assert.equal(socket.sent.length, frames, 'Expired actions must not be queued or replayed');
+});
+
 test('reconnect remains available after the fast retry budget is exhausted', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
   let offline = false;
@@ -162,7 +198,8 @@ test('renewal rejects changed binding and uncertain responses without retrying a
     { renewal: { id: grantID, challenge: 'renew' } },
     { renewal: { id: grantID, challenge: 'x'.repeat(4097) } },
     { renewal: { id: grantID, challenge: 'é'.repeat(2049) } },
-    { expiresAt: Date.now() + 1000000 }, { expiresAt: 0 }, null
+    { expiresAt: Date.now() + 1000000 }, { expiresAt: 0 },
+    ...[null, 0, -1, 30001, 1.5, '30000'].map(validForMs => ({ validForMs })), null
   ]) {
     const h = harness({ post: async path => {
       if (path.endsWith('begin')) return { id: grantID, challenge: 'challenge' };

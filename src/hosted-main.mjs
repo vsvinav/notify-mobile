@@ -17,6 +17,7 @@ const ASSETS = new Map([
   ['/', ['remote.html', 'text/html; charset=utf-8']],
   ['/remote-app.mjs', ['remote-app.mjs', 'text/javascript; charset=utf-8']],
   ['/remote-transport.mjs', ['remote-transport.mjs', 'text/javascript; charset=utf-8']],
+  ['/remote-lease.mjs', ['remote-lease.mjs', 'text/javascript; charset=utf-8']],
   ['/remote-identity.mjs', ['remote-identity.mjs', 'text/javascript; charset=utf-8']],
   ['/workspace.mjs', ['workspace.mjs', 'text/javascript; charset=utf-8']],
   ['/remote-crypto/channel.js', ['remote-crypto/channel.js', 'text/javascript; charset=utf-8']],

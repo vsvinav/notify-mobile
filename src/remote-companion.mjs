@@ -11,6 +11,7 @@ import { connectRemoteRelay } from './remote-relay-client.mjs';
 import { NativeCrypto } from './remote-crypto.mjs';
 import { RemoteActions } from './remote-actions.mjs';
 import { object } from './validation.mjs';
+import { leaseStart, localLease } from '../public/remote-lease.mjs';
 
 const execute = promisify(execFile);
 const uuid = value => typeof value === 'string' && /^[a-f\d]{8}(-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(value);
@@ -183,16 +184,16 @@ export async function createRemoteCompanion({ directory, origin, emit,
       fail(502, 'Invalid internet authorization challenge.');
     return bytes(await signer.call('sign', { bytes: [...Buffer.from(challenge)] })).toString('base64url');
   }
-  function validateGrant(grant, channel, id, previous) {
-    const now = Date.now(), renewal = grant?.renewal;
+  function validateGrant(grant, channel, id, started, previous) {
+    const renewal = grant?.renewal;
     if (!object(grant) || grant.role !== 'mac' || grant.macID !== state.macID || grant.deviceID !== channel.device.id ||
       typeof grant.approved !== 'boolean' || (previous?.approved && !grant.approved) ||
-      !Number.isSafeInteger(grant.expiresAt) || grant.expiresAt <= now || grant.expiresAt > now + 30000 ||
       !object(renewal) || renewal.id !== id || typeof id !== 'string' || !/^[\w-]{43}$/.test(id) ||
       typeof renewal.challenge !== 'string' || !renewal.challenge.length || Buffer.byteLength(renewal.challenge) > 4096 ||
       renewal.challenge === previous?.renewal.challenge ||
       (!grant.approved && channel.enrollmentExpiresAt && grant.expiresAt > channel.enrollmentExpiresAt))
       fail(502, 'Invalid Mac relay grant.');
+    return localLease(grant, started);
   }
   async function register(signal) {
     const begin = await api('mac/begin', { macID: state.macID, publicKey: state.publicKey }, undefined, signal);
@@ -206,7 +207,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
     if (!channel.possession || channel.handle || channel.signal.aborted || !auth) return;
     const approved = state.devices.find(d => d.id === channel.device.id && d.publicKey === channel.device.publicKey);
     if (!approved || !serverDevices.some(d => d.deviceID === approved.id && d.publicKey === approved.publicKey)) return;
-    const remaining = channel.expiresAt - Date.now();
+    const remaining = Math.floor(Math.min(channel.expiresAt - Date.now(), channel.deadline - performance.now()));
     if (remaining <= 0) return;
     channel.handle = auth.connect({ ...state.owner, macID: state.macID,
       deviceID: approved.id, keyHash: hash(approved.publicKey) }, remaining);
@@ -247,15 +248,16 @@ export async function createRemoteCompanion({ directory, origin, emit,
         const { id, challenge } = grant.renewal;
         const signature = await sign(challenge);
         if (!current()) return;
+        const started = leaseStart();
         const next = await api('grant/renew', { id, signature }, state.credential, channel.signal);
         if (!current()) return;
         if (!unexpired()) fail(403, 'Mac relay authorization expired.');
-        validateGrant(next, channel, id, grant);
-        const remaining = next.expiresAt - Date.now();
+        const timing = validateGrant(next, channel, id, started, grant);
+        const remaining = timing.remaining;
         if (channel.handle) auth.renew(channel.handle, remaining);
-        relay.renew(next.expiresAt);
-        channel.expiresAt = next.expiresAt;
-        channel.deadline = performance.now() + remaining;
+        relay.renew(timing.expiresAt, timing.deadline);
+        channel.expiresAt = timing.expiresAt;
+        channel.deadline = timing.deadline;
         grant = next;
       } catch {
         // The service may have consumed the nonce even when its reply was lost.
@@ -274,10 +276,12 @@ export async function createRemoteCompanion({ directory, origin, emit,
       const challenge = await api('grant/begin', { role: 'mac', deviceID: device.id }, state.credential, channel.signal);
       if (typeof challenge.id !== 'string' || !/^[\w-]{43}$/.test(challenge.id))
         fail(502, 'Invalid Mac authorization challenge.');
-      grant = await api('grant/finish', { id: challenge.id, signature: await sign(challenge.challenge) }, undefined, channel.signal);
-      validateGrant(grant, channel, challenge.id);
-      channel.expiresAt = grant.expiresAt;
-      channel.deadline = performance.now() + grant.expiresAt - Date.now();
+      const signature = await sign(challenge.challenge);
+      const started = leaseStart();
+      grant = await api('grant/finish', { id: challenge.id, signature }, undefined, channel.signal);
+      const timing = validateGrant(grant, channel, challenge.id, started);
+      channel.expiresAt = timing.expiresAt;
+      channel.deadline = timing.deadline;
       crypto = openCrypto();
       channel.send = async data => {
         requireLive();
@@ -286,7 +290,8 @@ export async function createRemoteCompanion({ directory, origin, emit,
         await relay.send(frame);
       };
       const relayReady = connectRelay({ url: `${origin.replace('https:', 'wss:')}/v1/relay`,
-        credential: grant.credential, expiresAt: grant.expiresAt, signal: channel.signal, onOpen: opened,
+        credential: grant.credential, expiresAt: channel.expiresAt, deadline: channel.deadline,
+        signal: channel.signal, onOpen: opened,
         receive: async data => {
           relay = await relayReady;
           requireLive();

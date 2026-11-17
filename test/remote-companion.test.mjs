@@ -373,7 +373,7 @@ test('helper requires full-key local approval and native ACK (injected crypto fi
 });
 
 const settle = async () => { for (let i = 0; i < 25; i++) await new Promise(resolve => setImmediate(resolve)); };
-async function renewalFixture(t, { pendingApproval = false, renew, status } = {}) {
+async function renewalFixture(t, { pendingApproval = false, renew, status, finish } = {}) {
   const root = join(process.cwd(), '.test-data');
   await mkdir(root, { recursive: true });
   const directory = await mkdtemp(join(root, 'remote-renew-'));
@@ -412,7 +412,7 @@ async function renewalFixture(t, { pendingApproval = false, renew, status } = {}
         return status ? status(value, options) : Response.json(value);
       }
       if (path.endsWith('/grant/begin')) return Response.json({ id, challenge: 'initial' });
-      if (path.endsWith('/grant/finish')) return Response.json(grant());
+      if (path.endsWith('/grant/finish')) return finish ? await finish(grant(), options) : Response.json(grant());
       if (path.endsWith('/grant/renew')) {
         assert.equal(options.headers.Authorization, `Bearer ${'c'.repeat(43)}`);
         assert.deepEqual(JSON.parse(options.body), { id, signature: 'AQI' });
@@ -449,6 +449,38 @@ async function renewalFixture(t, { pendingApproval = false, renew, status } = {}
     receive: value => receiver(Buffer.from(JSON.stringify(value))), signal: relaySignal, disconnect: () => closeRelay(),
     saved: () => readFile(join(directory, 'identity.json'), 'utf8') };
 }
+
+test('companion accepts +19ms clock skew and passes only local deadlines to relay and authorization', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
+  const skew = grant => Response.json({ ...grant, expiresAt: Date.now() + 30019, validForMs: 30000 });
+  const f = await renewalFixture(t, { finish: skew, renew: skew });
+  assert.equal(f.events.findLast(e => e.type === 'status').status.state, 'connected');
+  t.mock.timers.tick(10000); await settle();
+  assert.equal(f.signal.aborted, false);
+  assert.equal(f.renewals.length, 1);
+  assert.ok(f.renewals[0] <= Date.now() + 30000);
+  const ready = f.frames.find(frame => frame.type === 'ready');
+  await f.receive({ id: randomUUID(), epoch: ready.epoch, payload: { path: 'state', data: {} } });
+  await settle();
+  assert.equal(f.frames.at(-1).status, 200);
+});
+
+test('companion renewal subtracts response latency before handing off local expiry', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
+  let requestStart;
+  const f = await renewalFixture(t, { renew: async grant => {
+    requestStart = Date.now();
+    t.mock.timers.setTime(requestStart + 4000);
+    return Response.json({ ...grant, expiresAt: Date.now() + 5019, validForMs: 5000 });
+  } });
+  t.mock.timers.tick(10000); await settle();
+  assert.equal(f.renewals[0], requestStart + 5000);
+  const ready = f.frames.find(frame => frame.type === 'ready');
+  t.mock.timers.setTime(requestStart + 5000);
+  await assert.rejects(f.receive({ id: randomUUID(), epoch: ready.epoch, payload: { path: 'state', data: {} } }),
+    /expired|closed/i);
+  assert.equal(f.requests.filter(r => r.path.endsWith('/renew')).length, 1);
+});
 
 for (const failure of ['network', 'timeout', 'service', 'service-html']) {
   test(`wake after five minutes recovers from ${failure} failure without replacing trust or replaying actions`, async t => {
@@ -561,7 +593,7 @@ test('companion rejects invalid renewal bindings, lifetimes and uncertain respon
   for (const change of [
     { role: 'phone' }, { macID: 'other' }, { deviceID: 'other' }, { approved: false },
     { renewal: { id: 'x'.repeat(43), challenge: 'next' } }, { renewal: { id: 'g'.repeat(43), challenge: '' } },
-    { expiresAt: 0 }, null
+    { expiresAt: 0 }, ...[null, 0, -1, 30001, 1.5, '30000'].map(validForMs => ({ validForMs })), null
   ]) {
     const f = await renewalFixture(t, { renew: async grant => {
       if (change === null) throw new Error('Response lost');

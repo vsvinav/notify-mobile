@@ -115,6 +115,8 @@ test('invalid endpoints, credentials and expired grants fail before opening a so
     { credential: '' },
     { expiresAt: Date.now() - 1 },
     { expiresAt: Date.now() + 90000 },
+    { deadline: performance.now() - 1 },
+    { deadline: performance.now() + 90000 },
     { signal: AbortSignal.abort() }
   ]) await assert.rejects(f.mac(options));
   assert.equal(f.requests.length, 0);
@@ -184,6 +186,7 @@ test('trusted renewal preserves the socket and cancels the previous expiry timer
   const client = await f.mac({ expiresAt: Date.now() + 300 });
   for (const expiresAt of [Date.now() - 1, Date.now() + 90000, NaN, Infinity])
     assert.throws(() => client.renew(expiresAt), /lifetime/i);
+  assert.throws(() => client.renew(Date.now() + 1000, performance.now() - 1), /lifetime/i);
   client.renew(Date.now() + 1000);
   await delay(350);
   assert.equal(client.signal.aborted, false);
