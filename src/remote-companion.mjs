@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import https from 'node:https';
 import { privateDirectory, readPrivate, writePrivate } from './storage.mjs';
 import { RemoteAccess } from './remote-access.mjs';
 import { connectRemoteRelay } from './remote-relay-client.mjs';
@@ -34,9 +35,19 @@ function validDevice(device) {
   return object(device) && uuid(device.id) && text(device.name, 100) && validKey(device.publicKey);
 }
 
+function nativeRequest(url, { method, headers, body, signal }) {
+  return new Promise((resolve, reject) => {
+    const request = https.request(url, { method, headers, signal, rejectUnauthorized: true }, response => {
+      resolve({ status: response.statusCode, ok: response.statusCode >= 200 && response.statusCode < 300, body: response });
+    });
+    request.on('error', reject);
+    request.end(body);
+  });
+}
+
 export async function createRemoteCompanion({ directory, origin, emit,
   executable = fileURLToPath(new URL('../../remote-crypto/notify-channel', import.meta.url)),
-  fetchRequest = fetch, connectRelay = connectRemoteRelay,
+  fetchRequest = nativeRequest, connectRelay = connectRemoteRelay,
   cryptoProcess = (path, args) => new NativeCrypto(path, args) }) {
   let endpoint;
   try { endpoint = new URL(origin); } catch { fail(400, 'Invalid internet service origin.'); }

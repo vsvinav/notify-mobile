@@ -5,6 +5,11 @@ import { createECDH, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { permission } from './fixtures.mjs';
+import https from 'node:https';
+import { once } from 'node:events';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { certificates } from '../src/certificates.mjs';
 
 const key = () => { const ecdh = createECDH('prime256v1'); ecdh.generateKeys(); return ecdh.getPublicKey().toString('base64url'); };
 async function until(predicate) {
@@ -18,6 +23,60 @@ async function until(predicate) {
 test('internet helper rejects insecure or non-origin service URLs before creating identity', async () => {
   for (const origin of ['http://example.com', 'https://example.com/path', 'https://a@example.com', 'https://example.com#key']) {
     await assert.rejects(createRemoteCompanion({ directory: '.', origin, emit() {} }), /origin/i);
+  }
+});
+
+test('real native HTTP client verifies TLS without browser-only request headers', async () => {
+  const root = join(process.cwd(), '.test-data');
+  await mkdir(root, { recursive: true });
+  const directory = await mkdtemp(join(root, 'remote-http-'));
+  const tls = await certificates(directory, '127.0.0.1', true);
+  const macID = randomUUID(), publicKey = key();
+  let headers;
+  const server = https.createServer(tls, (req, res) => {
+    headers = req.headers;
+    req.resume();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ macID, pending: null, devices: [] }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const origin = `https://127.0.0.1:${server.address().port}`;
+    await writeFile(join(directory, 'identity.json'), JSON.stringify({
+      version: 1, origin, macID, publicKey, owner: null, devices: [],
+      credential: 'c'.repeat(43), setupID: 'setup'
+    }), { mode: 0o600 });
+    const ca = join(directory, 'test-ca.pem');
+    await writeFile(ca, tls.ca);
+    await promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs/promises';
+      import { createRemoteCompanion } from './src/remote-companion.mjs';
+      const directory = process.argv[1];
+      const state = JSON.parse(await fs.readFile(directory + '/identity.json', 'utf8'));
+      let count = 0, finish;
+      const done = new Promise(resolve => { finish = resolve; });
+      const helper = await createRemoteCompanion({
+        directory, origin: state.origin,
+        emit(event) { if (event.type === 'status' && ++count === 2) finish(); },
+        cryptoProcess: () => ({
+          async call() { return [...Buffer.from(state.publicKey, 'base64url')]; },
+          async close() {}
+        })
+      });
+      await done; await helper.close();
+    `, directory], {
+      timeout: 10000,
+      env: { ...process.env, NODE_TLS_REJECT_UNAUTHORIZED: '1', NODE_EXTRA_CA_CERTS: ca }
+    });
+    assert.ok(headers, 'The verified HTTPS request must reach the server');
+    assert.deepEqual(Object.keys(headers).filter(name => name.startsWith('sec-fetch-')), []);
+    assert.equal(headers.origin, undefined);
+    assert.equal(headers.cookie, undefined);
+    assert.equal(headers.authorization, `Bearer ${'c'.repeat(43)}`);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    await rm(directory, { recursive: true });
   }
 });
 
