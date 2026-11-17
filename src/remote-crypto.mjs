@@ -55,6 +55,7 @@ export class NativeCrypto {
       if (error) this.#fail(new Error('Native encrypted channel pipe closed.'));
     });
   }
+  get failed() { return this.#error !== undefined; }
   call(op, args = {}) {
     if (this.#error) return Promise.reject(this.#error);
     if (this.#queue.length >= 8) return Promise.reject(new Error('Native encrypted channel is busy.'));

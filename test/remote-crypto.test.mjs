@@ -22,6 +22,7 @@ test('crypto pipe correlates responses and rejects pending calls on exit without
     assert.deepEqual(await crypto.call('send', { bytes: [1, 2] }), [1, 2]);
     assert.deepEqual(await crypto.call('send', { bytes: [3] }), [3]);
     await assert.rejects(crypto.call('exit'), /closed|exited/i);
+    assert.equal(crypto.failed, true, 'A retired pipe must be detectable before starting a new authorization attempt');
     await assert.rejects(crypto.call('send', { bytes: [4] }), /closed|exited/i);
   } finally {
     await crypto.close();

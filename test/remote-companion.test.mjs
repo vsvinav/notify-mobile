@@ -481,7 +481,7 @@ test('helper requires full-key local approval and native ACK (injected crypto fi
 });
 
 const settle = async () => { for (let i = 0; i < 25; i++) await new Promise(resolve => setImmediate(resolve)); };
-async function renewalFixture(t, { pendingApproval = false, renew, status, finish } = {}) {
+async function renewalFixture(t, { pendingApproval = false, renew, status, finish, wrapCrypto = value => value } = {}) {
   const root = join(process.cwd(), '.test-data');
   await mkdir(root, { recursive: true });
   const directory = await mkdtemp(join(root, 'remote-renew-'));
@@ -500,7 +500,7 @@ async function renewalFixture(t, { pendingApproval = false, renew, status, finis
     credential: 'r'.repeat(43), renewal: { id, challenge: `renew-${requests.length}` } });
   const helper = await createRemoteCompanion({
     directory, origin, emit: event => events.push(event),
-    cryptoProcess: () => ({
+    cryptoProcess: () => wrapCrypto({
       async call(op, args = {}) {
         if (op === 'identity') return [...Buffer.from(macKey, 'base64url')];
         if (op === 'sign') { signed.push(Buffer.from(args.bytes).toString()); return [1, 2]; }
@@ -557,6 +557,53 @@ async function renewalFixture(t, { pendingApproval = false, renew, status, finis
   return { helper, events, frames, requests, renewals, signed, pending,
     receive: value => receiver(Buffer.from(JSON.stringify(value))), signal: relaySignal, disconnect: () => closeRelay(),
     saved: () => readFile(join(directory, 'identity.json'), 'utf8') };
+}
+
+for (const changedIdentity of [false, true]) {
+  test(`retired native signer ${changedIdentity ? 'rejects a changed identity' : 'recovers with the pinned identity without replay'}`, async t => {
+    const processes = [], otherKey = key();
+    const f = await renewalFixture(t, { wrapCrypto: base => {
+      const replacement = processes.length >= 2;
+      const process = {
+        failed: false,
+        async call(op, args) {
+          if (this.failed) throw new Error('Native encrypted channel closed.');
+          if (changedIdentity && replacement && op === 'identity')
+            return [...Buffer.from(otherKey, 'base64url')];
+          return base.call(op, args);
+        },
+        async close() { this.failed = true; }
+      };
+      processes.push(process);
+      return process;
+    } });
+    const saved = await f.saved(), oldEpoch = f.frames.find(frame => frame.type === 'ready').epoch;
+    await f.helper.command({ type: 'snapshot', total: 1, requests: [permission()] });
+    await f.receive({ id: randomUUID(), epoch: oldEpoch, payload: { path: 'reply', data: {
+      sessionID: 'session-1', requestID: 'request-1', ticket: 'ticket-1', decision: 'deny', answers: {}
+    } } });
+    await settle();
+    assert.equal(f.events.filter(event => event.type === 'reply').length, 1);
+    processes[0].failed = true;
+    await f.helper.command({ type: 'offline' }); await settle();
+    await f.helper.command({ type: 'heartbeat' }); await settle();
+    if (changedIdentity) {
+      assert.equal(f.events.findLast(e => e.type === 'status').status.state, 'error');
+      assert.match(f.events.findLast(e => e.type === 'error').message, /identity changed/i);
+      assert.equal(f.requests.filter(r => r.path.endsWith('/grant/finish')).length, 1);
+    } else {
+      assert.equal(f.requests.filter(r => r.path.endsWith('/grant/finish')).length, 2,
+        'A dead signer must not leave the Mac stuck Connecting forever');
+      await f.receive({ type: 'key_package', bytes: [1] });
+      await f.receive({ type: 'hello' }); await settle();
+      assert.equal(f.events.findLast(e => e.type === 'status').status.state, 'connected');
+      assert.notEqual(f.frames.findLast(frame => frame.type === 'ready').epoch, oldEpoch);
+      await assert.rejects(f.receive({ id: randomUUID(), epoch: oldEpoch,
+        payload: { path: 'state', data: {} } }), /expired connection/);
+    }
+    assert.equal(f.events.filter(event => event.type === 'reply').length, 1);
+    assert.equal(await f.saved(), saved, 'Recovery must retain the existing identity, owner and approved phones');
+  });
 }
 
 test('a status poll completing during revocation does not permanently fault the helper', async t => {

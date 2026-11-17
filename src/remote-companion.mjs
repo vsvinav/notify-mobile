@@ -61,7 +61,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';
   await privateDirectory(directory);
   const file = join(directory, 'identity.json');
-  let state, writer = Promise.resolve(), auth, signer, policyWork;
+  let state, writer = Promise.resolve(), auth, signer, signerWork, policyWork;
   let closed = false, paused = false, polling, pollController, registration, pending, approving, setupID, serverDevices = [];
   let message = 'Waiting for phone sign-in.', fault, enrollmentError;
   const channels = new Map();
@@ -192,10 +192,34 @@ export async function createRemoteCompanion({ directory, origin, emit,
     } });
     auth.enable();
   }
+  function verifiedSigner() {
+    if (signerWork) return signerWork;
+    if (signer && !signer.failed) return Promise.resolve(signer);
+    signerWork = (async () => {
+      await signer?.close();
+      lifetime.signal.throwIfAborted();
+      const candidate = openCrypto();
+      signer = candidate;
+      try {
+        if (bytes(await candidate.call('identity')).toString('base64url') !== state.publicKey) {
+          const error = new Error('Saved Mac identity changed. Internet access stopped; saved pairing was not replaced.');
+          fatal(error);
+          throw error;
+        }
+        lifetime.signal.throwIfAborted();
+        return candidate;
+      } catch (error) {
+        await candidate.close();
+        throw error;
+      }
+    })().finally(() => { signerWork = undefined; });
+    return signerWork;
+  }
   async function sign(challenge) {
     if (typeof challenge !== 'string' || !challenge.length || Buffer.byteLength(challenge) > 4096)
       fail(502, 'Invalid internet authorization challenge.');
-    return bytes(await signer.call('sign', { bytes: [...Buffer.from(challenge)] })).toString('base64url');
+    const identity = await verifiedSigner();
+    return bytes(await identity.call('sign', { bytes: [...Buffer.from(challenge)] })).toString('base64url');
   }
   function validateGrant(grant, channel, id, started, previous) {
     const renewal = grant?.renewal;
@@ -516,11 +540,10 @@ export async function createRemoteCompanion({ directory, origin, emit,
     actions.command(input);
     status();
   }
-  signer = openCrypto();
   try {
-    if (bytes(await signer.call('identity')).toString('base64url') !== state.publicKey) fail(503, 'Saved Mac identity changed.');
+    await verifiedSigner();
     if (state.owner) await openAuthorization(state.owner);
-  } catch (error) { await signer.close(); throw error; }
+  } catch (error) { await signer?.close(); throw error; }
   const timer = setInterval(() => { void tick(); }, 3000);
   timer.unref();
   status(); void tick();
