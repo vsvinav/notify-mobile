@@ -204,8 +204,12 @@ export async function firebaseConfiguration(env = process.env) {
     if (key.asymmetricKeyType !== 'rsa' || key.asymmetricKeyDetails.modulusLength < 2048) throw new Error();
     // Never pass credential-supplied URLs or discover application-default credentials.
     credentials = { client_email: value.client_email, private_key: value.private_key };
-  } catch {
-    throw new Error('Invalid Firebase configuration. Supply an explicit Notify-only project and matching service-account file.');
+  } catch (error) {
+    const startupCode = error.code === 'ENOENT' ? 'firebase-file-missing' :
+      error.code === 'ELOOP' ? 'firebase-file-symlink' :
+      error.code === 'EACCES' ? 'firebase-file-permission' : 'firebase-config-invalid';
+    throw Object.assign(new Error('Invalid Firebase configuration. Supply an explicit Notify-only project and matching service-account file.'),
+      { startupCode });
   } finally {
     await handle?.close();
   }
@@ -228,6 +232,6 @@ export async function createFirebaseStores({ origin, env = process.env, Firestor
       close: () => closing ??= firestore.terminate() });
   } catch {
     try { await firestore?.terminate(); } catch {}
-    throw unavailable();
+    throw Object.assign(unavailable(), { startupCode: 'firebase-storage-unavailable' });
   }
 }

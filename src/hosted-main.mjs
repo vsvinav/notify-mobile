@@ -415,8 +415,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const stop = () => { stopping = true; void app?.close(); };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
-  main().then(value => { app = value; if (stopping) return app.close(); }).catch(() => {
-    process.stderr.write('Hosted startup failed; check Render origin, PORT, Android certificates, assets and Firebase/private storage.\n');
+  main().then(value => { app = value; if (stopping) return app.close(); }).catch(error => {
+    const known = ['firebase-file-missing', 'firebase-file-symlink', 'firebase-file-permission',
+      'firebase-config-invalid', 'firebase-storage-unavailable'];
+    const category = known.includes(error?.startupCode) ? error.startupCode : 'configuration';
+    process.stderr.write(`Hosted startup failed (${category}); check Render origin, PORT, Android certificates, assets and Firebase/private storage.\n`);
     process.exitCode = 1;
   });
 }

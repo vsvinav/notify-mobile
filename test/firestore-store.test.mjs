@@ -1,12 +1,37 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomUUID } from 'node:crypto';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { resolve } from 'node:path';
 import { firestoreFixture } from './fixtures/firestore.mjs';
 
 const origin = 'https://notify.example';
 const module = () => import('../src/firestore-store.mjs');
+
+test('hosted startup identifies credential-file failures without printing file paths or contents', async t => {
+  const directory = resolve('.test-data', randomUUID());
+  await mkdir(directory, { recursive: true });
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const missing = resolve(directory, 'private-marker-missing.json');
+  const invalid = resolve(directory, 'private-marker-invalid.json');
+  const linked = resolve(directory, 'private-marker-linked.json');
+  await writeFile(invalid, 'private-marker-content');
+  await symlink(invalid, linked);
+  for (const [file, code] of [[missing, 'firebase-file-missing'],
+    [linked, 'firebase-file-symlink'], [invalid, 'firebase-config-invalid']]) {
+    await assert.rejects(promisify(execFile)(process.execPath, ['src/hosted-main.mjs'], {
+      timeout: 10000, env: { ...process.env, PORT: '10000',
+        NOTIFY_FIREBASE_PROJECT_ID: 'notify-fixture', NOTIFY_FIREBASE_CREDENTIALS_FILE: file }
+    }), error => {
+      assert.equal(error.code, 1);
+      assert.ok(error.stderr.includes(code), 'Startup identifies the sanitized failure category');
+      assert.ok(!error.stderr.includes('private-marker'));
+      return true;
+    });
+  }
+});
 
 test('durable stores preserve state and fence an overlapping previous writer', async () => {
   const { createFirestoreStores } = await module(), db = firestoreFixture();
@@ -308,6 +333,7 @@ test('Firebase configured but unavailable fails startup with sanitized errors an
   await assert.rejects(createFirebaseStores({ origin,
     env: { NOTIFY_FIREBASE_PROJECT_ID: 'notify-fixture', NOTIFY_FIREBASE_CREDENTIALS_FILE: file },
     Firestore: UnavailableFirestore }), error =>
-    /durable storage unavailable/.test(error.message) && !/Synthetic credential/.test(error.message));
+    /durable storage unavailable/.test(error.message) && !/Synthetic credential/.test(error.message) &&
+      error.startupCode === 'firebase-storage-unavailable');
   assert.equal(terminated, true);
 });
