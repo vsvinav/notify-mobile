@@ -1,9 +1,12 @@
 # Single-process Render Free hosting
 
+**Setting up your own service?** Start with the [step-by-step operator guide](https://github.com/vsvinav/notify/blob/feature/remote-native-identity/docs/remote-setup.md): Firebase Spark, deny-all Firestore rules, restricted IAM, managed Render secret files, Android signing/Digital Asset Links, FCM, pairing and safe recovery. Users joining an existing service do not need separate Firebase or Render accounts. This page documents the deployment contract and limits.
+
 `render.yaml` describes **one Free web service**, not a launched deployment.
 There is no paid disk, custom domain, background worker, or Rust build.
 Optional durable storage uses a separate Notify-only Firebase **Spark** project
-and its default Firestore database; no billing account or FCM setup is required.
+and its default Firestore database; no billing account is required. FCM setup
+is needed only for optional native Android notifications.
 Generated browser WASM is committed; the build is `npm ci --ignore-scripts`.
 Automatic deploys are disabled. Blueprint creation itself is a separate manual
 deployment action; this change does not authorize or perform it.
@@ -63,6 +66,22 @@ durably before success is returned. It never stores conversations, commands,
 client private keys, sessions/cookies, grants, challenges, setup links, sockets,
 or MLS channel state. The backend's service-account key stays in its secret file,
 not Firestore.
+
+When Android notifications are enabled, approved devices additionally retain a
+private FCM routing token. This is minimal delivery metadata, not conversation or
+command storage. Configure `NOTIFY_FCM_ENABLED=true` only with the explicit
+Firebase project and secret file, the FCM HTTP v1 API enabled, and
+`cloudmessaging.messages.create` granted to that restricted service account.
+Notifications contain only a generic attention event; FCM is not command transport.
+The Android client must be built for the same Firebase project. The stock app's
+service origin is fixed; a different self-hosted service requires a client rebuild.
+
+For native Android passkeys, set both `NOTIFY_ANDROID_PACKAGE_NAME=app.notify.android`
+and `NOTIFY_ANDROID_SHA256_CERT_FINGERPRINTS` (1–4 distinct uppercase colon-separated
+SHA-256 signing-certificate fingerprints, comma-separated without spaces).
+The backend serves the corresponding `/.well-known/assetlinks.json` statement.
+Use the installed release APK's signer, not its file checksum or an unrelated
+debug signer. Browser-only hosting can omit both Android variables.
 
 After a restart, sign in with the **same passkey/account** and reconnect. Existing
 Mac credentials and pinned keys still work; no re-pairing or trust reset occurs.
@@ -170,12 +189,15 @@ stricter bootstrap and concurrency limits still apply.
 `GET /healthz` returns `{"status":"ok"}` only while ready, otherwise 503; it
 contains no authority or secrets and performs no database reads.
 `GET`/`HEAD /` serves `public/remote.html`. Static routing is an exact allowlist:
-`remote-app.mjs`, `remote-transport.mjs`, `remote-identity.mjs`, `workspace.mjs`,
+`remote-app.mjs`, `remote-transport.mjs`, `remote-lease.mjs`, `remote-identity.mjs`, `workspace.mjs`,
 `styles.css`, `remote-crypto/channel.js`, and `remote-crypto/channel_bg.wasm`.
 `workspace.mjs` is the shared read-only renderer, not the LAN app or its APIs.
 Unknown paths, query variants, the LAN application, and service workers are
 not exposed. Factories return 404 for missing assets; CLI startup requires all
 listed assets to exist.
+
+When Android is configured, `GET`/`HEAD /.well-known/assetlinks.json` also serves
+its public association statement.
 
 All control requests use `POST` with exact `Content-Type: application/json`,
 at most 16 KiB, no content encoding, and no unexpected fields.
@@ -195,6 +217,9 @@ at most 16 KiB, no content encoding, and no unexpected fields.
 | `/v1/remote/grant/begin` | `role`, `deviceID`, optional `macID`; Mac credential only from Bearer, phone from account cookie |
 | `/v1/remote/grant/finish` | `id`, `signature`; phone must still authorize as the account that began the grant |
 | `/v1/remote/grant/renew` | `id`, `signature`; connected, unexpired grant, current same-account phone cookie or original native Mac Bearer credential |
+| `/v1/remote/push/begin` | `macID`, `deviceID`, `token` (or `null` to remove); current account session for an approved device |
+| `/v1/remote/push/finish` | `id`, `signature`; same-account signed device proof |
+| `/v1/remote/mac/attention` | `eventID`, `issuedAt`; native Mac Bearer credential; generic attention notification only |
 
 Clients sign authority-issued challenges using the documented P-256 domain
 separator and UTF-8 JSON challenge, with canonical base64url DER signatures. Phone grant completion

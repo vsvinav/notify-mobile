@@ -8,6 +8,8 @@ Approve a command, pick an option, or write your own answer without returning to
 
 [Quickstart](#quickstart) · [Install on iPhone](#install-on-iphone) · [Install on Android](#install-on-android) · [Using the app](#using-notify)
 
+**Choose your connection:** the quickstart below is the same-Wi-Fi web app. Optional internet access uses a separate HTTPS service, passkey sign-in and explicit full-public-key approval on the Mac. Start with the [complete internet / Render / Firebase setup guide](https://github.com/vsvinav/notify/blob/feature/remote-native-identity/docs/remote-setup.md), or see the [hosted deployment contract](docs/render-hosting.md). Users joining an existing service do not need their own Firebase project. Native Android internet access is a separate versioned APK supplied by the operator; it is not the LAN web app.
+
 ## Keep work moving
 
 - **Approve or deny from your phone.** Review the request and send your decision back to the waiting session.
@@ -45,7 +47,7 @@ Approve a command, pick an option, or write your own answer without returning to
 
 ## Quickstart
 
-You'll need **Notify running on your Mac**, a phone on the **same Wi-Fi**, and a few minutes for first-time setup. There is no App Store download yet: this version installs as a web app from your Mac.
+You'll need **Notify running on your Mac**, a phone on the **same Wi-Fi**, and a few minutes for first-time setup. This LAN version installs as a web app from your Mac, not an App Store download.
 
 1. **Enable your phone connection.** In Notify on the Mac, open **Settings > Phone connections**, enable **Allow phone connections**, and click **Pair a phone**.
 2. **Scan the QR code.** Follow the local setup page to download Notify's certificate. Compare its full SHA-256 fingerprint with the one shown on your Mac before trusting it.
@@ -53,7 +55,7 @@ You'll need **Notify running on your Mac**, a phone on the **same Wi-Fi**, and a
 4. **Pair from the installed app.** Open the new Notify icon, enter the Mac's eight-digit pairing code and give your phone a name. Check that the six-digit confirmation matches on both devices, then choose **Confirm phone** on the Mac.
 5. **Turn on alerts.** Open **Settings** in the phone app, tap **Enable alerts** and allow notifications. Use **Send test alert** on the Mac to try a generic notification.
 
-**Need the Mac app first?** Get [Notify 0.2.0 beta 3](https://github.com/vsvinav/notify/releases/tag/v0.2.0-beta.3) or follow the [Mac installation quickstart](https://github.com/vsvinav/notify#install-on-macos). If it is already installed, run `open ~/Applications/Notify.app`. The Mac download is not notarized; its included installation instructions explain Apple's manual approval. You do not run Node or build anything on your phone.
+**Need the Mac app first?** Choose the compatible build from [Mac releases](https://github.com/vsvinav/notify/releases) or follow the [Mac installation quickstart](https://github.com/vsvinav/notify#install-on-macos). If it is already installed, run `open ~/Applications/Notify.app`. The Mac download is not notarized; its included installation instructions explain Apple's manual approval. You do not run Node or build anything on your phone.
 
 **Updating an existing phone installation:** update Notify on your Mac, then close and reopen the phone web app while connected to that Mac. The same HTTPS address retains pairing. If Sessions says the workspace is unavailable, check that the Mac app was updated; refreshing the phone alone cannot add Mac-side support.
 
@@ -75,7 +77,7 @@ Pair inside the installed app, not just in Safari: they can have separate storag
 
 ### Install on Android
 
-**There is no APK or Play Store download.** Notify installs from Chrome as a Home Screen web app. Nothing needs to be built or run on your phone.
+**These are LAN web-app instructions, not native APK installation.** Notify installs from Chrome as a Home Screen web app. Nothing needs to be built or run on your phone. The separate internet Android client requires its operator's versioned APK and matching service configuration.
 
 1. **Start on the Mac.** Open Notify, then **Settings > Phone connections**. Turn on **Allow phone connections**, wait for the connection details, and click **Pair a phone**. Keep Notify running and the Mac awake.
 2. **Allow Chrome to reach your Mac, then open setup.** Connect to the same regular Wi-Fi as the Mac. If Android asks for Chrome's **Nearby devices** or **Local network** permission, allow it. If previously denied, open **Android Settings > Apps > Chrome > Permissions** and allow that permission. Then scan Notify's QR with your camera, or type the complete **setup address** into Chrome. It starts with **`http://`** and normally ends in **`:8080/`**. Use the address currently shown on your Mac, not an address from a screenshot.
