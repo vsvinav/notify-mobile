@@ -8,8 +8,24 @@ const id = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(v
 const text = (value, max = 65535) => typeof value === 'string' && value.length <= max;
 let account, setup, setupError, relationship, transport, workspace, view = 'inbox', channelState = 'disconnected';
 let banner, reconnect, inbox, settings, navigation, picker, list, lastRead = 0, snapshot, pollTimer, leaseTimer, polling = false;
-let generation = 0, selectedTicket, selectedSessionID, confirmation, signingIn = false;
+let generation = 0, selectedTicket, selectedSessionID, confirmation, confirmationCard, signingIn = false;
 const cards = new Map();
+function snapshotSignature(value) {
+  // Object member order can vary between otherwise identical native snapshots.
+  return JSON.stringify(value, (_key, value) => value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value);
+}
+function clearAnswers(card) {
+  for (const { options, custom } of card.forms.values()) {
+    for (const option of options) option.checked = false;
+    if (custom) custom.value = '';
+  }
+  if (card.feedback) card.feedback.value = '';
+}
+function closeConfirmation(card) {
+  if (card && card !== confirmationCard) return;
+  confirmation?.close(); confirmation?.remove(); confirmation = confirmationCard = undefined;
+}
 function el(tag, value, className) {
   const node = document.createElement(tag);
   if (value !== undefined) node.textContent = value;
@@ -58,7 +74,7 @@ function resetPrivateView() {
   generation++; clearTimeout(pollTimer); clearInterval(leaseTimer); polling = false;
   transport?.close(); transport = undefined;
   workspace?.clear(); workspace = undefined;
-  confirmation?.close(); confirmation?.remove(); confirmation = undefined;
+  closeConfirmation();
   cards.clear(); snapshot = undefined; lastRead = 0; selectedTicket = selectedSessionID = undefined; channelState = 'disconnected';
   banner = reconnect = inbox = settings = navigation = undefined;
   document.body.classList.remove('paired'); delete document.body.dataset.detail;
@@ -202,10 +218,11 @@ function statusChanged(status) {
     banner.textContent = 'Refreshing from your Mac…'; banner.hidden = false;
     void refresh();
   } else {
+    generation++; clearTimeout(pollTimer); polling = false;
     lastRead = 0;
     if (banner) { banner.hidden = false; banner.textContent = status.message; }
     if (reconnect) reconnect.hidden = status.state !== 'disconnected';
-    confirmation?.close(); confirmation?.remove(); confirmation = undefined;
+    closeConfirmation();
     updateControls();
   }
 }
@@ -268,11 +285,14 @@ async function refresh() {
     if (typeof state.connected !== 'boolean' || !Array.isArray(state.requests) || state.requests.length > 100 || !state.requests.every(validRequest)
       || new Set(state.requests.map(item => item.ticket)).size !== state.requests.length) throw new Error('The Mac returned an unsupported request snapshot. Review it on your Mac; no phone replies are enabled.');
     snapshot = state; lastRead = performance.now();
+    if (!state.connected) closeConfirmation();
     const present = new Set(state.requests.map(item => item.ticket));
-    for (const [ticket, card] of cards) if (!present.has(ticket)) { card.node.remove(); cards.delete(ticket); }
+    for (const [ticket, card] of cards) if (!present.has(ticket)) { closeConfirmation(card); card.node.remove(); cards.delete(ticket); }
     for (const item of state.requests) {
-      let card = cards.get(item.ticket); const signature = JSON.stringify(item);
-      if (card && card.signature !== signature && !card.submitted) { card.node.remove(); cards.delete(item.ticket); card = undefined; }
+      let card = cards.get(item.ticket); const signature = snapshotSignature(item);
+      if (card && card.signature !== signature && !card.submitted) {
+        closeConfirmation(card); card.node.remove(); cards.delete(item.ticket); card = undefined;
+      }
       if (!card) { card = makeCard(item); card.signature = signature; cards.set(item.ticket, card); list.append(card.node); }
     }
     renderSelection(); updateControls();
@@ -292,6 +312,7 @@ function updateControls() {
   workspace?.setConnected(connected);
   for (const card of cards.values()) {
     const disabled = !connected || card.submitted || card.item.sending;
+    if (channelState !== 'connected' || snapshot?.connected === false || card.submitted || card.item.sending) clearAnswers(card);
     for (const control of card.node.querySelectorAll('button,input,textarea')) control.disabled = !!disabled;
   }
   if (inbox && banner) {
@@ -377,14 +398,14 @@ function prepareReply(card, decision, label, permissionOptionID) {
   const item = card.item, payload = { sessionID: item.sessionID, requestID: item.request.id, ticket: item.ticket, decision, answers,
     ...(permissionOptionID ? { permissionOptionID } : {}),
     ...(decision === 'deny' && card.feedback?.value.trim() ? { feedback: card.feedback.value } : {}) };
-  confirmation?.remove(); confirmation = el('dialog', undefined, 'control-confirmation');
+  closeConfirmation(); confirmation = el('dialog', undefined, 'control-confirmation'); confirmationCard = card;
   confirmation.setAttribute('aria-label', 'Confirm this exact reply');
   confirmation.append(el('h2', `${label}?`), el('p', item.request.title, 'detail'),
     el('p', `Session: ${item.sessionID}\nRequest: ${item.request.id}\nTicket: ${item.ticket}`, 'field-value'));
   if (decision === 'answer') for (const q of item.request.questions) confirmation.append(el('p', `${q.text}\n${answers[q.id].join('\n') || 'No answer (optional)'}`, 'detail'));
   if (payload.feedback) confirmation.append(el('p', payload.feedback, 'detail'));
   const controls = el('div', undefined, 'actions');
-  const close = () => { confirmation?.close(); confirmation?.remove(); confirmation = undefined; };
+  const close = () => closeConfirmation();
   controls.append(button('Cancel', '', close), button('Confirm reply', decision === 'deny' ? 'deny' : 'primary', async () => {
     close();
     if (!live() || cards.get(item.ticket) !== card || card.submitted) { card.message.textContent = 'The request or connection changed. Review the latest request before replying.'; return; }
