@@ -33,7 +33,8 @@ const FIELDS = new Map([
   ['/v1/remote/mac/decision', [['id', 'allow']]],
   ['/v1/remote/mac/revoke', [['deviceID']]],
   ['/v1/remote/grant/begin', [['role', 'deviceID'], ['macID']]],
-  ['/v1/remote/grant/finish', [['id', 'signature']]]
+  ['/v1/remote/grant/finish', [['id', 'signature']]],
+  ['/v1/remote/grant/renew', [['id', 'signature']]]
 ]);
 const securityHeaders = {
   'Cache-Control': 'no-store',
@@ -160,9 +161,11 @@ export async function createHostedService({ origin, managedIngress, store,
     let rate = rates.get(peer);
     if (!rate) {
       if (rates.size >= 128) fail(503);
-      rates.set(peer, rate = { requests: 0, bootstrap: 0, expires: now + 60000 });
+      rates.set(peer, rate = { requests: 0, renewals: 0, bootstrap: 0, expires: now + 60000 });
     }
-    if (++rate.requests > 120) fail(429);
+    if (req.url === '/v1/remote/grant/renew') {
+      if (++rate.renewals > 120) fail(429);
+    } else if (++rate.requests > 120) fail(429);
     if (['/v1/remote/mac/begin', '/v1/remote/mac/register'].includes(req.url) && ++rate.bootstrap > 20) fail(429);
   }
   server.on('request', async (req, res) => {
@@ -235,6 +238,15 @@ export async function createHostedService({ origin, managedIngress, store,
             const { credential, ...publicResult } = result;
             result = publicResult;
           } else native(req);
+          break;
+        case '/v1/remote/grant/renew':
+          if (req.headers.origin === undefined) {
+            native(req);
+            result = await authority.renewGrant(req, data, bearer(req));
+          } else {
+            browser(req, origin);
+            result = await authority.renewGrant(req, data);
+          }
           break;
       }
       reply(res, 200, result);

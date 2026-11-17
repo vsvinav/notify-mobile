@@ -144,10 +144,12 @@ test('helper requires full-key local approval and native ACK (injected crypto fi
       macID, pending: decisions ? null : pending,
       devices: decisions ? [{ deviceID, publicKey: phoneKey, name: 'Phone' }] : []
     });
-    if (path.endsWith('/grant/begin')) return Response.json({ id: 'challenge', challenge: 'fixture challenge' });
+    if (path.endsWith('/grant/begin')) return Response.json({ id: 'g'.repeat(43), challenge: 'fixture challenge' });
     if (path.endsWith('/grant/finish')) return Response.json({
-      role: 'mac', macID, deviceID, expiresAt: Date.now() + 29000, credential: 'g'.repeat(43)
+      role: 'mac', macID, deviceID, approved: !!decisions, expiresAt: Date.now() + 29000, credential: 'g'.repeat(43),
+      renewal: { id: 'g'.repeat(43), challenge: 'fixture renewal' }
     });
+
     if (path.endsWith('/mac/decision')) {
       assert.equal(JSON.parse(options.body).allow, true); decisions++;
       return Response.json({ approved: true });
@@ -208,4 +210,191 @@ test('helper requires full-key local approval and native ACK (injected crypto fi
     await helper.close();
     await rm(directory, { recursive: true });
   }
+});
+
+const settle = async () => { for (let i = 0; i < 25; i++) await new Promise(resolve => setImmediate(resolve)); };
+async function renewalFixture(t, { pendingApproval = false, renew } = {}) {
+  const root = join(process.cwd(), '.test-data');
+  await mkdir(root, { recursive: true });
+  const directory = await mkdtemp(join(root, 'remote-renew-'));
+  const macID = randomUUID(), deviceID = randomUUID(), macKey = key(), phoneKey = key(), id = 'g'.repeat(43);
+  const origin = 'https://notify.example', events = [], frames = [], requests = [], renewals = [], signed = [];
+  const pending = { id: 'pending-phone', deviceID, publicKey: phoneKey, name: 'Phone',
+    account: { issuer: origin, subject: 'owner' }, expiresAt: Date.now() + 120000 };
+  await writeFile(join(directory, 'identity.json'), JSON.stringify({
+    version: 1, origin, macID, publicKey: macKey,
+    owner: pendingApproval ? null : pending.account,
+    devices: pendingApproval ? [] : [{ id: deviceID, name: 'Phone', publicKey: phoneKey }],
+    credential: 'c'.repeat(43), setupID: 'setup'
+  }), { mode: 0o600 });
+  let receiver, relaySignal, closeRelay, approved = !pendingApproval;
+  const grant = () => ({ role: 'mac', macID, deviceID, approved, expiresAt: Date.now() + 30000,
+    credential: 'r'.repeat(43), renewal: { id, challenge: `renew-${requests.length}` } });
+  const helper = await createRemoteCompanion({
+    directory, origin, emit: event => events.push(event),
+    cryptoProcess: () => ({
+      async call(op, args = {}) {
+        if (op === 'identity') return [...Buffer.from(macKey, 'base64url')];
+        if (op === 'sign') { signed.push(Buffer.from(args.bytes).toString()); return [1, 2]; }
+        if (op === 'create') return null;
+        if (op === 'add' || op === 'tree') return [1];
+        if (op === 'receive') return { bytes: args.bytes, sender: [] };
+        if (op === 'send') return args.bytes;
+        throw new Error(`Unexpected crypto operation ${op}`);
+      }, async close() {}
+    }),
+    fetchRequest: async (url, options) => {
+      const path = new URL(url).pathname;
+      requests.push({ path, options });
+      if (path.endsWith('/mac/status')) return Response.json({
+        macID, pending: approved ? null : pending,
+        devices: approved ? [{ deviceID, publicKey: phoneKey, name: 'Phone' }] : []
+      });
+      if (path.endsWith('/grant/begin')) return Response.json({ id, challenge: 'initial' });
+      if (path.endsWith('/grant/finish')) return Response.json(grant());
+      if (path.endsWith('/grant/renew')) {
+        assert.equal(options.headers.Authorization, `Bearer ${'c'.repeat(43)}`);
+        assert.deepEqual(JSON.parse(options.body), { id, signature: 'AQI' });
+        return renew ? await renew(grant(), options) : Response.json(grant());
+      }
+      if (path.endsWith('/mac/decision')) { approved = true; return Response.json({ approved }); }
+      throw new Error(`Unexpected request ${path}`);
+    },
+    connectRelay: async ({ receive, signal, expiresAt, onOpen }) => {
+      receiver = receive; relaySignal = signal;
+      let resolve;
+      const closed = new Promise(done => { resolve = done; });
+      let timer = setTimeout(() => resolve(new Error('expired')), expiresAt - Date.now());
+      closeRelay = () => { clearTimeout(timer); resolve(); };
+      signal.addEventListener('abort', closeRelay, { once: true });
+      const connection = { signal, closed, close: async () => closeRelay(),
+        send: async bytes => frames.push(JSON.parse(bytes.toString())),
+        renew(next) {
+          signal.throwIfAborted();
+          renewals.push(next); clearTimeout(timer);
+          timer = setTimeout(() => resolve(new Error('expired')), next - Date.now());
+        }
+      };
+      onOpen?.(connection);
+      return connection;
+    }
+  });
+  t.after(async () => { await helper.close(); await rm(directory, { recursive: true }); });
+  await settle();
+  assert.ok(receiver);
+  await receiver(Buffer.from(JSON.stringify({ type: 'key_package', bytes: [1] })));
+  await receiver(Buffer.from(JSON.stringify({ type: 'hello' })));
+  return { helper, events, frames, requests, renewals, signed, pending,
+    receive: value => receiver(Buffer.from(JSON.stringify(value))), signal: relaySignal, disconnect: () => closeRelay() };
+}
+
+test('companion renews pending approval without data exposure, then retains live mutation and native ACK', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
+  const f = await renewalFixture(t, { pendingApproval: true });
+  for (let i = 0; i < 4; i++) { t.mock.timers.tick(10000); await settle(); }
+  assert.equal(f.renewals.length, 4);
+  assert.equal(f.signal.aborted, false);
+  assert.equal(f.frames.some(frame => frame.type === 'ready'), false);
+  assert.equal(f.events.findLast(e => e.type === 'status').status.state, 'pairing');
+  const pairing = f.events.findLast(e => e.type === 'pairing');
+  await f.helper.command({ type: 'pair', id: pairing.id, allow: true, verificationData: pairing.verificationData });
+  const ready = f.frames.findLast(frame => frame.type === 'ready');
+  for (let i = 0; i < 2; i++) { t.mock.timers.tick(10000); await settle(); }
+  await f.helper.command({ type: 'snapshot', total: 1, requests: [permission()] });
+  const input = { id: randomUUID(), epoch: ready.epoch, payload: { path: 'reply', data: {
+    sessionID: 'session-1', requestID: 'request-1', ticket: 'ticket-1', decision: 'deny', answers: {}
+  } } };
+  await f.receive(input); await settle();
+  t.mock.timers.tick(10000); await settle();
+  t.mock.timers.tick(3000); await settle();
+  assert.equal(f.signal.aborted, false, 'The original approved handle deadline must have been renewed');
+  assert.equal(f.frames.some(frame => frame.id === input.id), false, 'Renewal is not native ACK');
+  await f.helper.command({ type: 'result', id: f.events.findLast(e => e.type === 'reply').id, ok: true });
+  await settle();
+  assert.equal(f.frames.find(frame => frame.id === input.id).status, 200);
+  await f.receive(input); await settle();
+  assert.equal(f.frames.filter(frame => frame.id === input.id).at(-1).status, 409);
+  assert.equal(f.events.filter(e => e.type === 'reply').length, 1);
+  assert.equal(f.frames.filter(frame => frame.type === 'ready').length, 1);
+  assert.equal(new Set(f.signed).size, f.signed.length, 'A consumed challenge must never be signed twice');
+  await f.helper.close();
+  const count = f.requests.length;
+  t.mock.timers.tick(60000); await settle();
+  assert.equal(f.requests.length, count);
+});
+
+test('companion rejects invalid renewal bindings, lifetimes and uncertain responses without retry', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
+  for (const change of [
+    { role: 'phone' }, { macID: 'other' }, { deviceID: 'other' }, { approved: false },
+    { renewal: { id: 'x'.repeat(43), challenge: 'next' } }, { renewal: { id: 'g'.repeat(43), challenge: '' } },
+    { expiresAt: 0 }, null
+  ]) {
+    const f = await renewalFixture(t, { renew: async grant => {
+      if (change === null) throw new Error('Response lost');
+      return Response.json({ ...grant, ...change });
+    } });
+    t.mock.timers.tick(10000); await settle();
+    assert.equal(f.signal.aborted, true);
+    assert.equal(f.renewals.length, 0);
+    assert.equal(f.requests.filter(r => r.path.endsWith('/renew')).length, 1);
+    await f.helper.close();
+  }
+});
+
+test('companion renewal keeps its 10-second cadence after a slow HTTPS roundtrip', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
+  let release, renewals = 0;
+  const f = await renewalFixture(t, { renew: async grant => {
+    if (++renewals === 1) await new Promise(resolve => { release = resolve; });
+    return Response.json(grant);
+  } });
+  t.mock.timers.tick(10000); await settle();
+  t.mock.timers.tick(5000); await settle();
+  assert.equal(renewals, 1);
+  release(); await settle();
+  t.mock.timers.tick(5000); await settle();
+  assert.equal(renewals, 2);
+  assert.equal(f.signal.aborted, false);
+});
+
+test('peer disconnect revokes the local handle before outstanding renewal HTTP drains', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
+  let release;
+  const f = await renewalFixture(t, { renew: async grant => {
+    await new Promise(resolve => { release = resolve; });
+    return Response.json(grant);
+  } });
+  const ready = f.frames.find(frame => frame.type === 'ready');
+  t.mock.timers.tick(10000); await settle();
+  try {
+    f.disconnect(); await settle();
+    assert.equal(f.signal.aborted, true);
+    await assert.rejects(f.receive({ id: randomUUID(), epoch: ready.epoch, payload: { path: 'state', data: {} } }),
+      /closed|unknown|expired/i);
+  } finally { release(); await settle(); }
+  assert.equal(f.renewals.length, 0);
+});
+
+test('companion close aborts and drains outstanding renewal HTTP without late lease updates', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
+  let signal, release;
+  const f = await renewalFixture(t, { renew: async (grant, options) => {
+    signal = options.signal;
+    await new Promise(resolve => { release = resolve; });
+    return Response.json(grant);
+  } });
+  t.mock.timers.tick(10000); await settle();
+  assert.ok(signal);
+  t.mock.timers.tick(5000); await settle();
+  let closed = false;
+  const closing = f.helper.close().then(() => { closed = true; });
+  await settle();
+  assert.equal(signal.aborted, true);
+  assert.equal(closed, false, 'close must drain renewal work');
+  release(); await closing;
+  assert.equal(f.renewals.length, 0);
+  const count = f.requests.length;
+  t.mock.timers.tick(60000); await settle();
+  assert.equal(f.requests.length, count);
 });

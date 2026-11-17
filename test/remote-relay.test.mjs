@@ -19,6 +19,45 @@ const protocol = 'notify-relay-v1';
 const owner = { issuer: 'https://accounts.notify.invalid', subject: 'account-a', macID: 'mac-a' };
 const identity = { ...owner, deviceID: 'phone-a', keyHash: 'a'.repeat(64) };
 
+test('a verified renewed lease retains the original sockets past their old deadline', async t => {
+  const controller = new AbortController();
+  let expiresAt;
+  const f = await fixture(t, async req => ({
+    ...owner, deviceID: 'phone-a',
+    role: req.headers.authorization === 'Bearer mac' ? 'mac' : 'phone',
+    get expiresAt() { return expiresAt; }, signal: controller.signal
+  }));
+  expiresAt = Date.now() + 1000;
+  const originalDeadline = expiresAt;
+  const { mac, phone } = await f.pair('Bearer mac', 'Bearer phone');
+  expiresAt = Date.now() + 5000;
+  await delay(Math.max(1, originalDeadline - Date.now() + 50));
+  assert.equal(mac.client.readyState, WebSocket.OPEN, 'Renewal must not tear down the Mac socket');
+  assert.equal(phone.client.readyState, WebSocket.OPEN, 'Renewal must not tear down the phone socket');
+  const received = once(phone.client, 'message');
+  mac.client.send(Buffer.from('same-channel-after-renewal'));
+  assert.equal((await received)[0].toString(), 'same-channel-after-renewal');
+  const closed = once(phone.client, 'close');
+  controller.abort();
+  assert.equal((await closed)[0], 1008, 'Revocation must still close a renewed channel');
+});
+
+test('renewed relay expiry cannot move backward or exceed the short lease bound', async t => {
+  for (const invalid of [previous => previous - 1, () => Date.now() + 60000, () => NaN]) {
+    let expiresAt = Date.now() + 10000;
+    const f = await fixture(t, async req => ({
+      ...owner, deviceID: 'phone-a',
+      role: req.headers.authorization === 'Bearer mac' ? 'mac' : 'phone',
+      get expiresAt() { return expiresAt; }, signal: new AbortController().signal
+    }));
+    const { mac, phone } = await f.pair('Bearer mac', 'Bearer phone');
+    const closed = once(phone.client, 'close');
+    expiresAt = invalid(expiresAt);
+    mac.client.send(Buffer.from('check-current-lease'));
+    assert.equal((await closed)[0], 1008);
+  }
+});
+
 async function fixture(t, authorizer, managedIngress) {
   const directory = join(process.cwd(), '.test-data', randomUUID());
   await privateDirectory(directory);

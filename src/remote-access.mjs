@@ -138,6 +138,18 @@ export class RemoteAccess {
     return channel.peer;
   }
 
+  // Only a freshly verified, bound service proof may extend this live handle.
+  renew(handle, leaseMs) {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs <= 0 || leaseMs > 30000)
+      fail(400, 'Remote authorization lifetime must be between 1 and 30000 milliseconds.');
+    this.authorize(handle);
+    const channel = this.#channels.get(handle);
+    channel.expires = this.#clock + leaseMs;
+    clearTimeout(channel.timer);
+    channel.timer = setTimeout(() => this.disconnect(handle), leaseMs);
+    channel.timer.unref();
+  }
+
   disconnect(handle) {
     const channel = this.#channels.get(handle);
     if (!channel) return;

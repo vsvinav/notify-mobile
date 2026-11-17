@@ -58,6 +58,42 @@ test('authorization expires at the exact deadline and clock rollback fails close
   assert.throws(() => access.enable(), { status: 503 });
 });
 
+test('renewal retains the live handle, pending mutation and replay history beyond the original lease', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { access, setClock } = await fixture(); t.after(() => access.disable());
+  const handle = access.connect(peer, 30000), epoch = access.epoch, input = command(access);
+  let release, sends = 0;
+  const pending = access.dispatch(handle, input, () => {
+    sends++;
+    return new Promise(resolve => { release = resolve; });
+  });
+  setClock(21000); t.mock.timers.tick(20000);
+  access.renew(handle, 30000);
+  setClock(32000); t.mock.timers.tick(11000);
+  assert.equal(handle.signal.aborted, false);
+  assert.equal(access.epoch, epoch);
+  assert.deepEqual(access.authorize(handle), peer);
+  await assert.rejects(access.dispatch(handle, input, () => sends++), { status: 409 });
+  release({ acknowledged: true });
+  assert.deepEqual(await pending, { acknowledged: true });
+  assert.equal(sends, 1);
+  setClock(51000); t.mock.timers.tick(19000);
+  assert.equal(handle.signal.aborted, true);
+});
+
+test('renewal rejects invalid lifetimes, copied, expired and revoked handles', async t => {
+  const { access, setClock } = await fixture(); t.after(() => access.disable());
+  const handle = access.connect(peer, 30000);
+  for (const duration of [0, -1, 30001, NaN, Infinity, 1.5])
+    assert.throws(() => access.renew(handle, duration), { status: 400 });
+  assert.throws(() => access.renew({ ...handle }, 30000), { status: 403 });
+  setClock(31000);
+  assert.throws(() => access.renew(handle, 30000), { status: 403 });
+  const next = access.connect(peer, 30000);
+  await access.revokeDevice(peer.deviceID);
+  assert.throws(() => access.renew(next, 30000), { status: 403 });
+});
+
 test('revocation closes channels before persistence completes and cannot be undone by reconnect', async t => {
   const store = memoryStore();
   const { access } = await fixture(store); t.after(() => access.disable());

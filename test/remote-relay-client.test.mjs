@@ -179,6 +179,36 @@ test('client expires independently of the relay and never reconnects automatical
   phone.terminate();
 });
 
+test('trusted renewal preserves the socket and cancels the previous expiry timer', { timeout: 10000 }, async t => {
+  const f = await fixture(t, ws => ws.send('{"type":"ready","version":1}'));
+  const client = await f.mac({ expiresAt: Date.now() + 300 });
+  for (const expiresAt of [Date.now() - 1, Date.now() + 90000, NaN, Infinity])
+    assert.throws(() => client.renew(expiresAt), /lifetime/i);
+  client.renew(Date.now() + 1000);
+  await delay(350);
+  assert.equal(client.signal.aborted, false);
+  await client.send(Buffer.from('same live socket'));
+  assert.equal(f.requests.length, 1);
+  f.controller.abort();
+  await client.closed;
+  assert.throws(() => client.renew(Date.now() + 1000), /closed|revoked/i);
+});
+
+test('socket-open hook can renew before the relay peer is ready but never after expiry', { timeout: 10000 }, async t => {
+  let sender, opened;
+  const f = await fixture(t, ws => { sender = ws; });
+  const connecting = f.mac({ expiresAt: Date.now() + 300, onOpen: client => {
+    opened = client; client.renew(Date.now() + 650);
+  } });
+  const failure = assert.rejects(connecting, /expired/i);
+  await delay(350);
+  assert.ok(opened);
+  assert.equal(opened.signal.aborted, false);
+  await failure;
+  assert.throws(() => opened.renew(Date.now() + 1000), /closed|expired/i);
+  assert.ok(sender);
+});
+
 test('callback errors close the connection without exposing private error details', { timeout: 10000 }, async t => {
   const f = await fixture(t), phone = await f.phone();
   const client = await f.mac({ receive: () => { throw new Error('private decrypted request'); } });

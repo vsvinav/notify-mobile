@@ -29,8 +29,11 @@ export function parseSetup(hash) {
   publicKey(params.get('key'));
   return { setupID: params.get('setup'), macID: params.get('mac'), macPublicKey: params.get('key') };
 }
-export async function postJSON(path, data, timeout = 15000) {
+export async function postJSON(path, data, timeout = 15000, signal) {
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), timeout);
+  const aborted = () => controller.abort();
+  signal?.addEventListener('abort', aborted, { once: true });
+  if (signal?.aborted) aborted();
   try {
     const response = await fetch(path, { method: 'POST', credentials: 'same-origin', cache: 'no-store',
       redirect: 'error', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -50,13 +53,14 @@ export async function postJSON(path, data, timeout = 15000) {
     } finally { reader.releaseLock(); }
     const body = new Uint8Array(length); let offset = 0;
     for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.length; }
+    controller.signal.throwIfAborted();
     const result = JSON.parse(decoder.decode(body));
     if (!object(result)) throw new Error('Invalid server response.');
     return result;
   } catch (error) {
     if (error.name === 'AbortError') throw new Error('Request timed out. Check your connection and try again.');
     throw error;
-  } finally { clearTimeout(timer); }
+  } finally { clearTimeout(timer); signal?.removeEventListener('abort', aborted); }
 }
 export function credentialJSON(credential, mode) {
   if (!credential || credential.type !== 'public-key') throw new Error('Passkey authentication did not complete.');
@@ -107,18 +111,21 @@ export async function loadCrypto() {
   return cryptoModule;
 }
 
-/** Each connect restores identity only, obtains a one-use cookie, and creates a new MLS group. */
+/** Connect creates a fresh MLS group; signed short-lease renewal preserves it without replaying RPCs. */
 export function createRemoteTransport({ origin = location.origin, macID, deviceID, pinnedMacKey, autoReconnect = false,
   restorePeer, post = postJSON, WebSocketImpl = WebSocket, onStatus = () => {} }) {
   let generation = 0, peer, socket, stage = 'closed', epoch, handshakeTimer, reconnectTimer, attempts = 0;
+  let lease, deadline, expiryTimer, renewalTimer, controller, renewing = false;
   const pending = new Map();
   const uncertainty = () => Object.assign(new Error('Connection lost; delivery is uncertain. Check the Mac before sending again. Nothing was retried.'), { network: true, uncertain: true });
   function close(message = 'Disconnected. No actions are queued.') {
-    generation++; clearTimeout(handshakeTimer); clearTimeout(reconnectTimer); stage = 'closed'; epoch = undefined;
+    generation++; clearTimeout(handshakeTimer); clearTimeout(reconnectTimer);
+    clearTimeout(expiryTimer); clearTimeout(renewalTimer); controller?.abort();
+    stage = 'closed'; epoch = undefined; lease = undefined; renewing = false;
     for (const call of pending.values()) call.reject(uncertainty());
     pending.clear();
     const old = socket; socket = undefined;
-    if (old) { old.onclose = old.onerror = old.onmessage = null; old.close(); }
+    if (old) { old.onopen = old.onclose = old.onerror = old.onmessage = null; old.close(); }
     peer?.free(); peer = undefined;
     onStatus({ state: 'disconnected', message });
   }
@@ -129,13 +136,57 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
     onStatus({ state: 'disconnected', message: `${message} Reconnecting safely in ${delay / 1000}s; no actions will be retried.` });
     reconnectTimer = setTimeout(() => { void connect().catch(() => {}); }, delay);
   }
+  function validLease(result, id, previousChallenge) {
+    const now = Date.now(), renewal = result?.renewal;
+    if (!object(result) || result.role !== 'phone' || result.macID !== macID || result.deviceID !== deviceID ||
+      typeof result.approved !== 'boolean' || (previousChallenge !== undefined && lease.approved && !result.approved) ||
+      !Number.isSafeInteger(result.expiresAt) ||
+      result.expiresAt <= now || result.expiresAt > now + 30000 ||
+      !object(renewal) || renewal.id !== id || !/^[A-Za-z0-9_-]{43}$/.test(id) ||
+      typeof renewal.challenge !== 'string' || !renewal.challenge.length ||
+      encoder.encode(renewal.challenge).length > 4096 || renewal.challenge === previousChallenge)
+      throw new Error('Channel authorization does not match this phone.');
+  }
+  function liveLease() {
+    return lease && Date.now() < lease.expiresAt && performance.now() < deadline;
+  }
+  function applyLease(result) {
+    lease = result;
+    const remaining = lease.expiresAt - Date.now();
+    deadline = performance.now() + remaining;
+    clearTimeout(expiryTimer);
+    expiryTimer = setTimeout(() => disconnected('Channel authorization expired. No actions were retried.'), remaining);
+  }
+  function scheduleRenewal(current, signal) {
+    renewalTimer = setTimeout(async () => {
+      if (current !== generation || signal.aborted) return;
+      scheduleRenewal(current, signal);
+      if (renewing) return;
+      renewing = true;
+      try {
+        if (!liveLease() || socket?.readyState !== 1) throw uncertainty();
+        const { id, challenge } = lease.renewal;
+        const signature = base64url(peer.sign_authorization(encoder.encode(challenge)));
+        const result = await post('/v1/remote/grant/renew', { id, signature }, 10000, signal);
+        if (current !== generation || signal.aborted) return;
+        if (!liveLease()) throw uncertainty();
+        validLease(result, id, challenge);
+        applyLease(result);
+      } catch {
+        // An uncertain response may already have consumed the nonce. Never retry it.
+        if (current === generation && !signal.aborted)
+          disconnected('Channel authorization lost. Delivery may be uncertain; no actions were retried.');
+      } finally { if (current === generation) renewing = false; }
+    }, 10000);
+  }
   function send(bytes) {
-    if (!socket || socket.readyState !== 1 || bytes.byteLength > MAX_FRAME || socket.bufferedAmount > MAX_FRAME) throw uncertainty();
+    if (!liveLease() || !socket || socket.readyState !== 1 || bytes.byteLength > MAX_FRAME || socket.bufferedAmount > MAX_FRAME) throw uncertainty();
     socket.send(bytes);
   }
   function encrypted(value) { send(peer.send(encoder.encode(JSON.stringify(value)))); }
   function receive(event) {
     try {
+      if (!liveLease()) throw uncertainty();
       if (stage === 'greeting') {
         if (event.data !== '{"type":"ready","version":1}') throw new Error('Invalid relay greeting.');
         send(encoder.encode(JSON.stringify({ type: 'key_package', bytes: [...peer.key_package()] })));
@@ -178,23 +229,31 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
   }
   async function connect() {
     close(); const current = generation;
+    controller = new AbortController();
+    const signal = controller.signal;
     onStatus({ state: 'connecting', message: 'Connecting to your Mac…' });
     try {
       const restored = await restorePeer();
       if (current !== generation) { restored.free(); return; }
       peer = restored;
-      const grant = await post('/v1/remote/grant/begin', { role: 'phone', macID, deviceID });
+      const grant = await post('/v1/remote/grant/begin', { role: 'phone', macID, deviceID }, 15000, signal);
       if (current !== generation) return;
-      if (!identifier(grant.id) || typeof grant.challenge !== 'string' || !grant.challenge.length || grant.challenge.length > 8192) throw new Error('Invalid channel authorization challenge.');
-      const result = await post('/v1/remote/grant/finish', { id: grant.id, signature: base64url(peer.sign_authorization(encoder.encode(grant.challenge))) });
+      if (!/^[A-Za-z0-9_-]{43}$/.test(grant.id) || typeof grant.challenge !== 'string' || !grant.challenge.length ||
+        encoder.encode(grant.challenge).length > 4096) throw new Error('Invalid channel authorization challenge.');
+      const result = await post('/v1/remote/grant/finish', { id: grant.id, signature: base64url(peer.sign_authorization(encoder.encode(grant.challenge))) }, 15000, signal);
       if (current !== generation) return;
-      if (result.role !== 'phone' || result.macID !== macID || result.deviceID !== deviceID || typeof result.approved !== 'boolean') throw new Error('Channel authorization does not match this phone.');
+      validLease(result, grant.id);
+      applyLease(result);
       const url = new URL('/v1/relay', origin);
       if (url.protocol === 'https:') url.protocol = 'wss:';
       else if (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) url.protocol = 'ws:';
       else throw new Error('A secure connection is required.');
       socket = new WebSocketImpl(url.href, 'notify-relay-v1'); socket.binaryType = 'arraybuffer';
       stage = 'greeting'; socket.onmessage = receive;
+      socket.onopen = () => {
+        if (current !== generation || signal.aborted) return;
+        scheduleRenewal(current, signal);
+      };
       socket.onerror = socket.onclose = () => disconnected('Mac connection lost. Check its network. No replies were retried.');
       handshakeTimer = setTimeout(() => disconnected('Pairing or connection timed out. Check your Mac.'), 120000);
     } catch (error) {
@@ -205,7 +264,7 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
       }
     }
   }
-  function api(path, data = {}, timeout = 12000, signal) {
+  function api(path, data = {}, timeout, signal) {
     return new Promise((resolve, reject) => {
       if (stage !== 'ready') { reject(new Error('An approved, connected Mac is required.')); return; }
       if (!['state', 'workspace', 'reply', 'control'].includes(path) || !object(data)) { reject(new Error('Unsupported Mac request.')); return; }
@@ -217,7 +276,9 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
       const abort = () => pending.get(id)?.reject(Object.assign(uncertainty(), { aborted: true }));
       pending.set(id, { resolve: finish(resolve), reject: finish(reject) });
       signal?.addEventListener('abort', abort, { once: true });
-      timer = setTimeout(abort, Math.min(15000, Math.max(1, timeout)));
+      const mutation = path === 'reply' || path === 'control';
+      const wait = timeout === undefined ? (mutation ? 25000 : 12000) : timeout;
+      timer = setTimeout(abort, Number.isFinite(wait) ? Math.min(mutation ? 30000 : 15000, Math.max(1, wait)) : (mutation ? 25000 : 12000));
       try { encrypted({ id, epoch, payload: { path, data } }); }
       catch { close(); }
     });

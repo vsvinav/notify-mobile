@@ -43,6 +43,9 @@ the outer listener forwards the original HTTP request and WebSocket socket,
 not synthetic headers. It owns connection, header, timeout, body, rate and
 concurrency limits. Rate limits use the actual socket peer; proxy peers can
 share limits. Forwarded client IPs never grant a separate allowance.
+Authorization renewal has its own bounded 120-request/minute allowance per
+socket peer, separate from the ordinary 120-request/minute allowance; the
+stricter bootstrap and concurrency limits still apply.
 
 `GET /healthz` returns only `{"status":"ok"}` with no authority or secrets.
 `GET`/`HEAD /` serves `public/remote.html`. Static routing is an exact allowlist:
@@ -69,6 +72,7 @@ at most 16 KiB, no content encoding, and no unexpected fields.
 | `/v1/remote/mac/revoke` | `deviceID`; native Bearer credential |
 | `/v1/remote/grant/begin` | `role`, `deviceID`, optional `macID`; Mac credential only from Bearer, phone from account cookie |
 | `/v1/remote/grant/finish` | `id`, `signature`; phone must still authorize as the account that began the grant |
+| `/v1/remote/grant/renew` | `id`, `signature`; connected, unexpired grant, current same-account phone cookie or original native Mac Bearer credential |
 
 Clients sign authority-issued challenges using the documented P-256 domain
 separator and UTF-8 JSON challenge, with canonical base64url DER signatures. Phone grant completion
@@ -78,6 +82,22 @@ short-lived credential in JSON. No credential belongs in a URL.
 `/v1/relay` upgrades use the existing `notify-relay-v1` protocol: native Bearer
 without Origin, or phone relay cookie with exact browser Origin. Browser fetch
 metadata, when present, must agree with same-origin API/WebSocket access.
+
+Grant completion also returns `renewal: { id, challenge }`. While connected,
+each endpoint signs that challenge and renews every 10 seconds in one HTTPS
+roundtrip. Success rotates the one-use challenge and extends authorization by
+at most 30 seconds without replacing the socket, MLS group, epoch or pending
+actions. It returns no new bearer credential or relay cookie. Initial relay
+credentials remain single-use; pending enrollment retains its original deadline.
+Expired, closed or revoked connections cannot renew. Failed or uncertain renewal
+does not replay a challenge or user action; logout and revocation still close the
+connection. This protocol does not depend on a particular hosting plan.
+
+The phone waits up to 25 seconds for mutation acknowledgments, allowing the
+native runtime's 20-second action window to finish; reads retain a 12-second
+timeout. A missing acknowledgment means delivery may be uncertain, not that the
+action was rejected or is safe to resend. Browser suspension, network loss and
+free-host restarts can still interrupt a connection.
 
 Responses are no-store, deny framing, suppress referrers, and use a self-only
 CSP with `wasm-unsafe-eval` solely for WebAssembly compilation and an explicit

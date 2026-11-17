@@ -6,6 +6,8 @@ import { createRemoteTransport, base64url, parseSetup, credentialJSON, postJSON 
 const key = Uint8Array.from({ length: 65 }, (_, i) => i ? 1 : 4);
 const encode = value => new TextEncoder().encode(JSON.stringify(value));
 const epoch = '11111111-1111-4111-8111-111111111111';
+const grantID = 'g'.repeat(43);
+const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 function harness(options = {}) {
   const sockets = [], calls = [], peers = [], statuses = [];
   class Socket {
@@ -25,15 +27,18 @@ function harness(options = {}) {
         free() { this.freed = true; } };
       peers.push(peer); return peer;
     },
-    post: async (path, data) => {
+    post: async (path, data, timeout, signal) => {
       calls.push({ path, data });
-      return path.endsWith('begin') ? { id: 'grant', challenge: 'challenge', expiresAt: Date.now() + 30000 }
-        : { role: 'phone', macID: 'mac', deviceID: 'phone', approved: true, expiresAt: Date.now() + 30000 };
+      if (options.post) return options.post(path, data, timeout, signal);
+      return path.endsWith('begin') ? { id: grantID, challenge: 'challenge', expiresAt: Date.now() + 30000 }
+        : { role: 'phone', macID: 'mac', deviceID: 'phone', approved: true, expiresAt: Date.now() + 30000,
+          renewal: { id: grantID, challenge: `renew-${calls.length}` } };
     }
   });
   async function connect() {
     await transport.connect();
     const socket = sockets.at(-1);
+    socket.onopen?.();
     socket.message('{"type":"ready","version":1}');
     socket.message(encode({ type: 'welcome', welcome: [1], tree: [2] }).buffer);
     socket.message(encode({ type: 'ready', epoch }).buffer);
@@ -47,6 +52,161 @@ test('full QR key is mandatory and login never invents a user handle', () => {
   assert.throws(() => parseSetup('#setup=setup&mac=mac&key=123456'));
   assert.throws(() => credentialJSON({ id: 'x', rawId: new Uint8Array([1]), type: 'public-key',
     response: { clientDataJSON: new Uint8Array([1]), authenticatorData: new Uint8Array([2]), signature: new Uint8Array([3]), userHandle: null } }, 'login'), /user handle/i);
+});
+
+test('renewal keeps the peer and pending mutation alive beyond the old lease and 12s ACK timeout', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  const h = harness(); t.after(() => h.transport.close());
+  const socket = await h.connect(), statusCount = h.statuses.length;
+  for (let i = 0; i < 2; i++) { t.mock.timers.tick(10000); await flush(); }
+  let settled = false;
+  const result = h.transport.api('control', { action: 'stop' }).finally(() => { settled = true; });
+  void result.catch(() => {});
+  const request = JSON.parse(new TextDecoder().decode(socket.sent.at(-1)));
+  t.mock.timers.tick(10000); await flush();
+  t.mock.timers.tick(3000); await flush();
+  t.mock.timers.tick(9000); await flush();
+  assert.equal(settled, false);
+  assert.equal(socket.readyState, 1);
+  assert.equal(h.peers.length, 1);
+  assert.equal(h.statuses.length, statusCount);
+  assert.equal(h.calls.filter(call => call.path.endsWith('/renew')).length, 4);
+  socket.message(encode({ id: request.id, status: 200, data: { acknowledged: true } }).buffer);
+  assert.deepEqual(await result, { acknowledged: true });
+  const callCount = h.calls.length;
+  h.transport.close(); t.mock.timers.tick(60000); await flush();
+  assert.equal(h.calls.length, callCount);
+});
+
+test('pending approval renews without exposing RPC and retains the bounded handshake deadline', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  const h = harness(); t.after(() => h.transport.close());
+  await h.transport.connect();
+  const socket = h.sockets[0]; socket.onopen?.();
+  socket.message('{"type":"ready","version":1}');
+  socket.message(encode({ type: 'welcome', welcome: [1], tree: [2] }).buffer);
+  for (let i = 0; i < 4; i++) { t.mock.timers.tick(10000); await flush(); }
+  assert.equal(socket.readyState, 1);
+  assert.equal(h.calls.filter(call => call.path.endsWith('/renew')).length, 4);
+  await assert.rejects(h.transport.api('state'), /approved/);
+  assert.equal(h.statuses.at(-1).state, 'pending');
+  t.mock.timers.tick(80000); await flush();
+  assert.equal(socket.readyState, 3);
+});
+
+test('renewal rejects changed binding and uncertain responses without retrying a consumed challenge', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  for (const change of [
+    { role: 'mac' }, { macID: 'other' }, { deviceID: 'other' }, { approved: 'yes' }, { approved: false },
+    { renewal: { id: 'x'.repeat(43), challenge: 'next' } },
+    { renewal: { id: grantID, challenge: 'renew' } },
+    { renewal: { id: grantID, challenge: 'x'.repeat(4097) } },
+    { renewal: { id: grantID, challenge: 'é'.repeat(2049) } },
+    { expiresAt: Date.now() + 1000000 }, { expiresAt: 0 }, null
+  ]) {
+    const h = harness({ post: async path => {
+      if (path.endsWith('begin')) return { id: grantID, challenge: 'challenge' };
+      if (path.endsWith('renew') && change === null) throw new Error('Response lost');
+      return { role: 'phone', macID: 'mac', deviceID: 'phone', approved: true, expiresAt: Date.now() + 30000,
+        renewal: { id: grantID, challenge: path.endsWith('renew') ? 'next' : 'renew' },
+        ...(path.endsWith('renew') ? change : {}) };
+    } });
+    const socket = await h.connect();
+    const pending = assert.rejects(h.transport.api('reply'), /uncertain/);
+    t.mock.timers.tick(10000); await flush();
+    assert.equal(socket.readyState, 3);
+    await pending;
+    t.mock.timers.tick(60000); await flush();
+    assert.equal(h.calls.filter(call => call.path.endsWith('renew')).length, 1);
+    h.transport.close();
+  }
+});
+
+test('close aborts renewal HTTP and discards its late response without overlapping or resurrecting a socket', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  let release, signal;
+  const h = harness({ post: async (path, _data, _timeout, requestSignal) => {
+    if (path.endsWith('begin')) return { id: grantID, challenge: 'challenge' };
+    if (path.endsWith('renew')) {
+      signal = requestSignal;
+      return new Promise(resolve => { release = resolve; });
+    }
+    return { role: 'phone', macID: 'mac', deviceID: 'phone', approved: true, expiresAt: Date.now() + 30000,
+      renewal: { id: grantID, challenge: 'renew' } };
+  } }); t.after(() => h.transport.close());
+  await h.connect();
+  t.mock.timers.tick(10000); await flush();
+  t.mock.timers.tick(10000); await flush();
+  assert.equal(h.calls.filter(call => call.path.endsWith('renew')).length, 1);
+  assert.equal(signal.aborted, false);
+  h.transport.close();
+  assert.equal(signal.aborted, true);
+  release({ role: 'phone', macID: 'mac', deviceID: 'phone', approved: true, expiresAt: Date.now() + 30000,
+    renewal: { id: grantID, challenge: 'next' } });
+  await flush(); t.mock.timers.tick(60000); await flush();
+  assert.equal(h.sockets.length, 1);
+  assert.equal(h.calls.filter(call => call.path.endsWith('renew')).length, 1);
+});
+
+test('read timeout stays short while a missing mutation ACK remains bounded at 25 seconds', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  const h = harness(); t.after(() => h.transport.close());
+  await h.connect();
+  let readDone = false, mutationDone = false;
+  const read = assert.rejects(h.transport.api('state'), /uncertain/).then(() => { readDone = true; });
+  const mutation = assert.rejects(h.transport.api('reply'), /uncertain/).then(() => { mutationDone = true; });
+  t.mock.timers.tick(10000); await flush();
+  t.mock.timers.tick(2000); await flush();
+  assert.equal(readDone, true);
+  assert.equal(mutationDone, false);
+  t.mock.timers.tick(10000); await flush();
+  assert.equal(mutationDone, false);
+  t.mock.timers.tick(3000); await flush();
+  assert.equal(mutationDone, true);
+  await Promise.all([read, mutation]);
+});
+
+test('an unresolved renewal cannot revive the phone after the original expiry deadline', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  let release, signal;
+  const h = harness({ post: async (path, _data, _timeout, requestSignal) => {
+    if (path.endsWith('begin')) return { id: grantID, challenge: 'challenge' };
+    if (path.endsWith('renew')) {
+      signal = requestSignal;
+      return new Promise(resolve => { release = resolve; });
+    }
+    return { role: 'phone', macID: 'mac', deviceID: 'phone', approved: true, expiresAt: Date.now() + 30000,
+      renewal: { id: grantID, challenge: 'renew' } };
+  } }); t.after(() => h.transport.close());
+  const socket = await h.connect();
+  t.mock.timers.tick(10000); await flush();
+  t.mock.timers.tick(20000); await flush();
+  assert.equal(signal.aborted, true);
+  assert.equal(socket.readyState, 3);
+  release({ role: 'phone', macID: 'mac', deviceID: 'phone', approved: true, expiresAt: Date.now() + 30000,
+    renewal: { id: grantID, challenge: 'next' } });
+  await flush(); t.mock.timers.tick(60000); await flush();
+  assert.equal(h.calls.filter(call => call.path.endsWith('/renew')).length, 1);
+  assert.equal(h.peers[0].freed, true);
+});
+
+test('slow renewal responses do not drift the 10-second cadence or overlap requests', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  let release, renewals = 0;
+  const lease = () => ({ role: 'phone', macID: 'mac', deviceID: 'phone', approved: true,
+    expiresAt: Date.now() + 30000, renewal: { id: grantID, challenge: `renew-${renewals}` } });
+  const h = harness({ post: async path => {
+    if (path.endsWith('begin')) return { id: grantID, challenge: 'challenge' };
+    if (path.endsWith('renew') && ++renewals === 1) return new Promise(resolve => { release = () => resolve(lease()); });
+    return lease();
+  } }); t.after(() => h.transport.close());
+  await h.connect();
+  t.mock.timers.tick(10000); await flush();
+  t.mock.timers.tick(5000); await flush();
+  assert.equal(renewals, 1);
+  release(); await flush();
+  t.mock.timers.tick(5000); await flush();
+  assert.equal(renewals, 2);
 });
 
 test('account fetches use same-origin cookies and stop reading oversized responses', async t => {
@@ -151,8 +311,9 @@ test('actual WASM MLS establishes pinned channel and encrypts browser RPC (synth
   }
   const transport = createRemoteTransport({origin:'https://notify.example',macID:'mac',deviceID:'phone',pinnedMacKey:macKey,
     WebSocketImpl:Socket,restorePeer:async()=>Peer.restore_identity('phone',secret,phoneKey),
-    post:async path=>path.endsWith('begin') ? {id:'test-grant',challenge:'synthetic challenge',expiresAt:Date.now()+30000}
-      : {role:'phone',macID:'mac',deviceID:'phone',approved:true,expiresAt:Date.now()+30000} });
+    post:async path=>path.endsWith('begin') ? {id:grantID,challenge:'synthetic challenge',expiresAt:Date.now()+30000}
+      : {role:'phone',macID:'mac',deviceID:'phone',approved:true,expiresAt:Date.now()+30000,
+        renewal:{id:grantID,challenge:'renew'}} });
   try {
     await transport.connect(); socket.message('{"type":"ready","version":1}');
     const packageMessage = JSON.parse(new TextDecoder().decode(socket.sent[0]));

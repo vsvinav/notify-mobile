@@ -50,6 +50,7 @@ export function createRemoteRelay({ server, publicOrigin, webOrigin, authorize, 
       if (!connection) continue;
       clearTimeout(connection.timer);
       connection.signal.removeEventListener('abort', connection.revoked);
+      connection.controller.abort();
       if (connection.ws.readyState === WebSocket.CLOSED) continue;
       connection.ws.close(code, reason);
       const timer = setTimeout(() => connection.ws.terminate(), 1000);
@@ -60,12 +61,39 @@ export function createRemoteRelay({ server, publicOrigin, webOrigin, authorize, 
 
   function live(room, connection) {
     if (rooms.get(room.key) !== room) return false;
-    if (!connection || connection.ws.readyState !== WebSocket.OPEN || connection.signal.aborted ||
-      performance.now() >= connection.deadline) {
+    if (!connection || connection.ws.readyState !== WebSocket.OPEN || connection.signal.aborted) {
+      drop(room, 1008, 'Peer unavailable or authorization expired.');
+      return false;
+    }
+    let expiresAt;
+    try { expiresAt = connection.grant.expiresAt; }
+    catch {
+      reportError(new Error('Relay authorization refresh failed.'));
+      drop(room, 1011, 'Relay authorization unavailable.');
+      return false;
+    }
+    if (expiresAt !== connection.expiresAt) {
+      const remaining = expiresAt - Date.now();
+      if (!Number.isSafeInteger(expiresAt) || expiresAt < connection.expiresAt ||
+        !(remaining > 0 && remaining <= 30000)) {
+        drop(room, 1008, 'Invalid renewed authorization.');
+        return false;
+      }
+      connection.expiresAt = expiresAt;
+      connection.deadline = performance.now() + remaining;
+    }
+    if (performance.now() >= connection.deadline) {
       drop(room, 1008, 'Peer unavailable or authorization expired.');
       return false;
     }
     return true;
+  }
+
+  function expire(room, connection) {
+    if (!live(room, connection)) return;
+    connection.timer = setTimeout(() => expire(room, connection),
+      Math.max(1, connection.deadline - performance.now()));
+    connection.timer.unref();
   }
 
   function consume(room, connection, size) {
@@ -125,11 +153,11 @@ export function createRemoteRelay({ server, publicOrigin, webOrigin, authorize, 
     try {
       const grant = await authorize(req, { signal: controller.signal });
       if (controller.signal.aborted || socket.destroyed || closed) return;
-      const remaining = grant?.expiresAt - Date.now();
+      const expiresAt = grant?.expiresAt, remaining = expiresAt - Date.now();
       if (!grant || Object.keys(grant).length !== GRANT_FIELDS.length ||
         !GRANT_FIELDS.every(field => Object.hasOwn(grant, field)) ||
         !['issuer', 'subject', 'macID', 'deviceID'].every(field => identity(grant[field])) ||
-        !['mac', 'phone'].includes(grant.role) || !Number.isSafeInteger(grant.expiresAt) ||
+        !['mac', 'phone'].includes(grant.role) || !Number.isSafeInteger(expiresAt) ||
         !(remaining > 0 && remaining <= 30000) || !(grant.signal instanceof AbortSignal) || grant.signal.aborted)
         return deny(401);
       const role = grant.role;
@@ -147,17 +175,18 @@ export function createRemoteRelay({ server, publicOrigin, webOrigin, authorize, 
         upgraded = true;
         room ??= { key, owner };
         rooms.set(key, room);
-        const connection = { ws, signal: grant.signal, deadline, window: performance.now(), messages: 0, bytes: 0 };
+        const connection = { ws, grant, controller, signal: grant.signal, expiresAt, deadline,
+          window: performance.now(), messages: 0, bytes: 0 };
         room[role] = connection;
         connection.revoked = () => drop(room, 1008, 'Relay authorization revoked.');
         connection.signal.addEventListener('abort', connection.revoked, { once: true });
-        connection.timer = setTimeout(() => drop(room, 1008, 'Relay authorization expired.'), remaining);
+        connection.timer = setTimeout(() => expire(room, connection), remaining);
         connection.timer.unref();
         ws.on('error', () => {
           reportError(new Error('Relay WebSocket failed.'));
           drop(room, 1011, 'Relay WebSocket failed.');
         });
-        ws.on('close', () => drop(room, 1001, 'Peer disconnected.'));
+        ws.on('close', () => { controller.abort(); drop(room, 1001, 'Peer disconnected.'); });
         ws.on('ping', data => { if (consume(room, connection, data.length)) ws.pong(data); });
         ws.on('pong', data => { consume(room, connection, data.length); });
         ws.on('message', (data, binary) => {
@@ -178,6 +207,7 @@ export function createRemoteRelay({ server, publicOrigin, webOrigin, authorize, 
     } finally {
       clearTimeout(timer);
       socket.off('close', disconnected);
+      if (!upgraded) controller.abort();
       if (upgraded || socket.destroyed) {
         socket.off('error', socketFailed);
         socket.off('close', socketClosed);

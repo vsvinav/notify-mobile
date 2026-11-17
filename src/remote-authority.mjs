@@ -54,7 +54,7 @@ const accountCopy = account => account && ({ issuer: account.issuer, subject: ac
 // and end-to-end key verification remain mandatory, including for pending grants.
 // Sign PREFIX + UTF8(challenge) with P-256/SHA-256; keys are x963 and signatures
 // ASN.1 DER, both canonical base64url. expiresAt is Unix milliseconds. Never put
-// credentials in URLs or logs. Only requestPair and beginGrant are asynchronous.
+// credentials in URLs or logs. Account-bound operations may be asynchronous.
 // finishGrant(input, req) requires the real account request for phone challenges;
 // accounts.authorize must be synchronous, and both begin/finish sessions stay live.
 export function createRemoteAuthority({ origin, accounts, now = () => performance.now(), wallNow = Date.now }) {
@@ -187,8 +187,11 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     if (!device || !current(mac, device)) fail(401, 'Device enrollment required.');
     return device;
   }
+  function challenge(purpose, fields) {
+    return JSON.stringify({ purpose, origin, ...fields, challenge: secret() });
+  }
   function flow(purpose, fields, publicKey, ttl) {
-    return { id: secret(), challenge: JSON.stringify({ purpose, origin, ...fields, challenge: secret() }),
+    return { id: secret(), challenge: challenge(purpose, fields),
       key: publicKey, deadline: mono + ttl, expiresAt: Math.floor(wall + ttl) };
   }
   function publicFlow(record) {
@@ -344,13 +347,63 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     const ttl = Math.min(GRANT_TTL, record.device.approved ? GRANT_TTL : record.device.deadline - mono);
     const grant = { ...record, finishProof, unwatch: [], credential: secret(), deadline: mono + ttl,
       expiresAt: Math.floor(wall + ttl), controller: new AbortController(), connected: false };
+    grant.renewalChallenge = nextRenewal(grant);
     grants.set(grant.credential, grant);
-    watch(grant, grant.proof.signal, () => dropGrant(grant));
-    if (finishProof && finishProof.signal !== grant.proof.signal)
-      watch(grant, finishProof.signal, () => dropGrant(grant));
+    watchGrant(grant);
     schedule();
-    return { credential: grant.credential, expiresAt: grant.expiresAt, role: grant.role,
-      macID: grant.mac.macID, deviceID: grant.device.deviceID, approved: grant.device.approved };
+    return { credential: grant.credential, ...publicLease(grant) };
+  }
+  function nextRenewal(grant) {
+    return challenge('renew', { role: grant.role, macID: grant.mac.macID,
+      deviceID: grant.device.deviceID, connectionID: grant.id });
+  }
+  function publicLease(grant) {
+    return { expiresAt: grant.expiresAt, role: grant.role,
+      macID: grant.mac.macID, deviceID: grant.device.deviceID, approved: grant.device.approved,
+      renewal: { id: grant.id, challenge: grant.renewalChallenge } };
+  }
+  function watchGrant(grant) {
+    watch(grant, grant.proof.signal, () => dropGrant(grant));
+    if (grant.finishProof && grant.finishProof.signal !== grant.proof.signal)
+      watch(grant, grant.finishProof.signal, () => dropGrant(grant));
+    if (grant.relaySignal) watch(grant, grant.relaySignal, () => dropGrant(grant));
+  }
+  async function renewGrant(req, input, credential) {
+    return accountOperation(async () => {
+      shape(input, ['id', 'signature']);
+      decode(input.id, 32);
+      const grant = [...grants.values()].find(value => value.id === input.id);
+      if (!grant?.connected || !valid(grant)) fail(401, 'Connected routing authorization required.');
+      let accountProof;
+      if (grant.role === 'phone') {
+        if (req?.headers?.origin !== origin || credential !== undefined)
+          fail(403, 'Authorization origin rejected.');
+        accountProof = await proof(req, false);
+      } else {
+        if (req?.headers?.origin !== undefined || host(credential) !== grant.mac)
+          fail(403, 'Mac authorization rejected.');
+        accountProof = checkedProof(grant.device.proof);
+      }
+      if (grants.get(grant.credential) !== grant || !valid(grant))
+        fail(401, 'Routing authorization expired.');
+      if (!sameAccount(accountProof, grant.proof))
+        fail(403, 'Account does not own this connection.');
+      signed({ key: grant.key, challenge: grant.renewalChallenge }, input.signature);
+      check();
+      if (grants.get(grant.credential) !== grant || !valid(grant))
+        fail(401, 'Routing authorization expired.');
+      const ttl = Math.min(GRANT_TTL, grant.device.approved ? GRANT_TTL : grant.device.deadline - mono);
+      unwatch(grant);
+      if (grant.role === 'phone') grant.device.proof = accountProof;
+      grant.proof = accountProof;
+      grant.finishProof = undefined;
+      grant.deadline = mono + ttl;
+      grant.expiresAt = Math.floor(wall + ttl);
+      grant.renewalChallenge = nextRenewal(grant);
+      watchGrant(grant);
+      schedule();
+      return publicLease(grant);
+    });
   }
   function authorizeRelay(req, { signal } = {}) {
     check();
@@ -395,10 +448,11 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     // One connection per lease bounds cancellation listeners and prevents reuse.
     if (grant.connected) fail(409, 'Relay credential already in use.');
     grant.connected = true;
+    grant.relaySignal = signal;
     if (signal) watch(grant, signal, () => dropGrant(grant));
     return Object.freeze({ issuer: grant.proof.issuer, subject: grant.proof.subject,
       macID: grant.mac.macID, deviceID: grant.device.deviceID, role: grant.role,
-      expiresAt: grant.expiresAt, signal: grant.controller.signal });
+      get expiresAt() { return grant.expiresAt; }, signal: grant.controller.signal });
   }
   function revokeDevice(credential, input) {
     check();
@@ -410,5 +464,5 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
   }
   time();
   return Object.freeze({ beginMac, registerMac, requestPair, macStatus, decidePair,
-    beginGrant, finishGrant, authorizeRelay, revokeDevice, close });
+    beginGrant, finishGrant, renewGrant, authorizeRelay, revokeDevice, close });
 }

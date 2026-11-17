@@ -111,6 +111,85 @@ test('fractional monotonic deadlines produce whole-millisecond pairing and relay
   assert.equal(f.relay(grant).expiresAt, grant.expiresAt);
 });
 
+const renewalInput = (grant, key) => ({
+  id: grant.renewal.id, signature: key.sign(grant.renewal.challenge)
+});
+
+test('connected leases renew without changing authority or allowing nonce replay', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const originalPhone = await f.grant(host, phone), originalMac = await f.grant(host, phone, 'mac');
+  let phoneGrant = originalPhone, macGrant = originalMac;
+  const phoneLive = f.relay(phoneGrant), macLive = f.relay(macGrant);
+  for (let index = 0; index < 5; index++) {
+    f.advance(10000);
+    const input = renewalInput(phoneGrant, phone.key);
+    const next = await f.authority.renewGrant(phone.session.req, input);
+    assert.equal(next.renewal.id, phoneGrant.renewal.id);
+    assert.notEqual(next.renewal.challenge, phoneGrant.renewal.challenge);
+    assert.equal(next.credential, undefined, 'Renewal must not mint a reusable relay credential');
+    assert.equal(next.expiresAt, 1800000000000 + (index + 1) * 10000 + 30000);
+    await assert.rejects(f.authority.renewGrant(phone.session.req, input), status(401));
+    phoneGrant = next;
+    macGrant = await f.authority.renewGrant({ headers: {} }, renewalInput(macGrant, host.key), host.credential);
+    assert.equal(phoneLive.expiresAt, phoneGrant.expiresAt);
+    assert.equal(macLive.expiresAt, macGrant.expiresAt);
+    assert.equal(phoneLive.signal.aborted, false);
+    assert.equal(macLive.signal.aborted, false);
+  }
+  assert.throws(() => f.relay(originalPhone), status(409));
+  assert.throws(() => f.relay(originalMac), status(409));
+  phone.session.controller.abort();
+  assert.equal(phoneLive.signal.aborted, true);
+  assert.equal(macLive.signal.aborted, true);
+});
+
+test('renewal rejects unconnected, wrong-account, wrong-key and expired leases', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host), other = f.mac();
+  const phoneGrant = await f.grant(host, phone), macGrant = await f.grant(host, phone, 'mac');
+  const input = renewalInput(phoneGrant, phone.key);
+  await assert.rejects(f.authority.renewGrant(phone.session.req, input), status(401));
+  const live = f.relay(phoneGrant);
+  f.relay(macGrant);
+  await assert.rejects(f.authority.renewGrant(f.account('other').req, input), status(403));
+  await assert.rejects(f.authority.renewGrant({ headers: {} }, input), status(403));
+  await assert.rejects(f.authority.renewGrant(phone.session.req, renewalInput(phoneGrant, host.key)), status(401));
+  await assert.rejects(f.authority.renewGrant({ headers: {} }, renewalInput(macGrant, host.key), other.credential), status(403));
+  assert.equal(live.expiresAt, phoneGrant.expiresAt);
+  const attempts = await Promise.allSettled([
+    f.authority.renewGrant(phone.session.req, input),
+    f.authority.renewGrant(phone.session.req, input)
+  ]);
+  assert.equal(attempts.filter(value => value.status === 'fulfilled').length, 1);
+  assert.equal(attempts.filter(value => value.status === 'rejected' && value.reason.status === 401).length, 1);
+  f.advance(30000);
+  await assert.rejects(f.authority.renewGrant(phone.session.req, input), status(401));
+  assert.equal(live.signal.aborted, true);
+});
+
+test('pending renewal cannot extend local pairing consent or survive connection revocation', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  let grant = await f.grant(host, phone);
+  const live = f.relay(grant);
+  for (let index = 0; index < 8; index++) {
+    f.advance(20000);
+    grant = await f.authority.renewGrant(phone.session.req, renewalInput(grant, phone.key));
+    assert.equal(grant.approved, false);
+    assert.ok(grant.expiresAt <= phone.expiresAt);
+    assert.deepEqual(f.authority.macStatus(host.credential).devices, []);
+  }
+  f.advance(20000);
+  await assert.rejects(f.authority.renewGrant(phone.session.req, renewalInput(grant, phone.key)), status(401));
+  assert.equal(live.signal.aborted, true);
+  const secondHost = f.mac(), second = await f.pair(secondHost);
+  const secondGrant = await f.grant(secondHost, second), controller = new AbortController();
+  const secondLive = f.relay(secondGrant, { signal: controller.signal });
+  const renewed = await f.authority.renewGrant(second.session.req, renewalInput(secondGrant, second.key));
+  controller.abort();
+  assert.equal(secondLive.signal.aborted, true);
+  await assert.rejects(f.authority.renewGrant(second.session.req, renewalInput(renewed, second.key)), status(401));
+});
+
 test('bootstrap rejects wrong keys, unsigned domain, replay and noncanonical keys', t => {
   const { authority } = fixture(t), key = identity(), other = identity(), macID = randomUUID();
   assert.throws(() => authority.beginMac({ macID, publicKey: key.publicKey + '=' }), status(400));

@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import https from 'node:https';
+import { performance } from 'node:perf_hooks';
 import { privateDirectory, readPrivate, writePrivate } from './storage.mjs';
 import { RemoteAccess } from './remote-access.mjs';
 import { connectRemoteRelay } from './remote-relay-client.mjs';
@@ -100,20 +101,22 @@ export async function createRemoteCompanion({ directory, origin, emit,
     emit, devices: () => [...channels.values()].filter(c => c.handle && !c.signal.aborted)
       .map(c => ({ id: c.device.id, name: c.device.name, expires: c.expiresAt }))
   });
-  async function api(path, body = {}, credential) {
+  async function api(path, body = {}, credential, signal) {
+    const requestSignal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(10000), ...(signal ? [signal] : [])]);
+    requestSignal.throwIfAborted();
     const response = await fetchRequest(`${origin}/v1/remote/${path}`, {
       method: 'POST', redirect: 'error', headers: {
         'Content-Type': 'application/json', ...(credential ? { Authorization: `Bearer ${credential}` } : {})
-      }, body: JSON.stringify(body), signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(10000)])
+      }, body: JSON.stringify(body), signal: requestSignal
     });
-    lifetime.signal.throwIfAborted();
+    requestSignal.throwIfAborted();
     const chunks = []; let size = 0;
     for await (const chunk of response.body) {
       size += chunk.length;
       if (size > 65536) fail(502, 'Internet service response is too large.');
       chunks.push(chunk);
     }
-    lifetime.signal.throwIfAborted();
+    requestSignal.throwIfAborted();
     let value;
     try { value = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
     catch { fail(502, 'Invalid internet service response.'); }
@@ -164,8 +167,20 @@ export async function createRemoteCompanion({ directory, origin, emit,
     auth.enable();
   }
   async function sign(challenge) {
-    if (!text(challenge, 4096)) fail(502, 'Invalid internet authorization challenge.');
+    if (typeof challenge !== 'string' || !challenge.length || Buffer.byteLength(challenge) > 4096)
+      fail(502, 'Invalid internet authorization challenge.');
     return bytes(await signer.call('sign', { bytes: [...Buffer.from(challenge)] })).toString('base64url');
+  }
+  function validateGrant(grant, channel, id, previous) {
+    const now = Date.now(), renewal = grant?.renewal;
+    if (!object(grant) || grant.role !== 'mac' || grant.macID !== state.macID || grant.deviceID !== channel.device.id ||
+      typeof grant.approved !== 'boolean' || (previous?.approved && !grant.approved) ||
+      !Number.isSafeInteger(grant.expiresAt) || grant.expiresAt <= now || grant.expiresAt > now + 30000 ||
+      !object(renewal) || renewal.id !== id || typeof id !== 'string' || !/^[\w-]{43}$/.test(id) ||
+      typeof renewal.challenge !== 'string' || !renewal.challenge.length || Buffer.byteLength(renewal.challenge) > 4096 ||
+      renewal.challenge === previous?.renewal.challenge ||
+      (!grant.approved && channel.enrollmentExpiresAt && grant.expiresAt > channel.enrollmentExpiresAt))
+      fail(502, 'Invalid Mac relay grant.');
   }
   async function register() {
     const begin = await api('mac/begin', { macID: state.macID, publicKey: state.publicKey });
@@ -191,16 +206,60 @@ export async function createRemoteCompanion({ directory, origin, emit,
   async function startChannel(device, candidateID) {
     if (closed || paused || fault || channels.has(device.id)) return;
     const controller = new AbortController();
-    const channel = { device, candidateID, controller, signal: controller.signal, stage: 'package', possession: false, inflight: new Set() };
+    const channel = { device, candidateID, controller, signal: controller.signal, stage: 'package', possession: false, inflight: new Set(),
+      enrollmentExpiresAt: candidateID && candidateID === pending?.id ? pending.expiresAt : undefined };
     channels.set(device.id, channel);
-    let crypto, relay;
+    let crypto, relay, grant, renewalTimer, renewalWork, renewalStarted = false;
+    const current = () => !closed && !paused && !fault && !channel.signal.aborted && channels.get(device.id) === channel;
+    const unexpired = () => Date.now() < channel.expiresAt && performance.now() < channel.deadline;
+    function scheduleRenewal() {
+      if (!current()) return;
+      renewalTimer = setTimeout(() => {
+        if (!current()) return;
+        scheduleRenewal();
+        if (renewalWork) return;
+        renewalWork = renew().finally(() => { renewalWork = undefined; });
+      }, 10000);
+      renewalTimer.unref();
+    }
+    async function renew() {
+      if (!current()) return;
+      try {
+        if (!unexpired()) fail(403, 'Mac relay authorization expired.');
+        const { id, challenge } = grant.renewal;
+        const signature = await sign(challenge);
+        if (!current()) return;
+        const next = await api('grant/renew', { id, signature }, state.credential, channel.signal);
+        if (!current()) return;
+        if (!unexpired()) fail(403, 'Mac relay authorization expired.');
+        validateGrant(next, channel, id, grant);
+        const remaining = next.expiresAt - Date.now();
+        if (channel.handle) auth.renew(channel.handle, remaining);
+        relay.renew(next.expiresAt);
+        channel.expiresAt = next.expiresAt;
+        channel.deadline = performance.now() + remaining;
+        grant = next;
+      } catch {
+        // The service may have consumed the nonce even when its reply was lost.
+        controller.abort();
+      }
+    }
+    function opened(connection) {
+      if (renewalStarted) return;
+      renewalStarted = true; relay = connection;
+      connection.signal?.addEventListener('abort', () => controller.abort(), { once: true });
+      if (connection.signal?.aborted) controller.abort();
+      scheduleRenewal();
+    }
+    channel.signal.addEventListener('abort', () => clearTimeout(renewalTimer), { once: true });
     try {
-      const challenge = await api('grant/begin', { role: 'mac', deviceID: device.id }, state.credential);
-      const grant = await api('grant/finish', { id: challenge.id, signature: await sign(challenge.challenge) });
-      if (grant.role !== 'mac' || grant.macID !== state.macID || grant.deviceID !== device.id ||
-        !Number.isSafeInteger(grant.expiresAt) || grant.expiresAt <= Date.now() || grant.expiresAt > Date.now() + 30000)
-        fail(502, 'Invalid Mac relay grant.');
+      const challenge = await api('grant/begin', { role: 'mac', deviceID: device.id }, state.credential, channel.signal);
+      if (typeof challenge.id !== 'string' || !/^[\w-]{43}$/.test(challenge.id))
+        fail(502, 'Invalid Mac authorization challenge.');
+      grant = await api('grant/finish', { id: challenge.id, signature: await sign(challenge.challenge) }, undefined, channel.signal);
+      validateGrant(grant, channel, challenge.id);
       channel.expiresAt = grant.expiresAt;
+      channel.deadline = performance.now() + grant.expiresAt - Date.now();
       crypto = openCrypto();
       channel.send = async data => {
         if (channel.signal.aborted) fail(403, 'Encrypted channel closed.');
@@ -208,7 +267,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
         await relay.send(frame);
       };
       const relayReady = connectRelay({ url: `${origin.replace('https:', 'wss:')}/v1/relay`,
-        credential: grant.credential, expiresAt: grant.expiresAt, signal: channel.signal,
+        credential: grant.credential, expiresAt: grant.expiresAt, signal: channel.signal, onOpen: opened,
         receive: async data => {
           relay = await relayReady;
           if (channel.stage === 'package') {
@@ -269,13 +328,16 @@ export async function createRemoteCompanion({ directory, origin, emit,
         }
       });
       relay = await relayReady;
+      opened(relay);
       await relay.closed;
     } catch (error) {
       if (!closed && !paused && !fault) message = text(error.message, 500) ? error.message : 'Waiting for phone authorization.';
     } finally {
       controller.abort();
+      clearTimeout(renewalTimer);
       if (channel.handle) auth?.disconnect(channel.handle);
       actions.disconnect(device.id);
+      await renewalWork;
       await relay?.close();
       await crypto?.close();
       if (channels.get(device.id) === channel) channels.delete(device.id);

@@ -243,6 +243,15 @@ test('bootstrap requests are bounded per actual socket peer, not forwarded IP', 
   assert.equal(statuses.at(-1), 429);
 });
 
+test('renewal has a bounded allowance separate from ordinary account and bootstrap traffic', async t => {
+  const app = await fixture(t);
+  for (let index = 0; index < 120; index++) {
+    assert.equal((await app.request('/v1/remote/grant/renew', { body: {} })).status, 400);
+  }
+  assert.equal((await app.request('/v1/remote/grant/renew', { body: {} })).status, 429);
+  assert.equal((await app.request('/v1/account/session', { body: {}, headers: { origin } })).status, 401);
+});
+
 test('phone finalization binds actual account cookies and WebSocket upgrades preserve requests', async t => {
   const app = await fixture(t);
   const cookie = await registerAccount(app), otherCookie = await registerAccount(app);
@@ -294,6 +303,27 @@ test('phone finalization binds actual account cookies and WebSocket upgrades pre
   const received = once(nativeSocket, 'message');
   browserSocket.send(Buffer.from('opaque authenticated ciphertext'));
   assert.equal((await received)[0].toString(), 'opaque authenticated ciphertext');
+  const renewBody = phone.finish(finished.json().renewal);
+  for (const [headers, expected] of [[{ origin }, 401], [{ origin, cookie: otherCookie }, 403],
+    [{ origin: 'https://evil.invalid', cookie }, 403], [{ origin, cookie, authorization }, 403]]) {
+    const rejected = await app.request('/v1/remote/grant/renew', { body: renewBody, headers });
+    assert.equal(rejected.status, expected);
+  }
+  const renewed = await app.request('/v1/remote/grant/renew', { body: renewBody, headers: { origin, cookie } });
+  assert.equal(renewed.status, 200);
+  assert.equal(renewed.json().credential, undefined);
+  assert.equal(renewed.headers['set-cookie'], undefined);
+  assert.notEqual(renewed.json().renewal.challenge, finished.json().renewal.challenge);
+  assert.equal((await app.request('/v1/remote/grant/renew', {
+    body: renewBody, headers: { origin, cookie }
+  })).status, 401);
+  const nativeRenewBody = mac.finish(macFinished.json().renewal);
+  assert.equal((await app.request('/v1/remote/grant/renew', { body: nativeRenewBody })).status, 401);
+  assert.equal((await app.request('/v1/remote/grant/renew', {
+    body: nativeRenewBody, headers: { authorization }
+  })).status, 200);
+  assert.equal(nativeSocket.readyState, WebSocket.OPEN);
+  assert.equal(browserSocket.readyState, WebSocket.OPEN);
   const nativeClosed = once(nativeSocket, 'close'), browserClosed = once(browserSocket, 'close');
   await app.close();
   await Promise.all([nativeClosed, browserClosed]);
