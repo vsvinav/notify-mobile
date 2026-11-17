@@ -135,7 +135,36 @@ test('expired Mac registration is visible and cannot keep advertising a stale pa
   assert.equal(status.state, 'error', 'An expired Mac registration must not look like an ongoing connection');
   assert.equal(status.setupURL, undefined, 'Do not offer a QR code the service has already rejected');
   assert.match(status.message, /Mac.*pair/i);
+  assert.match(status.message, /pairing registration expired/i);
 });
+
+for (const path of ['mac/begin', 'mac/invite']) {
+  test(`pairing conflict at ${path} explains recovery without replacing saved trust`, async t => {
+    const directory = join(process.cwd(), '.test-data', randomUUID());
+    await mkdir(directory, { recursive: true });
+    const origin = 'https://notify.example', events = [];
+    const saved = { version: 1, origin, macID: randomUUID(), publicKey: key(), owner: null, devices: [],
+      credential: path === 'mac/begin' ? null : 'c'.repeat(43), setupID: null };
+    const file = join(directory, 'identity.json');
+    await writeFile(file, JSON.stringify(saved), { mode: 0o600 });
+    const helper = await createRemoteCompanion({ directory, origin, emit: event => events.push(event),
+      cryptoProcess: () => ({
+        async call() { return [...Buffer.from(saved.publicKey, 'base64url')]; }, async close() {}
+      }),
+      fetchRequest: async url => new URL(url).pathname.endsWith(path)
+        ? Response.json({ error: 'Conflict' }, { status: 409 })
+        : Response.json({ macID: saved.macID, pending: null, devices: [] })
+    });
+    t.after(async () => { await helper.close(); await rm(directory, { recursive: true }); });
+    await until(() => events.filter(event => event.type === 'status').length >= 2);
+    if (path === 'mac/invite') {
+      await assert.rejects(helper.command({ type: 'invite' }), /Finish or reject.*pending phone/i);
+    } else {
+      assert.match(events.findLast(event => event.type === 'status').status.message, /Start fresh internet setup/);
+    }
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), saved);
+  });
+}
 
 test('explicit invitation refreshes a restarted service locator without replacing saved Mac trust', async t => {
   const directory = join(process.cwd(), '.test-data', randomUUID());
@@ -246,6 +275,8 @@ for (const subject of ['original-owner', 'different-owner']) {
       const status = events.findLast(event => event.type === 'status').status;
       assert.equal(status.state, 'error');
       assert.match(status.message, /locally approved owner/i);
+      assert.match(status.message, /original Notify passkey/);
+      assert.match(status.message, /Start fresh internet setup/);
       assert.equal(events.some(event => event.type === 'pairing'), false);
     } else {
       await until(() => receiver);
