@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRemoteCompanion } from '../src/remote-companion.mjs';
-import { createECDH, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { createECDH, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { permission } from './fixtures.mjs';
 import https from 'node:https';
@@ -10,6 +10,7 @@ import { once } from 'node:events';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { certificates } from '../src/certificates.mjs';
+import { createRemoteAuthority } from '../src/remote-authority.mjs';
 
 const key = () => { const ecdh = createECDH('prime256v1'); ecdh.generateKeys(); return ecdh.getPublicKey().toString('base64url'); };
 async function until(predicate) {
@@ -110,6 +111,126 @@ test('closing the helper cancels an outstanding service poll', async () => {
     await rm(directory, { recursive: true });
   }
 });
+
+test('expired Mac registration is visible and cannot keep advertising a stale pairing QR', async t => {
+  const root = join(process.cwd(), '.test-data');
+  await mkdir(root, { recursive: true });
+  const directory = await mkdtemp(join(root, 'remote-recovery-'));
+  const publicKey = key(), origin = 'https://notify.example', events = [];
+  const saved = { version: 1, origin, macID: randomUUID(), publicKey,
+    owner: { issuer: origin, subject: 'original-owner' }, devices: [],
+    credential: 'c'.repeat(43), setupID: 'expired-setup' };
+  await writeFile(join(directory, 'identity.json'), JSON.stringify(saved), { mode: 0o600 });
+  const helper = await createRemoteCompanion({
+    directory, origin, emit: event => events.push(event),
+    cryptoProcess: () => ({
+      async call() { return [...Buffer.from(publicKey, 'base64url')]; },
+      async close() {}
+    }),
+    fetchRequest: async () => Response.json({ error: 'Mac authorization required.' }, { status: 401 })
+  });
+  t.after(async () => { await helper.close(); await rm(directory, { recursive: true }); });
+  await until(() => events.filter(event => event.type === 'status').length >= 2);
+  const status = events.findLast(event => event.type === 'status').status;
+  assert.equal(status.state, 'error', 'An expired Mac registration must not look like an ongoing connection');
+  assert.equal(status.setupURL, undefined, 'Do not offer a QR code the service has already rejected');
+  assert.match(status.message, /Mac.*pair/i);
+});
+
+for (const subject of ['original-owner', 'different-owner']) {
+  test(`restart recovery with real authority and ${subject} preserves the local trust boundary`, async t => {
+    const root = join(process.cwd(), '.test-data');
+    await mkdir(root, { recursive: true });
+    const directory = await mkdtemp(join(root, 'remote-restart-'));
+    const origin = 'https://notify.example', macID = randomUUID(), deviceID = randomUUID(), events = [];
+    const { publicKey: publicObject, privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = publicObject.export({ format: 'jwk' });
+    const publicKey = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]).toString('base64url');
+    const owner = { issuer: origin, subject: 'original-owner' };
+    const saved = { version: 1, origin, macID, publicKey, owner, devices: [],
+      credential: 'c'.repeat(43), setupID: 'expired-setup' };
+    await writeFile(join(directory, 'identity.json'), JSON.stringify(saved), { mode: 0o600 });
+    const authority = createRemoteAuthority({ origin, accounts: { authorize: async () =>
+      ({ issuer: origin, subject, signal: new AbortController().signal }) } });
+    let receiver, closeRelay, polls = 0;
+    const helper = await createRemoteCompanion({
+      directory, origin, emit: event => events.push(event),
+      cryptoProcess: () => ({
+        async call(op, args = {}) {
+          if (op === 'identity') return [...Buffer.from(publicKey, 'base64url')];
+          if (op === 'sign') return [...sign('sha256', Buffer.concat([
+            Buffer.from('Notify remote authorization v1\0'), Buffer.from(args.bytes)
+          ]), privateKey)];
+          // MLS is a fixture here; registration and grant signatures use the real authority.
+          if (op === 'create') return null;
+          if (op === 'add' || op === 'tree') return [1];
+          if (op === 'receive') return { bytes: args.bytes, sender: [] };
+          if (op === 'send') return args.bytes;
+          throw new Error(`Unexpected crypto operation ${op}`);
+        }, async close() {}
+      }),
+      fetchRequest: async (url, options) => {
+        const path = new URL(url).pathname, input = JSON.parse(options.body);
+        const credential = options.headers.Authorization?.slice(7);
+        try {
+          let result;
+          if (path.endsWith('/mac/status')) { polls++; result = authority.macStatus(credential); }
+          else if (path.endsWith('/mac/begin')) result = authority.beginMac(input);
+          else if (path.endsWith('/mac/register')) result = authority.registerMac(input);
+          else if (path.endsWith('/grant/begin')) result = await authority.beginGrant({}, { ...input, credential });
+          else if (path.endsWith('/grant/finish')) result = authority.finishGrant(input);
+          else if (path.endsWith('/mac/decision')) result = authority.decidePair(credential, input);
+          else throw new Error(`Unexpected route ${path}`);
+          return Response.json(result);
+        } catch (error) {
+          if (!error.status) throw error;
+          return Response.json({ error: error.message }, { status: error.status });
+        }
+      },
+      connectRelay: async ({ receive, signal }) => {
+        receiver = receive;
+        const closed = new Promise(resolve => { closeRelay = resolve; });
+        signal.addEventListener('abort', () => closeRelay(), { once: true });
+        return { closed, close() { closeRelay(); }, async send() {} };
+      }
+    });
+    t.after(async () => { await helper.close(); authority.close(); await rm(directory, { recursive: true }); });
+    await until(() => events.filter(event => event.type === 'status').length >= 2);
+    for (let attempt = 0; attempt < 3; attempt++) await helper.command({ type: 'heartbeat' });
+    await settle();
+    assert.equal(polls, 1, 'Do not repeatedly poll with a credential the service rejected');
+    await helper.command({ type: 'invite' });
+    const registered = JSON.parse(await readFile(join(directory, 'identity.json'), 'utf8'));
+    assert.equal(registered.macID, macID);
+    assert.equal(registered.publicKey, publicKey);
+    assert.deepEqual(registered.owner, owner);
+    assert.notEqual(registered.credential, saved.credential);
+    assert.ok(events.findLast(event => event.type === 'status').status.setupURL);
+    const phoneKey = key();
+    const pairing = await authority.requestPair({ headers: { origin } }, {
+      setupID: registered.setupID, deviceID, publicKey: phoneKey, name: 'Fixture phone'
+    });
+    await helper.command({ type: 'heartbeat' });
+    await settle();
+    if (subject !== owner.subject) {
+      assert.equal(receiver, undefined);
+      const status = events.findLast(event => event.type === 'status').status;
+      assert.equal(status.state, 'error');
+      assert.match(status.message, /locally approved owner/i);
+      assert.equal(events.some(event => event.type === 'pairing'), false);
+    } else {
+      await until(() => receiver);
+      await receiver(Buffer.from(JSON.stringify({ type: 'key_package', bytes: [1] })));
+      await receiver(Buffer.from(JSON.stringify({ type: 'hello' })));
+      const approval = events.findLast(event => event.type === 'pairing');
+      assert.equal(approval.id, pairing.id);
+      assert.deepEqual(authority.macStatus(registered.credential).devices, []);
+      await helper.command({ type: 'pair', id: approval.id, allow: true, verificationData: approval.verificationData });
+      assert.equal(events.findLast(event => event.type === 'status').status.state, 'connected');
+    }
+    assert.deepEqual(JSON.parse(await readFile(join(directory, 'identity.json'), 'utf8')).owner, owner);
+  });
+}
 
 test('helper requires full-key local approval and native ACK (injected crypto fixture)', async () => {
   const root = join(process.cwd(), '.test-data');

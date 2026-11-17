@@ -59,7 +59,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
   const file = join(directory, 'identity.json');
   let state, writer = Promise.resolve(), auth, signer;
   let closed = false, paused = false, polling, pending, approving, setupID, serverDevices = [];
-  let message = 'Waiting for phone sign-in.', fault;
+  let message = 'Waiting for phone sign-in.', fault, enrollmentError;
   const channels = new Map();
   const channelWork = new Set(), lifetime = new AbortController();
   const openCrypto = () => cryptoProcess(executable, ['load-identity', state.macID, JSON.stringify([...Buffer.from(state.publicKey, 'base64url')])]);
@@ -130,7 +130,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
       online: !!channels.get(device.id)?.handle && !channels.get(device.id).signal.aborted, pushEnabled: false }));
     const active = devices.some(d => d.online);
     emit({ type: 'status', status: {
-      state: fault ? 'error' : paused ? 'paused' : active ? 'connected' : pending ? 'pairing' : 'connecting',
+      state: fault || enrollmentError ? 'error' : paused ? 'paused' : active ? 'connected' : pending ? 'pairing' : 'connecting',
       url: origin, devices, pendingPairingIDs: pending ? [pending.id] : [],
       ...(setupID ? { setupURL: `${origin}/#setup=${encodeURIComponent(setupID)}&mac=${state.macID}&key=${state.publicKey}` } : {}),
       ...(message ? { message } : {})
@@ -348,7 +348,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
     }
   }
   function tick() {
-    if (closed || paused || fault || polling) return;
+    if (closed || paused || fault || enrollmentError || polling) return;
     polling = poll();
   }
   async function poll() {
@@ -369,6 +369,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
         if (state.owner && (state.owner.issuer !== p.account.issuer || state.owner.subject !== p.account.subject))
           fail(403, 'This account differs from the locally approved owner. Local re-enrollment is required.');
       } else pending = undefined;
+      setupID = state.setupID ?? undefined;
       for (const channel of channels.values()) {
         if (channel.candidateID && pending?.id !== channel.candidateID &&
           !serverDevices.some(d => d.deviceID === channel.device.id && d.publicKey === channel.device.publicKey)) channel.controller.abort();
@@ -384,7 +385,11 @@ export async function createRemoteCompanion({ directory, origin, emit,
       status();
     } catch (error) {
       if (error.status === 401 || error.status === 403 || error.status === 409) {
-        message = 'Sign in on your phone, or choose Create pairing after a free-server restart.';
+        enrollmentError = error;
+        message = error.status === 401
+          ? 'This Mac registration expired or the service restarted. Choose "Pair an internet device" on this Mac for a fresh pairing code. Signing in again on the phone cannot restore the Mac registration.'
+          : error.message;
+        setupID = undefined; pending = undefined; serverDevices = [];
         auth?.disable();
         for (const channel of channels.values()) channel.controller.abort();
         status();
@@ -410,6 +415,8 @@ export async function createRemoteCompanion({ directory, origin, emit,
         catch (error) { if (error.status !== 401) throw error; }
       }
       if (!existing) await register();
+      enrollmentError = undefined;
+      setupID = state.setupID ?? undefined;
       message = "Scan this Mac's code and sign in on your phone."; status(); return;
     }
     if (input.type === 'pair') {
@@ -453,7 +460,6 @@ export async function createRemoteCompanion({ directory, origin, emit,
     if (bytes(await signer.call('identity')).toString('base64url') !== state.publicKey) fail(503, 'Saved Mac identity changed.');
     if (state.owner) await openAuthorization(state.owner);
   } catch (error) { await signer.close(); throw error; }
-  setupID = state.setupID ?? undefined;
   const timer = setInterval(() => { void tick(); }, 3000);
   timer.unref();
   status(); void tick();

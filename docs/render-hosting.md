@@ -99,6 +99,16 @@ timeout. A missing acknowledgment means delivery may be uncertain, not that the
 action was rejected or is safe to resend. Browser suspension, network loss and
 free-host restarts can still interrupt a connection.
 
+After a restart, distinguish account login from Mac/device enrollment. A rejected
+Mac registration stops polling and hides its stale QR code; choose **Pair an
+internet device** on the Mac to register again with the same signing identity.
+If the phone still has a relationship that the service no longer recognizes,
+explicitly forget that phone pairing, then scan a fresh Mac code and pair again.
+Reload the phone page when reopening a setup link in an existing tab. Local
+full-key approval is still required. Signing in again alone does not restore
+lost enrollment. A different account remains blocked by the saved Mac owner;
+never silently reset or transfer that trust.
+
 Responses are no-store, deny framing, suppress referrers, and use a self-only
 CSP with `wasm-unsafe-eval` solely for WebAssembly compilation and an explicit
 same-host WSS connection source for browser compatibility. No third-party

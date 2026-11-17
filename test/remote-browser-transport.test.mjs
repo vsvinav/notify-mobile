@@ -230,6 +230,51 @@ test('account fetches use same-origin cookies and stop reading oversized respons
   assert.ok(chunks < 1100);
 });
 
+test('an enrollment 401 does not incorrectly tell the phone to sign in again', async t => {
+  t.mock.method(globalThis, 'fetch', async () =>
+    Response.json({ error: 'Device enrollment required.' }, { status: 401 }));
+  await assert.rejects(postJSON('/v1/remote/grant/begin', {}), error => {
+    assert.equal(error.status, 401);
+    assert.match(error.message, /Device enrollment required/);
+    assert.doesNotMatch(error.message, /sign in again/i);
+    return true;
+  });
+});
+
+test('HTTP errors retain status with empty, non-JSON or invalid error bodies', async t => {
+  for (const response of [
+    new Response(null, { status: 401 }),
+    new Response('<html>Unavailable</html>', { status: 503 }),
+    Response.json({ error: 'x'.repeat(501) }, { status: 401 }),
+    Response.json({ error: {} }, { status: 403 })
+  ]) {
+    const mock = t.mock.method(globalThis, 'fetch', async () => response);
+    await assert.rejects(postJSON('/v1/remote/grant/begin', {}), error => {
+      assert.equal(error.status, response.status);
+      assert.equal(error.message, `Request failed (${response.status}).`);
+      return true;
+    });
+    mock.mock.restore();
+  }
+});
+
+test('rejected setup authorization stops before opening a socket or automatically retrying', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  for (const rejectedPhase of ['begin', 'finish']) {
+    const h = harness({ autoReconnect: true, post: async path => {
+      if (path.endsWith(rejectedPhase)) throw Object.assign(new Error('Device enrollment required.'), { status: 401 });
+      return { id: grantID, challenge: 'challenge' };
+    } });
+    await assert.rejects(h.transport.connect(), { status: 401 });
+    t.mock.timers.tick(120000); await flush();
+    assert.equal(h.sockets.length, 0);
+    assert.equal(h.calls.length, rejectedPhase === 'begin' ? 1 : 2);
+    assert.equal(h.statuses.at(-1).state, 'disconnected');
+    assert.equal(h.peers[0].freed, true);
+    h.transport.close();
+  }
+});
+
 test('approval gates RPC; disconnect rejects uncertainty and reconnect restores fresh peer and grant', async () => {
   const h = harness();
   await assert.rejects(h.transport.api('state', {}), /approved|connected/i);

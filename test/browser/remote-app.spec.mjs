@@ -44,7 +44,10 @@ async function setup(page, { mismatch = false, loggedOut = false } = {}) {
         if (window.__loggedOut) throw Object.assign(new Error('Sign in'),{status:401});
         return { account:window.__account,scope:'account',fresh:true };
       }
-      if (path.endsWith('/pair')) return { id:'pending', macID:'mac', macPublicKey: window.__mismatch ? '${Buffer.from([4, ...Array(64).fill(9)]).toString('base64url')}' : '${key}', account:window.__account,expiresAt:Date.now()+60000 };
+      if (path.endsWith('/pair')) {
+        if (window.__pairError) throw Object.assign(new Error(window.__pairError), { status:401 });
+        return { id:'pending', macID:'mac', macPublicKey: window.__mismatch ? '${Buffer.from([4, ...Array(64).fill(9)]).toString('base64url')}' : '${key}', account:window.__account,expiresAt:Date.now()+60000 };
+      }
       return {};
     }
     class Peer {
@@ -86,6 +89,27 @@ test('account-only sign-in never creates a channel identity without explicit Pai
   expect(await page.evaluate(() => localStorage.getItem('notify-remote-relationships-v1'))).toBe(null);
   expect(await page.evaluate(() => __calls.some(call=>call.path.endsWith('/pair')))).toBe(false);
   expect(await page.evaluate(() => typeof __approve)).toBe('undefined');
+});
+
+test('failed enrollment survives reload and recovers only through explicit forget and fresh pairing', async ({ page }) => {
+  await setup(page);
+  await page.evaluate(() => { window.__pairError = 'Mac enrollment unavailable.'; });
+  await page.getByLabel('Phone name').fill('Synthetic phone');
+  await page.getByRole('button', { name: 'Pair with this Mac', exact: true }).click();
+  await expect(page.getByRole('alert')).toHaveText('Mac enrollment unavailable.');
+  expect(await page.evaluate(() => typeof __approve)).toBe('undefined');
+  const original = await page.evaluate(() => JSON.parse(localStorage.getItem('notify-remote-relationships-v1')));
+  await page.goto(`${origin}/#setup=fresh-setup&mac=mac&key=${key}`);
+  await page.reload();
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('notify-remote-relationships-v1')))).toEqual(original);
+  expect(await page.evaluate(() => __calls.some(call => call.path.endsWith('/pair')))).toBe(false);
+  await page.getByRole('button', { name: 'Forget this phone’s pairing', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Forget pairing', exact: true }).click();
+  await pair(page);
+  expect(await page.evaluate(() => __calls.filter(call => call.path.endsWith('/pair')).map(call => call.data.setupID))).toEqual(['fresh-setup']);
+  expect(await page.evaluate(() => __calls.some(call => call.path === 'state'))).toBe(false);
+  await page.evaluate(() => __approve());
+  await expect(page.getByRole('heading', { name: 'Synthetic permission' })).toBeVisible();
 });
 
 test('pairing pins full QR key, strips fragment and waits for Mac approval', async ({ page }) => {

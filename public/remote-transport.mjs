@@ -38,9 +38,9 @@ export async function postJSON(path, data, timeout = 15000, signal) {
     const response = await fetch(path, { method: 'POST', credentials: 'same-origin', cache: 'no-store',
       redirect: 'error', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(data), signal: controller.signal });
-    if (!response.ok) throw Object.assign(new Error(`Request failed (${response.status}). Sign in again if your session expired.`), { status: response.status });
+    const httpError = response.ok ? null : Object.assign(new Error(`Request failed (${response.status}).`), { status: response.status });
     const reader = response.body?.getReader();
-    if (!reader) throw new Error('Server response is empty.');
+    if (!reader) throw httpError ?? new Error('Server response is empty.');
     const chunks = []; let length = 0;
     try {
       while (true) {
@@ -54,7 +54,14 @@ export async function postJSON(path, data, timeout = 15000, signal) {
     const body = new Uint8Array(length); let offset = 0;
     for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.length; }
     controller.signal.throwIfAborted();
-    const result = JSON.parse(decoder.decode(body));
+    let result;
+    try { result = JSON.parse(decoder.decode(body)); }
+    catch { throw httpError ?? new Error('Invalid server response.'); }
+    if (httpError) {
+      if (typeof result?.error === 'string' && result.error.trim().length && result.error.length <= 500)
+        httpError.message = result.error;
+      throw httpError;
+    }
     if (!object(result)) throw new Error('Invalid server response.');
     return result;
   } catch (error) {
