@@ -98,7 +98,8 @@ function androidPasskeys(config) {
 }
 
 // Account identity only, never device trust or relay authority. One private store
-// has one authoritative service writer; restart invalidates every cookie session.
+// has one authoritative service writer (a durable store fences it on takeover);
+// restart invalidates every cookie session.
 export async function createAccountService({ server, origin, store, reportError, now = () => performance.now(), managedIngress, android }) {
   const ingress = createIngressPolicy({ server, publicOrigin: origin, managedIngress });
   if (server.listening || server.listenerCount('request') ||
@@ -255,6 +256,15 @@ export async function createAccountService({ server, origin, store, reportError,
       }
       const operation = serial.then(async () => {
         ensureLive(); prune();
+        if (store.check) {
+          try { await store.check(); }
+          catch {
+            fault = true; flows.clear(); clearSessions();
+            reportError(new Error('Account storage freshness check failed.'));
+            fail(503, 'Account storage unavailable.');
+          }
+          ensureLive(); prune();
+        }
         if (kind === 'session') {
           if (!shape(data, [])) fail(400, 'Unexpected account request fields.');
           const key = tokens[SESSION] && hash(tokens[SESSION]), session = sessions.get(key);

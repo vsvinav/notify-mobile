@@ -157,6 +157,22 @@ test('real passkey registration/login persist public credentials and issue accou
   assert.equal((await browser.request('session', {}, { cookie: `${sessionCookie}=${oldCookie}` })).status, 401);
 });
 
+test('durable storage fencing failure invalidates existing account sessions', async t => {
+  let state = null, unavailable = false;
+  const store = {
+    read: async () => structuredClone(state),
+    write: async value => { state = structuredClone(value); },
+    check: async () => { if (unavailable) throw new Error('Synthetic fenced writer'); }
+  };
+  const f = await fixture(t, { store }), browser = f.browser();
+  await browser.register();
+  const proof = browser.authorize();
+  unavailable = true;
+  assert.equal((await browser.request('session')).status, 503);
+  assert.equal(proof.signal.aborted, true);
+  assert.throws(() => browser.authorize(), error => error.status === 401);
+});
+
 test('allowlisted Android origins use the real verifier and retain browser credential interoperability', async t => {
   const config = androidConfig();
   const f = await fixture(t, { android: config }), native = f.browser(), auth = authenticator(androidOrigin);

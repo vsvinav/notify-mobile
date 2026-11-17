@@ -32,10 +32,10 @@ export function createIngressPolicy({ server, publicOrigin, managedIngress }) {
 
   return Object.freeze({
     accepts,
-    health(req, res) {
+    health(req, res, { available = true } = {}) {
       if (!managed || req.url !== '/healthz') return false;
       const allowed = accepts(req) && (req.headers.origin === undefined || req.headers.origin === endpoint.origin);
-      const status = !allowed ? 403 : req.method === 'GET' ? 200 : 405;
+      const status = !allowed ? 403 : req.method === 'GET' ? (available ? 200 : 503) : 405;
       res.writeHead(status, { 'Cache-Control': 'no-store', 'Content-Type': 'application/json; charset=utf-8',
         'X-Content-Type-Options': 'nosniff' });
       res.end(JSON.stringify(status === 200 ? { status: 'ok' } : { error: 'Health request rejected.' }));

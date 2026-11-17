@@ -137,6 +137,35 @@ test('expired Mac registration is visible and cannot keep advertising a stale pa
   assert.match(status.message, /Mac.*pair/i);
 });
 
+test('explicit invitation refreshes a restarted service locator without replacing saved Mac trust', async t => {
+  const directory = join(process.cwd(), '.test-data', randomUUID());
+  await mkdir(directory, { recursive: true });
+  const origin = 'https://notify.example', events = [], calls = [];
+  const state = { version: 1, origin, macID: randomUUID(), publicKey: key(),
+    owner: { issuer: origin, subject: 'owner' }, devices: [], credential: 'c'.repeat(43), setupID: 'old-setup' };
+  await writeFile(join(directory, 'identity.json'), JSON.stringify(state), { mode: 0o600 });
+  const helper = await createRemoteCompanion({ directory, origin, emit: event => events.push(event),
+    cryptoProcess: () => ({
+      async call() { return [...Buffer.from(state.publicKey, 'base64url')]; }, async close() {}
+    }),
+    fetchRequest: async (url, options) => {
+      const path = new URL(url).pathname;
+      calls.push(path);
+      assert.equal(options.headers.Authorization, `Bearer ${state.credential}`);
+      if (path.endsWith('/mac/invite'))
+        return Response.json({ setupID: 'n'.repeat(43), expiresAt: Date.now() + 180000 });
+      return Response.json({ macID: state.macID, account: state.owner, pending: null, devices: [] });
+    }
+  });
+  t.after(async () => { await helper.close(); await rm(directory, { recursive: true }); });
+  await until(() => events.filter(event => event.type === 'status').length >= 2);
+  await helper.command({ type: 'invite' });
+  assert.ok(calls.includes('/v1/remote/mac/invite'));
+  const updated = JSON.parse(await readFile(join(directory, 'identity.json'), 'utf8'));
+  assert.deepEqual(updated, { ...state, setupID: 'n'.repeat(43) });
+  assert.match(events.findLast(event => event.type === 'status').status.setupURL, new RegExp('n'.repeat(43)));
+});
+
 for (const subject of ['original-owner', 'different-owner']) {
   test(`restart recovery with real authority and ${subject} preserves the local trust boundary`, async t => {
     const root = join(process.cwd(), '.test-data');

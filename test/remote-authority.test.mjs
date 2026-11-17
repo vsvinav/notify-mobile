@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import test from 'node:test';
 import { createRemoteAuthority } from '../src/remote-authority.mjs';
+import { createFirestoreStores } from '../src/firestore-store.mjs';
+import { firestoreFixture } from './fixtures/firestore.mjs';
 
 const origin = 'https://notify.example';
 const prefix = 'Notify remote authorization v1\0';
@@ -113,6 +115,220 @@ test('fractional monotonic deadlines produce whole-millisecond pairing and relay
 
 const renewalInput = (grant, key) => ({
   id: grant.renewal.id, signature: key.sign(grant.renewal.challenge)
+});
+
+test('durable approval retains exact owner and public keys, but no grants or account proofs, after restart', async t => {
+  let saved = null;
+  const store = { read: async () => structuredClone(saved),
+    write: async value => { saved = structuredClone(value); }, check: async () => {} };
+  const controller = new AbortController();
+  const req = { headers: { origin } };
+  const accounts = { authorize: () => ({ issuer: origin, subject: 'owner', signal: controller.signal }) };
+  let authority = await createRemoteAuthority({ origin, accounts, store });
+  t.after(() => authority.close());
+  const mac = identity(), phone = identity(), macID = randomUUID(), deviceID = randomUUID();
+  const bootstrap = await authority.beginMac({ macID, publicKey: mac.publicKey });
+  const host = await authority.registerMac({ id: bootstrap.id, signature: mac.sign(bootstrap.challenge) });
+  const pending = await authority.requestPair(req, {
+    setupID: host.setupID, deviceID, publicKey: phone.publicKey, name: 'Phone'
+  });
+  await authority.decidePair(host.credential, { id: pending.id, allow: true });
+  const challenge = await authority.beginGrant(req, { role: 'phone', macID, deviceID });
+  const old = await authority.finishGrant({ id: challenge.id, signature: phone.sign(challenge.challenge) }, req);
+  authority.close();
+  authority = await createRemoteAuthority({ origin, accounts, store });
+  const restored = await authority.macStatus(host.credential);
+  assert.deepEqual(restored.account, { issuer: origin, subject: 'owner' });
+  assert.deepEqual(restored.devices, [{ deviceID, publicKey: phone.publicKey, name: 'Phone' }]);
+  assert.equal(restored.pending, null);
+  await assert.rejects(async () => authority.authorizeRelay({
+    headers: { origin, cookie: `__Host-notify-relay=${old.credential}` }
+  }), status(401));
+  await assert.rejects(async () => authority.finishGrant({
+    id: challenge.id, signature: phone.sign(challenge.challenge)
+  }, req), status(401));
+  await assert.rejects(authority.beginGrant(req, { role: 'mac', deviceID, credential: host.credential }), status(401));
+  const fresh = await authority.beginGrant(req, { role: 'phone', macID, deviceID });
+  assert.equal((await authority.finishGrant({ id: fresh.id, signature: phone.sign(fresh.challenge) }, req)).approved, true);
+  const macFlow = await authority.beginGrant(req, { role: 'mac', deviceID, credential: host.credential });
+  assert.equal((await authority.finishGrant({ id: macFlow.id, signature: mac.sign(macFlow.challenge) }, req)).role, 'mac');
+  const serialized = JSON.stringify(saved);
+  for (const secret of [host.credential, host.setupID, old.credential, challenge.challenge])
+    assert.ok(!serialized.includes(secret));
+  assert.doesNotMatch(serialized, /privateKey|proof|deadline|signal|challenge|setupID/);
+  await authority.revokeDevice(host.credential, { deviceID });
+  authority.close();
+  authority = await createRemoteAuthority({ origin, accounts, store });
+  assert.deepEqual((await authority.macStatus(host.credential)).devices, []);
+  await assert.rejects(authority.beginGrant(req, { role: 'phone', macID, deviceID }), status(401));
+});
+
+async function durableFixture(t) {
+  const db = firestoreFixture(), controller = new AbortController();
+  const req = { headers: { origin } }, otherReq = { headers: { origin } };
+  const accounts = { authorize: request => ({ issuer: origin,
+    subject: request === req ? 'owner' : 'other', signal: controller.signal }) };
+  const start = async () => {
+    const stores = await createFirestoreStores({ firestore: db.firestore, origin });
+    const authority = await createRemoteAuthority({ origin, accounts, store: stores.trust });
+    t.after(() => authority.close());
+    return authority;
+  };
+  const authority = await start(), mac = identity(), phone = identity();
+  const macID = randomUUID(), deviceID = randomUUID();
+  const flow = await authority.beginMac({ macID, publicKey: mac.publicKey });
+  const host = await authority.registerMac({ id: flow.id, signature: mac.sign(flow.challenge) });
+  const pending = await authority.requestPair(req, { setupID: host.setupID, deviceID,
+    publicKey: phone.publicKey, name: 'Phone' });
+  return { db, authority, start, req, otherReq, controller, mac, phone, macID, deviceID, host, pending };
+}
+
+test('durable trust rejects wrong owner/key and fences stale leases and pending decisions after takeover/revocation', async t => {
+  const f = await durableFixture(t);
+  await f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true });
+  await assert.rejects(f.authority.beginGrant(f.otherReq,
+    { role: 'phone', macID: f.macID, deviceID: f.deviceID }), status(403));
+  const wrong = await f.authority.beginGrant(f.req, { role: 'phone', macID: f.macID, deviceID: f.deviceID });
+  await assert.rejects(f.authority.finishGrant({ id: wrong.id, signature: f.mac.sign(wrong.challenge) }, f.req), status(401));
+  const flow = await f.authority.beginGrant(f.req, { role: 'phone', macID: f.macID, deviceID: f.deviceID });
+  let grant = await f.authority.finishGrant({ id: flow.id, signature: f.phone.sign(flow.challenge) }, f.req);
+  const live = await f.authority.authorizeRelay({
+    headers: { origin, cookie: `__Host-notify-relay=${grant.credential}` }
+  });
+  const writes = f.db.metrics.writes, reads = f.db.metrics.reads;
+  grant = await f.authority.renewGrant(f.req, renewalInput(grant, f.phone));
+  assert.equal(f.db.metrics.writes, writes);
+  assert.equal(f.db.metrics.reads - reads, 1, 'One fence read per renewal; no trust-document read/write');
+  const pending = await f.authority.requestPair(f.req, { setupID: f.host.setupID,
+    deviceID: randomUUID(), publicKey: identity().publicKey, name: 'Another phone' });
+  const replacement = await f.start();
+  await replacement.revokeDevice(f.host.credential, { deviceID: f.deviceID });
+  await assert.rejects(f.authority.renewGrant(f.req, renewalInput(grant, f.phone)), status(503));
+  assert.equal(live.signal.aborted, true);
+  await assert.rejects(f.authority.decidePair(f.host.credential, { id: pending.id, allow: true }), status(503));
+  const durable = structuredClone([...f.db.documents]);
+  f.controller.abort();
+  assert.deepEqual([...f.db.documents], durable, 'Old account callbacks cannot write restored trust');
+  assert.deepEqual((await replacement.macStatus(f.host.credential)).devices, []);
+});
+
+test('approval and revocation wait for storage; failed writes never acknowledge success or revive trust', async t => {
+  const f = await durableFixture(t);
+  let release, entered;
+  const blocked = new Promise(resolve => { entered = resolve; });
+  f.db.beforeCommit(async () => { entered(); await new Promise(resolve => { release = resolve; }); });
+  let acknowledged = false;
+  const approval = f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true })
+    .then(value => { acknowledged = true; return value; });
+  await blocked;
+  assert.equal(acknowledged, false);
+  release();
+  await approval;
+  f.db.beforeCommit(undefined);
+  const flow = await f.authority.beginGrant(f.req, { role: 'phone', macID: f.macID, deviceID: f.deviceID });
+  const grant = await f.authority.finishGrant({ id: flow.id, signature: f.phone.sign(flow.challenge) }, f.req);
+  const live = await f.authority.authorizeRelay({
+    headers: { origin, cookie: `__Host-notify-relay=${grant.credential}` }
+  });
+  f.db.fail(true);
+  await assert.rejects(f.authority.revokeDevice(f.host.credential, { deviceID: f.deviceID }), status(503));
+  assert.equal(live.signal.aborted, true);
+  f.db.fail(false);
+  await assert.rejects(f.authority.macStatus(f.host.credential), status(503));
+  const replacement = await f.start();
+  assert.equal((await replacement.macStatus(f.host.credential)).devices.length, 1,
+    'A failed revocation is not reported as durably successful');
+  await replacement.revokeDevice(f.host.credential, { deviceID: f.deviceID });
+  assert.deepEqual((await (await f.start()).macStatus(f.host.credential)).devices, []);
+});
+
+test('a late approval cannot overwrite a revocation committed by the replacement service', async t => {
+  const f = await durableFixture(t);
+  await f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true });
+  const pending = await f.authority.requestPair(f.req, { setupID: f.host.setupID,
+    deviceID: randomUUID(), publicKey: identity().publicKey, name: 'Late phone' });
+  const replacement = await f.start();
+  await replacement.revokeDevice(f.host.credential, { deviceID: f.deviceID });
+  const persisted = structuredClone([...f.db.documents]);
+  await assert.rejects(f.authority.decidePair(f.host.credential, { id: pending.id, allow: true }), status(503));
+  f.controller.abort();
+  assert.deepEqual([...f.db.documents], persisted);
+  assert.deepEqual((await replacement.macStatus(f.host.credential)).devices, []);
+});
+
+test('failed initial approval cannot become durable trust or a successful reply', async t => {
+  const f = await durableFixture(t);
+  f.db.fail(true);
+  await assert.rejects(f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true }), status(503));
+  f.db.fail(false);
+  const replacement = await f.start();
+  await assert.rejects(replacement.macStatus(f.host.credential), status(401));
+});
+
+test('malformed restored public trust is rejected without writes or empty-state fallback', async t => {
+  const f = await durableFixture(t);
+  await f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true });
+  const original = JSON.parse(f.db.documents.get('notifyState/trust').json);
+  for (const corrupt of [
+    state => { state.origin = 'https://other.example'; },
+    state => { state.macs[0].account.issuer = 'https://other.example'; },
+    state => { state.macs[0].credentialHash = [state.macs[0].credentialHash]; },
+    state => { state.macs[0].devices[0].publicKey = identity().publicKey + '='; },
+    state => { state.macs[0].devices.push(state.macs[0].devices[0]); },
+    state => { state.macs.push(state.macs[0]); },
+    state => { state.macs[0].setupID = 'not durable'; }
+  ]) {
+    const state = structuredClone(original);
+    corrupt(state);
+    let writes = 0;
+    await assert.rejects(createRemoteAuthority({ origin, accounts: { authorize() {} },
+      store: { read: async () => state, check: async () => {}, write: async () => { writes++; } } }), /Invalid remote trust/);
+    assert.equal(writes, 0);
+  }
+});
+
+test('a retained Mac explicitly creates a fresh ephemeral invitation without rotating its credential or owner', async t => {
+  const f = await durableFixture(t);
+  await f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true });
+  const restored = await f.start();
+  const input = { setupID: f.host.setupID, deviceID: randomUUID(), publicKey: identity().publicKey, name: 'New phone' };
+  await assert.rejects(restored.requestPair(f.req, input), status(401));
+  assert.equal(typeof restored.invite, 'function');
+  const writes = f.db.metrics.writes;
+  const invitation = await restored.invite(f.host.credential);
+  assert.notEqual(invitation.setupID, f.host.setupID);
+  assert.equal(f.db.metrics.writes, writes);
+  await assert.rejects(restored.requestPair(f.otherReq, { ...input, setupID: invitation.setupID }), status(403));
+  const pending = await restored.requestPair(f.req, { ...input, setupID: invitation.setupID });
+  assert.equal(pending.macPublicKey, f.mac.publicKey);
+  await restored.decidePair(f.host.credential, { id: pending.id, allow: true });
+  assert.equal((await restored.macStatus(f.host.credential)).devices.length, 2);
+  assert.ok(!JSON.stringify([...f.db.documents]).includes(invitation.setupID));
+});
+
+test('status sampling returns current pending state but cannot authorize against a successor fence', async t => {
+  const f = await durableFixture(t);
+  await f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true });
+  const before = f.db.metrics.reads;
+  for (let i = 0; i < 3; i++) await f.authority.macStatus(f.host.credential);
+  assert.equal(f.db.metrics.reads, before);
+  const pending = await f.authority.requestPair(f.req, { setupID: f.host.setupID,
+    deviceID: randomUUID(), publicKey: identity().publicKey, name: 'Fresh pending phone' });
+  assert.equal((await f.authority.macStatus(f.host.credential)).pending.id, pending.id);
+  let reads = f.db.metrics.reads;
+  const challenge = await f.authority.beginGrant(f.req, { role: 'phone', macID: f.macID, deviceID: f.deviceID });
+  assert.equal(f.db.metrics.reads, ++reads);
+  const grant = await f.authority.finishGrant({ id: challenge.id, signature: f.phone.sign(challenge.challenge) }, f.req);
+  assert.equal(f.db.metrics.reads, ++reads);
+  const live = await f.authority.authorizeRelay({ headers: { origin, cookie: `__Host-notify-relay=${grant.credential}` } });
+  assert.equal(f.db.metrics.reads, ++reads);
+  const next = await f.authority.renewGrant(f.req, renewalInput(grant, f.phone));
+  assert.equal(f.db.metrics.reads, ++reads);
+  const successor = await f.start();
+  await successor.revokeDevice(f.host.credential, { deviceID: f.deviceID });
+  assert.equal((await f.authority.macStatus(f.host.credential)).devices.length, 1, 'Sampled status is informational only');
+  await assert.rejects(f.authority.renewGrant(f.req, renewalInput(next, f.phone)), status(503));
+  assert.equal(live.signal.aborted, true);
 });
 
 test('connected leases renew without changing authority or allowing nonce replay', async t => {

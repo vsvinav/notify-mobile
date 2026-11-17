@@ -1,7 +1,9 @@
 # Single-process Render Free hosting
 
 `render.yaml` describes **one Free web service**, not a launched deployment.
-There is no paid disk, database, custom domain, background worker, or Rust build.
+There is no paid disk, custom domain, background worker, or Rust build.
+Optional durable storage uses a separate Notify-only Firebase **Spark** project
+and its default Firestore database; no billing account or FCM setup is required.
 Generated browser WASM is committed; the build is `npm ci --ignore-scripts`.
 Automatic deploys are disabled. Blueprint creation itself is a separate manual
 deployment action; this change does not authorize or perform it.
@@ -23,17 +25,132 @@ Do not set fake Render variables to expose this listener on a public machine.
   or nondefault port. The `onrender.com` hostname need not be bought.
 - `NODE_TLS_REJECT_UNAUTHORIZED=1` is configured for build and runtime.
   The CLI also forces TLS verification on; no insecure TLS fallback exists.
-- Account public credentials are stored privately in repository-local
-  `.hosted-data/state.json` (directory `0700`, file `0600`). Do not commit or
-  publish that runtime directory. The process is its sole writer.
-- **Render Free disk is ephemeral. Restart, redeploy, or idle spin-down can
-  lose every account record.** Even if the file happens to survive, account
-  sessions, Mac bindings, pending pairing, routing grants, and relay rooms
-  are invalidated on every process restart. Re-enroll explicitly; a local
-  remembered device is not cloud authorization. This is not durable hosting.
+- For durable hosting, set **both** `NOTIFY_FIREBASE_PROJECT_ID` (public project
+  ID) and `NOTIFY_FIREBASE_CREDENTIALS_FILE` (absolute path to an explicitly
+  provisioned Notify-only service-account JSON). Render must have its own
+  explicitly uploaded secret file, for example `/etc/secrets/notify-firebase.json`.
+  Never put JSON credentials in Git, the blueprint, browser code, or logs.
+  Use only the new project's service account with Firestore data access, not
+  an existing personal account. Keep browser/mobile Firestore rules deny-all:
+  only this backend accesses the database using its project-scoped IAM identity.
+- Credentials must be a regular, non-symlink file, at most 32 KiB, contain a
+  matching project and service-account email, and an RSA private key of at
+  least 2048 bits. Only Google's standard token endpoint/universe is accepted;
+  the Firestore endpoint is pinned. No application-default credentials,
+  `gcloud` login, or ambient Google credential file is used.
+  Emulator redirection and ambient Google client-certificate/mTLS opt-ins are
+  rejected. Partial/invalid configuration,
+  permission errors, quota exhaustion or unavailable storage fail closed;
+  configured Firebase never falls back to a local file.
+- With neither Firebase variable set, development retains private account
+  storage in `.hosted-data/state.json` (`0700` directory, `0600` file) and
+  memory-only Mac/device registration. **That mode is not durable on Render
+  Free:** disk loss can erase accounts and every process restart erases pairing.
+  Do not publish or commit the runtime directory.
 - Free services sleep and can take time to wake. Workspace hour/bandwidth/build
   limits and possible overage charges still apply; confirm billing controls
   before any deployment. A Free instance is not a guarantee of zero charges.
+
+### What survives a durable restart
+
+Firestore stores only account public passkeys and counters, the exact approved
+owner, Mac and approved phone public keys, names/IDs, and a SHA-256 hash of the
+existing Mac bearer credential. Revocation removes the approved phone record
+durably before success is returned. It never stores conversations, commands,
+client private keys, sessions/cookies, grants, challenges, setup links, sockets,
+or MLS channel state. The backend's service-account key stays in its secret file,
+not Firestore.
+
+After a restart, sign in with the **same passkey/account** and reconnect. Existing
+Mac credentials and pinned keys still work; no re-pairing or trust reset occurs.
+The Mac waits for a freshly authenticated phone before creating new routing
+grants. Old cookies, grants and pending setup flows are invalid. To add another
+phone, explicitly choose **Pair an internet device** in the updated Mac helper:
+it requests a fresh three-minute invitation using the retained Mac credential,
+without rotating that credential or changing the owner. Old helper builds can
+reconnect approved phones but cannot refresh a stale setup QR; update the helper
+before inviting a new phone.
+
+This is not recovery for records **already lost** by the old memory-only
+service. There is no automatic migration, import from caller-supplied owner/key,
+or silent re-enrollment. Establishing the initial durable pairing still requires
+real passkey verification and explicit local full-key approval.
+
+### Overlapping deploys, limits and free quotas
+
+There is one logical active writer, not a horizontally scaled service. Three
+fixed documents under `notifyState` hold the startup fence, accounts and trust.
+A Firestore transaction takes a new fence at startup; record writes verify that
+fence **and** their previously read revision in the committing transaction.
+Every grant, renewal, relay admission and trust mutation checks the fence before
+returning, unless a fenced write already did so. Account requests check freshness
+too. Only non-authorizing Mac status polls reuse a successful fence check, for
+at most 30 monotonic seconds (including the checking request's elapsed time).
+Status still returns current local pending/device information, not a cached
+response; that information never bypasses fresh authorization. A known storage
+fault invalidates the sample immediately. A stale process cannot overwrite
+newer trust or keep renewing a revoked phone; its next successful-operation
+check fails closed. Already-issued leases on that old process can remain usable
+for **at most their existing 30 seconds**, never an extended revocation window.
+
+Keep `numInstances: 1`. During overlapping Render deploys, requests routed to the
+old instance may fail until it drains; cookies are process-local and fresh
+sign-in on the new instance is required. Do not run competing auto-restarting
+instances against the same project: every startup takes over. Health reflects
+known readiness without making additional database reads. Only these fenced service
+writers may modify the documents; direct console edits, deletion/restoration of
+the database, or old unfenced binaries are not a supported concurrent writer.
+Never roll back to an unfenced backend against durable state.
+
+Limits remain 256 accounts, 64 Macs and 8 approved phones per Mac. Each serialized
+record is additionally capped at **900,000 UTF-8 bytes**, below Firestore's 1 MiB
+document limit; unusually large passkeys may hit that byte cap before the count
+limit. Oversize/corrupt/missing records and uncertain writes reject the operation
+rather than resetting data. Corruption, credential/permission errors and
+ownership/revision conflicts stay fail-closed for intervention; never delete
+state to clear an error.
+
+For one continuously connected Mac/phone, 10-second renewals cost approximately
+**17,280 document reads/day and zero writes**. Status polling reuses these fresh
+checks and adds no reads in the steady-state synthetic cadence test. Two active
+phones (for example browser plus Android) cost **34,560 reads/day**. Conservatively,
+allow another **2,880 status reads/day per service** when not covered by other
+checks: totals **20,160 / 37,440**, before sign-ins, reconnects, retries and
+deployments. Idle status-only service use is at most 2,880 reads/day, even if
+heartbeats trigger extra polls. This is not an unrestricted multi-user quota
+budget against Spark's usual 50,000 reads/day allowance. A trust mutation or
+passkey counter update costs one document write and two transactional reads;
+sign-in also has freshness reads. Startup reads three documents and writes one
+fence (three writes on first initialization), plus two reads per service load.
+There are no writes on polls or lease renewals, no collection scans/listeners,
+and no payload history. Confirm current Firebase quotas in the private console;
+quota exhaustion intentionally interrupts access rather than enabling billing.
+
+### Transient storage recovery
+
+Exhausted, recognized transport/deadline/quota errors suspend both account and
+remote authorization and close active relay connections. A single service
+coordinator retries after 1, 2, 4… seconds, capped at 60 seconds; quota errors wait
+at least 60 seconds. Client Retry requests do not create additional recovery
+work. `/healthz` returns 503 during suspension and returns 200 only after both
+services have reloaded and validated their durable records.
+
+Recovery drains in-flight storage operations, verifies the **same owned startup
+generation**, and transactionally changes its recovery incarnation. That real
+fence change prevents a delayed, unknown-outcome commit from writing past the
+reload boundary. It does not acquire a successor's ownership. Old storage
+handles are invalidated; fresh account/authority instances reload the committed
+records, with no cookies, grants, challenges or sockets carried over. Sign in
+again and reconnect; an uncertain mutation is never automatically replayed.
+Even a lost recovery-transaction reply can resume only that process's own
+pending incarnation.
+
+A successful recovery costs seven document reads and one fence write, before
+client sign-in/reconnection; retries may cost additional reads/writes if a commit
+reply is lost. Unrecognized
+errors, corruption and conflicting owners/revisions are not automatically
+recovered. Live Firestore acceptance must still verify this behavior; the local
+transaction fixture is not an emulator or proof of live-service semantics.
 
 ## Exposed surface
 
@@ -47,7 +164,8 @@ Authorization renewal has its own bounded 120-request/minute allowance per
 socket peer, separate from the ordinary 120-request/minute allowance; the
 stricter bootstrap and concurrency limits still apply.
 
-`GET /healthz` returns only `{"status":"ok"}` with no authority or secrets.
+`GET /healthz` returns `{"status":"ok"}` only while ready, otherwise 503; it
+contains no authority or secrets and performs no database reads.
 `GET`/`HEAD /` serves `public/remote.html`. Static routing is an exact allowlist:
 `remote-app.mjs`, `remote-transport.mjs`, `remote-identity.mjs`, `workspace.mjs`,
 `styles.css`, `remote-crypto/channel.js`, and `remote-crypto/channel_bg.wasm`.
@@ -68,6 +186,7 @@ at most 16 KiB, no content encoding, and no unexpected fields.
 | `/v1/remote/mac/register` | `id`, `signature`; native, no Origin |
 | `/v1/remote/pair` | `setupID`, `deviceID`, `publicKey`, `name`; fresh passkey session |
 | `/v1/remote/mac/status` | `{}`; native Bearer credential |
+| `/v1/remote/mac/invite` | `{}`; native Bearer credential; explicit fresh setup link, no trust change |
 | `/v1/remote/mac/decision` | `id`, `allow`; native Bearer credential |
 | `/v1/remote/mac/revoke` | `deviceID`; native Bearer credential |
 | `/v1/remote/grant/begin` | `role`, `deviceID`, optional `macID`; Mac credential only from Bearer, phone from account cookie |
@@ -101,8 +220,9 @@ an expired channel immediately. **Reconnect** starts a fresh attempt.
 Recovery creates new grants, an encrypted channel and action epoch, never
 revives an expired lease or replays an uncertain action. Authorization rejection
 stops automatic recovery: an expired account requires explicit sign-in, and a
-lost Mac registration still requires explicit local re-enrollment. Recovery
-does not repair a Free-host account wipe.
+lost Mac registration still requires explicit local re-enrollment. Durable
+Firestore prevents normal process restarts from losing that registration;
+reconnect logic alone cannot repair an already-lost account or registration.
 
 The phone waits up to 25 seconds for mutation acknowledgments, allowing the
 native runtime's 20-second action window to finish; reads retain a 12-second
@@ -110,7 +230,7 @@ timeout. A missing acknowledgment means delivery may be uncertain, not that the
 action was rejected or is safe to resend. Browser suspension, network loss and
 free-host restarts can still interrupt a connection.
 
-After a restart, distinguish account login from Mac/device enrollment. A rejected
+Without durable storage, distinguish account login from Mac/device enrollment. A rejected
 Mac registration stops polling and hides its stale QR code; choose **Pair an
 internet device** on the Mac to register again with the same signing identity.
 If the phone still has a relationship that the service no longer recognizes,
@@ -141,7 +261,7 @@ Exported interfaces:
 
 ```js
 const app = await createHostedService({
-  origin, managedIngress: 'render-free', store,
+  origin, managedIngress: 'render-free', persistence,
   publicDirectory, // optional; defaults to this repository's public directory
   reportError     // optional; receives only a sanitized generic Error
 });
@@ -152,7 +272,21 @@ const running = await main(); // validates process.env, storage/assets, listens
 await running.close();
 ```
 
+`persistence = await createFirebaseStores({origin})` supplies both stores and
+the recovery lifecycle from the explicit environment configuration. Its
+`close()` releases the Firestore client; `main` owns that cleanup. For development
+or isolated tests, `store` and `trustStore` may still be supplied separately,
+without automatic recovery. Supplying storage to `createRemoteAuthority` makes its factory
+and operations asynchronous (except `close`); its in-memory API stays compatible.
+
+`NODE_TLS_REJECT_UNAUTHORIZED=1 node --test test/firestore-store.test.mjs test/account-service.test.mjs test/remote-authority.test.mjs test/hosted-main.test.mjs test/remote-companion.test.mjs`
+uses synthetic credentials, real passkey/signature paths and an in-memory
+transaction seam. It covers restart, revocation, stale writers, failures and
+the public hosted routes, **not live Firestore acceptance**. No emulator or
+Google authentication is involved.
+
 CLI `SIGINT`/`SIGTERM` closes all services. Before describing internet access as
 ready, separately verify the actual edge HTTPS redirects, exact health Host,
-WSS upgrades, sleep/restart invalidation, phone passkeys and in-person Mac
+WSS upgrades, durable restart/revocation with freshly authenticated phone passkeys,
+overlapping-deploy fencing, and in-person Mac
 approval end to end. Loopback tests cannot prove those platform behaviors.

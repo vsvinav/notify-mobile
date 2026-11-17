@@ -1,10 +1,11 @@
-import { createPublicKey, randomBytes, verify } from 'node:crypto';
+import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 
 const ENROLL_TTL = 180000, GRANT_TTL = 30000;
 const PREFIX = Buffer.from('Notify remote authorization v1\0');
 const COOKIE = '__Host-notify-relay';
 const secret = () => randomBytes(32).toString('base64url');
+const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' &&
   /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/.test(value);
 const identity = value => typeof value === 'string' && value.length > 0 &&
@@ -50,14 +51,17 @@ function signed(record, signature) {
 const sameAccount = (a, b) => a?.issuer === b?.issuer && a?.subject === b?.subject;
 const accountCopy = account => account && ({ issuer: account.issuer, subject: account.subject });
 
-// Memory-only enrollment and routing, never device trust. A local Mac allowlist
+// Enrollment flows and routing are memory-only. A local Mac allowlist
 // and end-to-end key verification remain mandatory, including for pending grants.
 // Sign PREFIX + UTF8(challenge) with P-256/SHA-256; keys are x963 and signatures
 // ASN.1 DER, both canonical base64url. expiresAt is Unix milliseconds. Never put
 // credentials in URLs or logs. Account-bound operations may be asynchronous.
 // finishGrant(input, req) requires the real account request for phone challenges;
 // accounts.authorize must be synchronous, and both begin/finish sessions stay live.
-export function createRemoteAuthority({ origin, accounts, now = () => performance.now(), wallNow = Date.now }) {
+// Supplying a fenced store makes construction and all operations except close asynchronous.
+export function createRemoteAuthority({ origin, accounts, now = () => performance.now(), wallNow = Date.now,
+  store, initialState = null }) {
+  if (store) return storedAuthority({ origin, accounts, now, wallNow, store });
   let endpoint;
   try { endpoint = new URL(origin); } catch { fail(400, 'Invalid authorization origin.'); }
   if (endpoint.protocol !== 'https:' || endpoint.origin !== origin ||
@@ -65,6 +69,33 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     fail(400, 'Invalid authorization configuration.');
 
   const bootstraps = new Map(), macs = new Map(), challenges = new Map(), grants = new Map();
+  if (initialState !== null) {
+    try {
+      shape(initialState, ['version', 'origin', 'macs']);
+      if (initialState.version !== 1 || initialState.origin !== origin ||
+        !Array.isArray(initialState.macs) || initialState.macs.length > 64) throw new Error();
+      const hashes = new Set();
+      for (const mac of initialState.macs) {
+        shape(mac, ['macID', 'publicKey', 'credentialHash', 'account', 'devices']);
+        shape(mac.account, ['issuer', 'subject']);
+        if (!uuid(mac.macID) || macs.has(mac.macID) || typeof mac.credentialHash !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(mac.credentialHash) ||
+          hashes.has(mac.credentialHash) || mac.account.issuer !== origin || !identity(mac.account.subject) ||
+          !Array.isArray(mac.devices) || mac.devices.length > 8) throw new Error();
+        hashes.add(mac.credentialHash);
+        const devices = new Map();
+        for (const device of mac.devices) {
+          shape(device, ['deviceID', 'publicKey', 'name']);
+          if (!uuid(device.deviceID) || devices.has(device.deviceID) || !identity(device.name) ||
+            device.name.length > 128 || device.name.trim() !== device.name) throw new Error();
+          devices.set(device.deviceID, { ...device, key: key(device.publicKey),
+            approved: true, account: accountCopy(mac.account) });
+        }
+        macs.set(mac.macID, { ...mac, account: accountCopy(mac.account), key: key(mac.publicKey),
+          devices, pending: null });
+      }
+    } catch { throw new Error('Invalid remote trust storage. Inspect it before starting the service.'); }
+  }
   const subscriptions = new Map();
   let closed = false, fault = false, mono = -Infinity, wall = -Infinity, timer, active = 0;
 
@@ -176,7 +207,8 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
   function check() { time(); prune(); schedule(); }
   function host(credential) {
     decode(credential, 32);
-    const mac = [...macs.values()].find(record => record.credential === credential);
+    const credentialHash = hash(credential);
+    const mac = [...macs.values()].find(record => record.credentialHash === credentialHash);
     if (!mac) fail(401, 'Mac authorization required.');
     return mac;
   }
@@ -238,12 +270,13 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     bootstraps.delete(input.id);
     signed(record, input.signature);
     if (macs.size >= 64) fail(429, 'Mac enrollment capacity reached.');
+    const credential = secret();
     const mac = { macID: record.macID, publicKey: record.publicKey, key: record.key,
-      credential: secret(), setupID: secret(), deadline: mono + ENROLL_TTL,
+      credentialHash: hash(credential), setupID: secret(), deadline: mono + ENROLL_TTL,
       expiresAt: wall + ENROLL_TTL, account: null, pending: null, devices: new Map() };
     macs.set(mac.macID, mac);
     schedule();
-    return { macID: mac.macID, credential: mac.credential, setupID: mac.setupID, expiresAt: mac.expiresAt };
+    return { macID: mac.macID, credential, setupID: mac.setupID, expiresAt: mac.expiresAt };
   }
   async function requestPair(req, input) {
     return accountOperation(async () => {
@@ -254,7 +287,8 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
         name.length > 128 || /[\0-\x1f\x7f]/.test(name)) fail(400, 'Invalid device enrollment.');
       const publicKeyObject = key(publicKey), accountProof = await proof(req, true);
       const mac = [...macs.values()].find(record => record.setupID === setupID);
-      if (!mac) fail(401, 'Mac enrollment unavailable.');
+      if (!mac || (mac.setupDeadline !== undefined && mono >= mac.setupDeadline))
+        fail(401, 'Mac enrollment unavailable.');
       if (mac.account && !sameAccount(mac.account, accountProof)) fail(403, 'Account does not own this Mac.');
       if (mac.pending || mac.devices.has(deviceID)) fail(409, 'Device enrollment already exists.');
       if (mac.devices.size >= 8 || [...macs.values()].filter(record => record.pending).length >= 128)
@@ -277,6 +311,15 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
       pending: pending ? { id: pending.id, name: pending.name, deviceID: pending.deviceID,
         publicKey: pending.publicKey, account: accountCopy(pending.account), expiresAt: pending.expiresAt } : null,
       devices: [...mac.devices.values()].map(({ deviceID, publicKey, name }) => ({ deviceID, publicKey, name })) };
+  }
+  function invite(credential) {
+    check();
+    const mac = host(credential);
+    if (mac.pending) fail(409, 'Finish or reject the pending phone first.');
+    const ttl = mac.account ? ENROLL_TTL : mac.deadline - mono;
+    mac.setupID = secret();
+    mac.setupDeadline = mono + ttl;
+    return { setupID: mac.setupID, expiresAt: Math.floor(wall + ttl) };
   }
   function decidePair(credential, input) {
     check();
@@ -314,7 +357,7 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
       }
       const device = target(mac, deviceID);
       accountProof ??= device.proof;
-      if (accountProof.signal.aborted) fail(401, 'Account authorization required.');
+      if (!accountProof || accountProof.signal.aborted) fail(401, 'Account authorization required.');
       if (!sameAccount(accountProof, mac.account ?? device.account)) fail(403, 'Account does not own this device.');
       if (challenges.size >= 128 || grants.size >= 256) fail(429, 'Routing grant capacity reached.');
       if (role === 'phone' && device.approved) device.proof = accountProof;
@@ -462,7 +505,55 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     schedule();
     return { deviceID: device.deviceID, revoked: true };
   }
+  function snapshot() {
+    return { version: 1, origin, macs: [...macs.values()].filter(mac => mac.account).map(mac => ({
+      macID: mac.macID, publicKey: mac.publicKey, credentialHash: mac.credentialHash,
+      account: accountCopy(mac.account),
+      devices: [...mac.devices.values()].map(({ deviceID, publicKey, name }) => ({ deviceID, publicKey, name }))
+    })) };
+  }
   time();
-  return Object.freeze({ beginMac, registerMac, requestPair, macStatus, decidePair,
-    beginGrant, finishGrant, renewGrant, authorizeRelay, revokeDevice, close });
+  return Object.freeze({ beginMac, registerMac, requestPair, macStatus, invite, decidePair,
+    beginGrant, finishGrant, renewGrant, authorizeRelay, revokeDevice, close, snapshot });
+}
+
+async function storedAuthority({ store, ...options }) {
+  if (typeof store.read !== 'function' || typeof store.write !== 'function' || typeof store.check !== 'function')
+    throw new Error('Remote trust requires a fenced store.');
+  let initialState;
+  try { initialState = await store.read(); }
+  catch { throw new Error('Remote trust storage unavailable.'); }
+  const authority = createRemoteAuthority({ ...options, initialState });
+  let serial = Promise.resolve(), closed = false, queued = 0;
+  const close = () => { closed = true; authority.close(); };
+  const result = { close };
+  for (const [name, operation] of Object.entries(authority)) {
+    if (['close', 'snapshot'].includes(name)) continue;
+    result[name] = (...args) => {
+      if (closed) return Promise.reject(new RemoteAuthorityError(503, 'Remote authorization unavailable.'));
+      if (queued >= 128) return Promise.reject(new RemoteAuthorityError(429, 'Remote authorization capacity reached.'));
+      queued++;
+      const pending = serial.then(async () => {
+        if (closed) fail(503, 'Remote authorization unavailable.');
+        const before = JSON.stringify(authority.snapshot());
+        const value = await operation(...args);
+        const next = authority.snapshot();
+        try {
+          // A mutation commits under the same fence; read-only authorization checks
+          // freshness after async proof work, immediately before acknowledging it.
+          if (JSON.stringify(next) !== before) await store.write(next);
+          else if (name === 'macStatus' && store.checkStatus) await store.checkStatus();
+          else await store.check();
+        } catch {
+          close();
+          fail(503, 'Remote trust storage unavailable.');
+        }
+        if (closed) fail(503, 'Remote authorization unavailable.');
+        return value;
+      });
+      serial = pending.then(() => undefined, () => undefined);
+      return pending.finally(() => { queued--; });
+    };
+  }
+  return Object.freeze(result);
 }

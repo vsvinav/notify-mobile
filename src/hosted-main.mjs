@@ -8,6 +8,7 @@ import { createIngressPolicy } from './managed-ingress.mjs';
 import { createRemoteAuthority } from './remote-authority.mjs';
 import { createRemoteRelay } from './remote-relay.mjs';
 import { privateDirectory, stateStore } from './storage.mjs';
+import { createFirebaseStores } from './firestore-store.mjs';
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const BODY_LIMIT = 16384;
@@ -30,6 +31,7 @@ const FIELDS = new Map([
   ['/v1/remote/mac/register', [['id', 'signature']]],
   ['/v1/remote/pair', [['setupID', 'deviceID', 'publicKey', 'name']]],
   ['/v1/remote/mac/status', [[]]],
+  ['/v1/remote/mac/invite', [[]]],
   ['/v1/remote/mac/decision', [['id', 'allow']]],
   ['/v1/remote/mac/revoke', [['deviceID']]],
   ['/v1/remote/grant/begin', [['role', 'deviceID'], ['macID']]],
@@ -107,7 +109,7 @@ async function json(req, res) {
 }
 
 // Only the outer server listens. Inner modules receive the original request/socket.
-export async function createHostedService({ origin, managedIngress, store, android,
+export async function createHostedService({ origin, managedIngress, store, trustStore, persistence, android,
   publicDirectory = resolve(ROOT, 'public'), reportError = () => {} } = {}) {
   if (typeof origin !== 'string' || new URL(origin).origin !== origin) throw new Error('An exact HTTPS origin is required.');
   const server = http.createServer({ maxHeaderSize: 8192, connectionsCheckingInterval: 1000 });
@@ -121,18 +123,62 @@ export async function createHostedService({ origin, managedIngress, store, andro
     try { assets.set(path, { bytes: await readFile(resolve(publicDirectory, file)), type }); }
     catch (error) { if (error.code !== 'ENOENT') throw new Error('Hosted assets could not be read.'); }
   }
-  const accountServer = http.createServer(), relayServer = http.createServer();
-  const accounts = await createAccountService({ server: accountServer, origin, store, managedIngress, android, reportError: report });
-  let authority, relay;
-  try {
-    authority = createRemoteAuthority({ origin, accounts });
-    relay = createRemoteRelay({ server: relayServer, publicOrigin: origin, webOrigin: origin,
-      managedIngress, authorize: authority.authorizeRelay, reportError: report });
-  } catch (error) {
-    accounts.close(); authority?.close();
-    throw error;
+  async function openServices(stores) {
+    const accountServer = http.createServer(), relayServer = http.createServer();
+    let accounts, authority, relay;
+    try {
+      accounts = await createAccountService({ server: accountServer, origin, store: stores.accounts,
+        managedIngress, android, reportError: report });
+      authority = await createRemoteAuthority({ origin, accounts, store: stores.trust });
+      relay = createRemoteRelay({ server: relayServer, publicOrigin: origin, webOrigin: origin,
+        managedIngress, authorize: authority.authorizeRelay, reportError: report });
+    } catch (error) {
+      accounts?.close(); authority?.close();
+      throw error;
+    }
+    let closing;
+    return { accountServer, relayServer, authority, close() {
+      accounts.close(); authority.close();
+      return closing ??= relay.close();
+    } };
   }
+  let services = await openServices(persistence ?? { accounts: store, trust: trustStore });
   let closed = false, closing, active = 0;
+  let ready = true, serviceEpoch = 0, attempts = 0, recoveryTimer, recoveryWork, retired;
+  function scheduleRecovery() {
+    if (closed || recoveryTimer || recoveryWork || persistence?.failure !== 'transient') return;
+    const wait = Math.max(persistence.retryAfter, Math.min(60000, 1000 * 2 ** Math.min(attempts++, 6)));
+    recoveryTimer = setTimeout(() => {
+      recoveryTimer = undefined;
+      recoveryWork = (async () => {
+        await retired;
+        const stores = await persistence.recover();
+        if (closed) return;
+        const next = await openServices(stores);
+        if (closed) { await next.close(); return; }
+        services = next;
+        ready = true;
+        attempts = 0;
+      })().catch(() => {
+        if (!closed && persistence.failure === null) persistence.block();
+        report();
+      }).finally(() => {
+        recoveryWork = undefined;
+        scheduleRecovery();
+      });
+    }, wait);
+    recoveryTimer.unref();
+  }
+  const unlisten = persistence?.onFailure(() => {
+    ready = false;
+    serviceEpoch++;
+    retired = services.close();
+    void retired.catch(report);
+    if (persistence.failure !== 'transient') {
+      clearTimeout(recoveryTimer); recoveryTimer = undefined;
+    }
+    scheduleRecovery();
+  });
   const sockets = new Set(), rates = new Map();
   server.maxConnections = 160;
   server.maxHeadersCount = 32;
@@ -169,6 +215,7 @@ export async function createHostedService({ origin, managedIngress, store, andro
     if (['/v1/remote/mac/begin', '/v1/remote/mac/register'].includes(req.url) && ++rate.bootstrap > 20) fail(429);
   }
   server.on('request', async (req, res) => {
+    const requestEpoch = serviceEpoch;
     for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
     let reserved = false;
     const timer = setTimeout(() => res.destroy(), 5000);
@@ -179,11 +226,12 @@ export async function createHostedService({ origin, managedIngress, store, andro
     });
     try {
       checkIngress(req);
-      if (ingress.health(req, res)) return;
+      if (ingress.health(req, res, { available: ready })) return;
+      if (!ready) fail(503);
       if (active >= 16) fail(503);
       active++; reserved = true;
       if (req.url === '/.well-known/assetlinks.json') {
-        accountServer.emit('request', req, res);
+        services.accountServer.emit('request', req, res);
         return;
       }
       if (ASSETS.has(req.url)) {
@@ -205,7 +253,7 @@ export async function createHostedService({ origin, managedIngress, store, andro
           size += chunk.length;
           if (size > BODY_LIMIT) tooLarge(req, res);
         });
-        accountServer.emit('request', req, res);
+        services.accountServer.emit('request', req, res);
         return;
       }
       if (req.url.startsWith('/v1/remote/mac/')) native(req);
@@ -213,15 +261,18 @@ export async function createHostedService({ origin, managedIngress, store, andro
       bodyHeaders(req);
       const data = await json(req, res);
       if (closed || res.destroyed || res.writableEnded) return;
+      if (!ready || requestEpoch !== serviceEpoch) fail(503);
       shape(data, FIELDS.get(req.url));
+      const authority = services.authority;
       let result;
       switch (req.url) {
-        case '/v1/remote/mac/begin': result = authority.beginMac(data); break;
-        case '/v1/remote/mac/register': result = authority.registerMac(data); break;
+        case '/v1/remote/mac/begin': result = await authority.beginMac(data); break;
+        case '/v1/remote/mac/register': result = await authority.registerMac(data); break;
         case '/v1/remote/pair': result = await authority.requestPair(req, data); break;
-        case '/v1/remote/mac/status': result = authority.macStatus(bearer(req)); break;
-        case '/v1/remote/mac/decision': result = authority.decidePair(bearer(req), data); break;
-        case '/v1/remote/mac/revoke': result = authority.revokeDevice(bearer(req), data); break;
+        case '/v1/remote/mac/status': result = await authority.macStatus(bearer(req)); break;
+        case '/v1/remote/mac/invite': result = await authority.invite(bearer(req)); break;
+        case '/v1/remote/mac/decision': result = await authority.decidePair(bearer(req), data); break;
+        case '/v1/remote/mac/revoke': result = await authority.revokeDevice(bearer(req), data); break;
         case '/v1/remote/grant/begin':
           if (data.role === 'mac') {
             native(req);
@@ -233,7 +284,7 @@ export async function createHostedService({ origin, managedIngress, store, andro
           break;
         case '/v1/remote/grant/finish':
           if (req.headers.origin === undefined) native(req); else browser(req, origin);
-          result = authority.finishGrant(data, req);
+          result = await authority.finishGrant(data, req);
           if (result.role === 'phone') {
             browser(req, origin);
             const age = Math.min(30, Math.floor((result.expiresAt - Date.now()) / 1000));
@@ -264,10 +315,11 @@ export async function createHostedService({ origin, managedIngress, store, andro
   server.on('upgrade', (req, socket, head) => {
     try {
       checkIngress(req);
+      if (!ready) fail(503);
       if (req.url !== '/v1/relay') fail(404);
       limit(req);
       if (req.headers.origin === undefined) native(req); else browser(req, origin, true);
-      relayServer.emit('upgrade', req, socket, head);
+      services.relayServer.emit('upgrade', req, socket, head);
     } catch (error) {
       const status = error.status ?? 500;
       socket.end(`HTTP/1.1 ${status} ${STATUS_CODES[status]}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
@@ -281,11 +333,14 @@ export async function createHostedService({ origin, managedIngress, store, andro
     close() {
       if (closing) return closing;
       closed = true;
+      clearTimeout(recoveryTimer); unlisten?.();
       closing = (async () => {
-        accounts.close(); authority.close(); rates.clear();
+        const stopping = services.close();
+        rates.clear();
         const stopped = server.listening ? new Promise(resolve => server.close(resolve)) : Promise.resolve();
         server.closeAllConnections();
-        await relay.close();
+        await stopping;
+        await recoveryWork;
         for (const socket of sockets) socket.destroy();
         await stopped;
       })();
@@ -306,19 +361,28 @@ export async function main() {
   if (!/^[1-9][0-9]{0,4}$/.test(process.env.PORT ?? '') || Number(process.env.PORT) > 65535)
     throw new Error('Render PORT is required.');
   for (const [, [file]] of ASSETS) await readFile(resolve(ROOT, 'public', file));
-  const directory = resolve(ROOT, '.hosted-data');
-  await privateDirectory(directory);
-  const app = await createHostedService({ origin, managedIngress: 'render-free', android, store: stateStore(directory),
-    reportError: () => process.stderr.write('Hosted service operation failed.\n') });
+  const durable = await createFirebaseStores({ origin });
+  let app;
   try {
+    let store = durable?.accounts;
+    if (!durable) {
+      const directory = resolve(ROOT, '.hosted-data');
+      await privateDirectory(directory);
+      store = stateStore(directory);
+    }
+    app = await createHostedService({ origin, managedIngress: 'render-free', android,
+      store, trustStore: durable?.trust, persistence: durable,
+      reportError: () => process.stderr.write('Hosted service operation failed.\n') });
     await new Promise((resolve, reject) => {
       app.server.once('error', reject);
       app.server.listen(Number(process.env.PORT), '0.0.0.0', () => {
         app.server.off('error', reject); resolve();
       });
     });
-  } catch (error) { await app.close(); throw error; }
-  return app;
+  } catch (error) { await app?.close(); await durable?.close(); throw error; }
+  return Object.freeze({ server: app.server, close: async () => {
+    try { await app.close(); } finally { await durable?.close(); }
+  } });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
@@ -327,7 +391,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   main().then(value => { app = value; if (stopping) return app.close(); }).catch(() => {
-    process.stderr.write('Hosted startup failed; check Render origin, PORT, Android certificates, assets and private storage.\n');
+    process.stderr.write('Hosted startup failed; check Render origin, PORT, Android certificates, assets and Firebase/private storage.\n');
     process.exitCode = 1;
   });
 }

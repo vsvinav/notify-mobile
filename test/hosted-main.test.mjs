@@ -8,6 +8,8 @@ import { resolve } from 'node:path';
 import { createHostedService } from '../src/hosted-main.mjs';
 import { isoCBOR } from '@simplewebauthn/server/helpers';
 import WebSocket from 'ws';
+import { createFirestoreStores } from '../src/firestore-store.mjs';
+import { firestoreFixture } from './fixtures/firestore.mjs';
 
 const hostname = 'notify-test.onrender.com', origin = `https://${hostname}`;
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';
@@ -21,10 +23,11 @@ function deviceKey() {
     Buffer.from('Notify remote authorization v1\0'), Buffer.from(flow.challenge)]), privateKey).toString('base64url') }) };
 }
 
-async function registerAccount(app, credentialOrigin = origin) {
+async function registerAccount(app, credentialOrigin = origin, retainAuthenticator = false) {
   const options = await app.request('/v1/account/register/options', { body: { name: 'Hosted account' }, headers: { origin } });
   assert.equal(options.status, 200);
-  const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const registrationUserID = options.json().user.id;
+  const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
   const jwk = publicKey.export({ format: 'jwk' }), credential = randomBytes(32);
   const cose = isoCBOR.encode(new Map([[1, 2], [3, -7], [-1, 1],
     [-2, new Uint8Array(Buffer.from(jwk.x, 'base64url'))], [-3, new Uint8Array(Buffer.from(jwk.y, 'base64url'))]]));
@@ -40,8 +43,28 @@ async function registerAccount(app, credentialOrigin = origin) {
   const verified = await app.request('/v1/account/register/verify', { body: { response }, headers: {
     origin, cookie: options.headers['set-cookie'].map(value => value.split(';')[0]).join('; ') } });
   assert.equal(verified.status, 200);
-  return verified.headers['set-cookie'].filter(value => !value.includes('Max-Age=0'))
+  const cookie = verified.headers['set-cookie'].filter(value => !value.includes('Max-Age=0'))
     .map(value => value.split(';')[0]).join('; ');
+  if (!retainAuthenticator) return cookie;
+  let counter = 0;
+  return { cookie, account: verified.json().account, async login() {
+    const options = await app.request('/v1/account/login/options', { body: {}, headers: { origin } });
+    const clientDataJSON = Buffer.from(JSON.stringify({ type: 'webauthn.get',
+      challenge: options.json().challenge, origin: credentialOrigin, crossOrigin: false }));
+    const count = Buffer.alloc(4); count.writeUInt32BE(++counter);
+    const authData = Buffer.concat([createHash('sha256').update(hostname).digest(), Buffer.from([5]), count]);
+    const result = await app.request('/v1/account/login/verify', { body: { response: {
+      id: response.id, rawId: response.rawId, type: 'public-key', clientExtensionResults: {},
+      response: { clientDataJSON: clientDataJSON.toString('base64url'),
+        authenticatorData: authData.toString('base64url'), userHandle: registrationUserID,
+        signature: sign('sha256', Buffer.concat([authData, createHash('sha256').update(clientDataJSON).digest()]),
+          privateKey).toString('base64url') }
+    } }, headers: { origin, cookie: options.headers['set-cookie'].map(value => value.split(';')[0]).join('; ') } });
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.json().account, verified.json().account);
+    return result.headers['set-cookie'].filter(value => !value.includes('Max-Age=0'))
+      .map(value => value.split(';')[0]).join('; ');
+  } };
 }
 
 async function fixture(t, options = {}) {
@@ -56,11 +79,16 @@ async function fixture(t, options = {}) {
   await mkdir(resolve(directory, 'remote-crypto'));
   await writeFile(resolve(directory, 'remote-crypto/LICENSES.txt'), 'Dependency notices fixture');
   const errors = [];
-  const app = await createHostedService({ origin, managedIngress: 'render-free', android: options.android,
-    publicDirectory: directory, store: { read: async () => null, write: async () => {} },
-    reportError: error => errors.push(error.message) });
-  app.server.listen(0, '127.0.0.1');
-  await once(app.server, 'listening');
+  let app;
+  async function start() {
+    const stores = await options.storageFactory?.();
+    app = await createHostedService({ origin, managedIngress: 'render-free', android: options.android,
+      publicDirectory: directory, store: stores?.accounts ?? { read: async () => null, write: async () => {} },
+      trustStore: stores?.trust, persistence: stores, reportError: error => errors.push(error.message) });
+    app.server.listen(0, '127.0.0.1');
+    await once(app.server, 'listening');
+  }
+  await start();
   t.after(async () => {
     await app.close();
     await rm(directory, { recursive: true, force: true });
@@ -87,8 +115,184 @@ async function fixture(t, options = {}) {
       } else req.end(data);
     });
   }
-  return { ...app, request, errors };
+  return { get server() { return app.server; }, close: () => app.close(), request, errors,
+    restart: async () => { await app.close(); await start(); } };
 }
+
+test('hosted durable accounts and approved pairing survive reconstruction without saving sessions or grants', async t => {
+  const db = firestoreFixture();
+  const app = await fixture(t, { storageFactory: () => createFirestoreStores({ firestore: db.firestore, origin }) });
+  const account = await registerAccount(app, origin, true);
+  const mac = deviceKey(), phone = deviceKey(), macID = randomUUID(), deviceID = randomUUID();
+  const call = async (path, body, headers) => {
+    const result = await app.request(`/v1/remote/${path}`, { body, headers });
+    assert.equal(result.status, 200, `${path}: ${result.text}`);
+    return result;
+  };
+  const bootstrap = await call('mac/begin', { macID, publicKey: mac.publicKey });
+  const host = (await call('mac/register', mac.finish(bootstrap.json()))).json();
+  const native = { authorization: `Bearer ${host.credential}` };
+  const pending = (await call('pair', { setupID: host.setupID, deviceID, publicKey: phone.publicKey, name: 'Phone' },
+    { origin, cookie: account.cookie })).json();
+  await call('mac/decision', { id: pending.id, allow: true }, native);
+  const oldFlow = (await call('grant/begin', { role: 'phone', macID, deviceID },
+    { origin, cookie: account.cookie })).json();
+  const oldGrant = await call('grant/finish', phone.finish(oldFlow), { origin, cookie: account.cookie });
+  const oldRelayCookie = oldGrant.headers['set-cookie'][0].split(';')[0];
+  await app.restart();
+  assert.equal((await app.request('/v1/account/session', { body: {}, headers: { origin, cookie: account.cookie } })).status, 401);
+  const state = (await call('mac/status', {}, native)).json();
+  assert.deepEqual(state.account, account.account);
+  assert.deepEqual(state.devices, [{ deviceID, publicKey: phone.publicKey, name: 'Phone' }]);
+  const invitation = (await call('mac/invite', {}, native)).json();
+  assert.notEqual(invitation.setupID, host.setupID);
+  assert.equal((await app.request('/v1/remote/mac/invite', {
+    body: {}, headers: { origin, cookie: account.cookie }
+  })).status, 403);
+  assert.equal((await app.request('/v1/remote/grant/finish', {
+    body: phone.finish(oldFlow), headers: { origin, cookie: account.cookie }
+  })).status, 401);
+  const cookie = await account.login();
+  const fresh = (await call('grant/begin', { role: 'phone', macID, deviceID }, { origin, cookie })).json();
+  const signed = await call('grant/finish', phone.finish(fresh), { origin, cookie });
+  assert.equal(signed.json().approved, true);
+  const macFlow = (await call('grant/begin', { role: 'mac', deviceID }, native)).json();
+  assert.equal((await call('grant/finish', mac.finish(macFlow))).json().role, 'mac');
+  const writes = db.metrics.writes;
+  await call('mac/status', {}, native);
+  assert.equal(db.metrics.writes, writes, 'Polling must not write Firestore');
+  const stored = JSON.stringify([...db.documents.values()]);
+  for (const secret of [host.credential, host.setupID, oldFlow.challenge, oldRelayCookie.split('=')[1],
+    account.cookie.split('=')[1], cookie.split('=')[1]]) assert.ok(!stored.includes(secret));
+  assert.equal(JSON.parse(db.documents.get('notifyState/accounts').json).accounts[0].credential.counter, 1);
+  await call('mac/revoke', { deviceID }, native);
+  await app.restart();
+  assert.deepEqual((await call('mac/status', {}, native)).json().devices, []);
+  const nextCookie = await account.login();
+  assert.equal((await app.request('/v1/remote/grant/begin', {
+    body: { role: 'phone', macID, deviceID }, headers: { origin, cookie: nextCookie }
+  })).status, 401);
+});
+
+async function healthy(app) {
+  const deadline = Date.now() + 5000;
+  while ((await app.request('/healthz')).status !== 200) {
+    assert.ok(Date.now() < deadline, 'Recovery did not restore readiness');
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
+
+test('hosted transient recovery preserves pairing, discards sessions, and reloads an unknown write outcome', async t => {
+  const db = firestoreFixture();
+  const app = await fixture(t, { storageFactory: () => createFirestoreStores({ firestore: db.firestore, origin }) });
+  const account = await registerAccount(app, origin, true);
+  let cookie = account.cookie;
+  const mac = deviceKey(), macID = randomUUID(), deviceID = randomUUID(), phone = deviceKey();
+  const call = (path, body, headers = {}) => app.request(`/v1/remote/${path}`, { body, headers });
+  const bootstrap = await call('mac/begin', { macID, publicKey: mac.publicKey });
+  const host = (await call('mac/register', mac.finish(bootstrap.json()))).json();
+  const native = { authorization: `Bearer ${host.credential}` };
+  const pending = (await call('pair', { setupID: host.setupID, deviceID, publicKey: phone.publicKey, name: 'Phone' },
+    { origin, cookie })).json();
+  assert.equal((await call('mac/decision', { id: pending.id, allow: true }, native)).status, 200);
+  const oldChallenge = (await call('grant/begin', { role: 'phone', macID, deviceID }, { origin, cookie })).json();
+  const macChallenge = (await call('grant/begin', { role: 'mac', deviceID }, native)).json();
+  const oldGrant = (await call('grant/finish', mac.finish(macChallenge))).json();
+  const socket = new WebSocket(`ws://127.0.0.1:${app.server.address().port}/v1/relay`, 'notify-relay-v1',
+    { headers: { host: hostname, 'x-forwarded-proto': 'https', authorization: `Bearer ${oldGrant.credential}` } });
+  await once(socket, 'open');
+  const socketClosed = once(socket, 'close');
+  const generation = db.documents.get('notifyState/fence').generation;
+  db.fail(true, 14);
+  assert.equal((await app.request('/v1/account/session', { body: {}, headers: { origin, cookie } })).status, 503);
+  await socketClosed;
+  const reads = db.metrics.reads;
+  for (let i = 0; i < 5; i++) assert.equal((await app.request('/healthz')).status, 503);
+  assert.equal(db.metrics.reads, reads, 'Readiness must not query Firestore');
+  db.fail(false);
+  await healthy(app);
+  assert.equal(db.documents.get('notifyState/fence').generation, generation);
+  assert.equal((await app.request('/v1/account/session', { body: {}, headers: { origin, cookie } })).status, 401);
+  cookie = await account.login();
+  assert.equal((await call('grant/finish', phone.finish(oldChallenge), { origin, cookie })).status, 401);
+  assert.equal((await call('grant/renew', mac.finish(oldGrant.renewal), native)).status, 401);
+  assert.deepEqual((await call('mac/status', {}, native)).json().devices,
+    [{ deviceID, publicKey: phone.publicKey, name: 'Phone' }]);
+  const challenge = (await call('grant/begin', { role: 'phone', macID, deviceID }, { origin, cookie })).json();
+  assert.equal((await call('grant/finish', phone.finish(challenge), { origin, cookie })).status, 200);
+  const invite = (await call('mac/invite', {}, native)).json();
+  const secondID = randomUUID(), second = deviceKey();
+  const secondPending = (await call('pair', { setupID: invite.setupID, deviceID: secondID,
+    publicKey: second.publicKey, name: 'Second phone' }, { origin, cookie })).json();
+  db.afterCommit(writes => {
+    if (!writes.some(([path]) => path === 'notifyState/trust')) return;
+    db.afterCommit(undefined);
+    throw Object.assign(new Error('Synthetic lost commit response'), { code: 4 });
+  });
+  assert.equal((await call('mac/decision', { id: secondPending.id, allow: true }, native)).status, 503);
+  await healthy(app);
+  assert.equal(db.documents.get('notifyState/fence').generation, generation);
+  assert.equal((await app.request('/v1/account/session', { body: {}, headers: { origin, cookie } })).status, 401);
+  cookie = await account.login();
+  assert.equal((await call('mac/status', {}, native)).json().devices.length, 2);
+  const recovered = (await call('grant/begin', { role: 'phone', macID, deviceID: secondID }, { origin, cookie })).json();
+  assert.equal((await call('grant/finish', second.finish(recovered), { origin, cookie })).status, 200);
+});
+
+test('one backoff coordinator, not client Retry requests, drives transient recovery', async t => {
+  const db = firestoreFixture();
+  const app = await fixture(t, { storageFactory: () => createFirestoreStores({ firestore: db.firestore, origin }) });
+  db.fail(true, 14);
+  assert.equal((await app.request('/v1/account/login/options', { body: {}, headers: { origin } })).status, 503);
+  const before = db.metrics.transactions, writes = db.metrics.writes;
+  for (let i = 0; i < 10; i++)
+    assert.equal((await app.request('/v1/account/login/options', { body: {}, headers: { origin } })).status, 503);
+  assert.equal(db.metrics.transactions, before);
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  assert.equal(db.metrics.transactions, before + 1);
+  for (let i = 0; i < 10; i++) await app.request('/healthz');
+  assert.equal(db.metrics.transactions, before + 1);
+  db.fail(false);
+  await healthy(app);
+  assert.equal(db.metrics.transactions, before + 4, 'One failed attempt, one barrier, two service reloads');
+  assert.equal(db.metrics.writes, writes + 1, 'Only the recovery incarnation is written');
+});
+
+test('hosted shutdown cancels a queued recovery rather than reviving closed services', async t => {
+  const db = firestoreFixture();
+  const app = await fixture(t, { storageFactory: () => createFirestoreStores({ firestore: db.firestore, origin }) });
+  db.fail(true, 14);
+  assert.equal((await app.request('/v1/account/login/options', { body: {}, headers: { origin } })).status, 503);
+  const transactions = db.metrics.transactions;
+  await app.close();
+  db.fail(false);
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  assert.equal(db.metrics.transactions, transactions);
+});
+
+test('hosted recovery never retakes a successor fence or serves corrupt reloaded accounts', async t => {
+  for (const failure of ['successor', 'corrupt', 'permission']) {
+    const db = firestoreFixture();
+    let persistence;
+    const app = await fixture(t, { storageFactory: async () =>
+      persistence = await createFirestoreStores({ firestore: db.firestore, origin }) });
+    db.fail(true, failure === 'permission' ? 7 : 14);
+    assert.equal((await app.request('/v1/account/login/options', { body: {}, headers: { origin } })).status, 503);
+    db.fail(false);
+    if (failure === 'successor') await createFirestoreStores({ firestore: db.firestore, origin });
+    if (failure === 'corrupt') db.documents.get('notifyState/accounts').json =
+      JSON.stringify({ version: 1, origin, accounts: [{}] });
+    const generation = db.documents.get('notifyState/fence').generation;
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal((await app.request('/healthz')).status, 503);
+    assert.notEqual(persistence.failure, 'transient');
+    assert.equal(db.documents.get('notifyState/fence').generation, generation);
+    const reads = db.metrics.reads;
+    for (let i = 0; i < 3; i++) await app.request('/healthz');
+    assert.equal(db.metrics.reads, reads);
+    await app.close();
+  }
+});
 
 test('hosted factory never enables plaintext ingress by default', async () => {
   await assert.rejects(createHostedService({ origin,

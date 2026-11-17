@@ -436,6 +436,13 @@ export async function createRemoteCompanion({ directory, origin, emit,
         catch (error) { if (error.status !== 401) throw error; }
       }
       if (!existing) await register();
+      else {
+        const invitation = await api('mac/invite', {}, state.credential);
+        if (!/^[\w-]{43}$/.test(invitation.setupID) || !Number.isSafeInteger(invitation.expiresAt) ||
+          invitation.expiresAt <= Date.now() || invitation.expiresAt > Date.now() + 180000)
+          fail(502, 'Invalid pairing invitation.');
+        await save(current => ({ ...current, setupID: invitation.setupID }));
+      }
       enrollmentError = undefined;
       setupID = state.setupID ?? undefined;
       message = "Scan this Mac's code and sign in on your phone."; status(); return;
