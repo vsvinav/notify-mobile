@@ -16,6 +16,10 @@ const origin = 'https://accounts.notify.invalid', rpID = 'accounts.notify.invali
 const flowCookie = '__Host-notify-account-flow', sessionCookie = '__Host-notify-account';
 const b64 = value => Buffer.from(value).toString('base64url');
 const hash = value => createHash('sha256').update(value).digest();
+const androidFingerprint = '00:01:02:03:04:05:06:07:08:09:0A:0B:0C:0D:0E:0F:10:11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F';
+const androidOrigin = 'android:apk-key-hash:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8';
+const otherAndroidOrigin = `android:apk-key-hash:${b64(Buffer.alloc(32, 99))}`;
+const androidConfig = () => ({ packageName: 'app.notify.android', sha256CertFingerprints: [androidFingerprint] });
 
 function authenticator(authOrigin = origin) {
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
@@ -37,7 +41,7 @@ function authenticator(authOrigin = origin) {
     const count = Buffer.alloc(4);
     count.writeUInt32BE(extra.counter ?? (registration ? counter : ++counter));
     const length = Buffer.alloc(2); length.writeUInt16BE(credentialID.length);
-    const authData = Buffer.concat([hash(extra.rpID ?? new URL(authOrigin).hostname), Buffer.from([flags]), count,
+    const authData = Buffer.concat([hash(extra.rpID ?? options.rp?.id ?? options.rpId), Buffer.from([flags]), count,
       ...(registration ? [Buffer.alloc(16), length, credentialID, Buffer.from(cose)] : [])]);
     const result = { id: b64(credentialID), rawId: b64(credentialID), type: 'public-key', clientExtensionResults: {},
       response: { clientDataJSON: b64(clientDataJSON) } };
@@ -64,7 +68,7 @@ async function fixture(t, override = {}) {
   async function start() {
     server = override.managedIngress ? http.createServer() : https.createServer(tls);
     service = await createAccountService({ server, origin: override.origin ?? origin, store, now: () => clock,
-      managedIngress: override.managedIngress, reportError: error => errors.push(error) });
+      managedIngress: override.managedIngress, android: override.android, reportError: error => errors.push(error) });
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
   }
   async function stop() {
@@ -151,6 +155,157 @@ test('real passkey registration/login persist public credentials and issue accou
   const oldCookie = browser.cookies.get(sessionCookie);
   assert.equal((await browser.request('logout')).status, 200);
   assert.equal((await browser.request('session', {}, { cookie: `${sessionCookie}=${oldCookie}` })).status, 401);
+});
+
+test('allowlisted Android origins use the real verifier and retain browser credential interoperability', async t => {
+  const config = androidConfig();
+  const f = await fixture(t, { android: config }), native = f.browser(), auth = authenticator(androidOrigin);
+  config.sha256CertFingerprints[0] = Buffer.alloc(32, 99).toString('hex').toUpperCase().match(/../g).join(':');
+  const { result } = await native.register(auth);
+  await native.request('logout');
+  const login = await native.request('login/options');
+  const signedIn = await native.request('login/verify', { response: auth.login(login.body) });
+  assert.equal(signedIn.status, 200);
+  assert.deepEqual(signedIn.body.account, result.body.account);
+  const webLogin = await native.request('login/options');
+  assert.equal((await native.request('login/verify', {
+    response: auth.login(webLogin.body, { clientData: { origin } })
+  })).status, 200);
+  const web = f.browser(), { auth: webAuth } = await web.register();
+  const nativeLogin = await web.request('login/options');
+  assert.equal((await web.request('login/verify', {
+    response: webAuth.login(nativeLogin.body, { clientData: { origin: androidOrigin } })
+  })).status, 200);
+  assert.deepEqual(f.errors, []);
+});
+
+test('Android verification rejects unlisted and lookalike origins, wrong RP and missing UV', async t => {
+  const f = await fixture(t, { android: androidConfig() }), browser = f.browser();
+  const { auth } = await browser.register(authenticator(androidOrigin));
+  for (const extra of [
+    { clientData: { origin: otherAndroidOrigin } },
+    { clientData: { origin: `${androidOrigin}=` } },
+    { clientData: { origin: `https://${androidOrigin}` } },
+    { clientData: { origin: `${origin}.evil.invalid` } },
+    { clientData: { origin: `${origin}/` } },
+    { clientData: { origin: `android:apk-key-hash:${androidFingerprint}` } },
+    { clientData: { origin: 'android:app.notify.android' } },
+    { rpID: 'app.notify.android' }, { uv: false }, { up: false },
+    { clientData: { crossOrigin: true } }
+  ]) {
+    const registration = await browser.request('register/options', { name: 'Rejected Android' });
+    assert.equal((await browser.request('register/verify', {
+      response: authenticator(androidOrigin).register(registration.body, extra)
+    })).status, 401, JSON.stringify(extra));
+    const login = await browser.request('login/options');
+    assert.equal((await browser.request('login/verify', {
+      response: auth.login(login.body, extra)
+    })).status, 401, JSON.stringify(extra));
+  }
+});
+
+test('Android HTTP headers cannot select accepted credential origins or replace the public Origin', async t => {
+  const f = await fixture(t, { android: androidConfig() }), browser = f.browser();
+  for (const value of [undefined, androidOrigin, otherAndroidOrigin])
+    assert.equal((await browser.request('login/options', {}, { origin: value })).status, 403);
+  const options = await browser.request('register/options', { name: 'Header spoof' });
+  assert.equal((await browser.request('register/verify', {
+    response: authenticator(otherAndroidOrigin).register(options.body)
+  }, { 'x-android-origin': otherAndroidOrigin, 'x-android-package': 'app.notify.android',
+    'x-android-certificate': androidFingerprint })).status, 401);
+  assert.equal((await browser.request('session')).status, 401);
+  const { auth } = await browser.register(authenticator(androidOrigin));
+  const login = await browser.request('login/options');
+  assert.equal((await browser.request('login/verify', {
+    response: auth.login(login.body, { clientData: { origin: otherAndroidOrigin } })
+  }, { 'x-android-origin': androidOrigin })).status, 401);
+  const spoofedLogin = await browser.request('login/options');
+  const response = auth.login(spoofedLogin.body, { clientData: { origin: otherAndroidOrigin } });
+  const clientData = JSON.parse(Buffer.from(response.response.clientDataJSON, 'base64url'));
+  response.response.clientDataJSON = b64(JSON.stringify({ ...clientData, origin: androidOrigin }));
+  assert.equal((await browser.request('login/verify', { response })).status, 401);
+});
+
+test('Android is disabled by default for registration and login, while browser credentials still work', async t => {
+  const f = await fixture(t), browser = f.browser();
+  const options = await browser.request('register/options', { name: 'Disabled Android' });
+  assert.equal((await browser.request('register/verify', {
+    response: authenticator(androidOrigin).register(options.body)
+  })).status, 401);
+  const { auth } = await browser.register();
+  const login = await browser.request('login/options');
+  assert.equal((await browser.request('login/verify', {
+    response: auth.login(login.body, { clientData: { origin: androidOrigin } })
+  })).status, 401);
+  const browserLogin = await browser.request('login/options');
+  assert.equal((await browser.request('login/verify', { response: auth.login(browserLogin.body) })).status, 200);
+});
+
+test('Android configuration rejects malformed, partial, duplicate or excessive identities before storage access', async () => {
+  let reads = 0;
+  const store = { read: async () => { reads++; return null; }, write: async () => {} };
+  for (const android of [
+    null, {}, [], false, { packageName: 'app.notify.android' },
+    { sha256CertFingerprints: [androidFingerprint] },
+    ...['', 'app..notify', 'app.notify.android ', 'app.notify.other', 'app.notify.android/debug']
+      .map(packageName => ({ ...androidConfig(), packageName })),
+    ...[[], [androidFingerprint, androidFingerprint], [androidFingerprint.toLowerCase()],
+      [androidFingerprint.replaceAll(':', '')], [` ${androidFingerprint}`], [`${androidFingerprint}:FF`],
+      [`${androidFingerprint}\n`], Array(1),
+      [androidOrigin], ['SHA256: ' + androidFingerprint], [null], androidFingerprint,
+      Array.from({ length: 5 }, (_, index) => Buffer.alloc(32, index).toString('hex').toUpperCase().match(/../g).join(':'))]
+      .map(sha256CertFingerprints => ({ ...androidConfig(), sha256CertFingerprints })),
+    { ...androidConfig(), expectedOrigin: otherAndroidOrigin }
+  ]) {
+    await assert.rejects(createAccountService({ server: https.createServer(), origin, store, android,
+      reportError() {} }), /Android/, JSON.stringify(android));
+  }
+  assert.equal(reads, 0);
+});
+
+test('up to four configured signing certificates support rotation without trusting a fifth', async t => {
+  const fingerprints = Array.from({ length: 4 }, (_, index) =>
+    Buffer.alloc(32, index).toString('hex').toUpperCase().match(/../g).join(':'));
+  const f = await fixture(t, { android: { ...androidConfig(), sha256CertFingerprints: fingerprints } });
+  for (let index = 0; index < 4; index++) {
+    const browser = f.browser(), auth = authenticator(`android:apk-key-hash:${b64(Buffer.alloc(32, index))}`);
+    await browser.register(auth);
+    const options = await browser.request('login/options');
+    assert.equal((await browser.request('login/verify', { response: auth.login(options.body) })).status, 200);
+  }
+  const browser = f.browser(), options = await browser.request('register/options', { name: 'Unlisted fifth cert' });
+  assert.equal((await browser.request('register/verify', {
+    response: authenticator(`android:apk-key-hash:${b64(Buffer.alloc(32, 4))}`).register(options.body)
+  })).status, 401);
+  const dal = await browser.request('/.well-known/assetlinks.json', {}, { origin: undefined }, 'GET');
+  assert.deepEqual(dal.body[0].target.sha256_cert_fingerprints, fingerprints);
+});
+
+test('the exact public Digital Asset Links route works over verified TLS without account Origin or cookies', async t => {
+  const f = await fixture(t, { android: androidConfig() }), browser = f.browser();
+  const dal = await browser.request('/.well-known/assetlinks.json', {}, { origin: undefined, cookie: undefined }, 'GET');
+  assert.equal(dal.status, 200);
+  assert.deepEqual(dal.body, [{ relation: ['delegate_permission/common.get_login_creds'],
+    target: { namespace: 'android_app', package_name: 'app.notify.android',
+      sha256_cert_fingerprints: [androidFingerprint] } }]);
+  assert.equal(dal.headers['content-type'], 'application/json; charset=utf-8');
+  assert.equal(dal.headers['cache-control'], 'no-store');
+  assert.equal(dal.headers['set-cookie'], undefined);
+  assert.equal(dal.headers.location, undefined);
+  for (const method of ['POST', 'PUT', 'OPTIONS'])
+    assert.equal((await browser.request('/.well-known/assetlinks.json', {}, { origin: undefined }, method)).status, 405);
+  for (const path of ['/.well-known/assetlinks.json?package=evil', '/.well-known/assetlinks.json/',
+    '/.well-known/other.json', '/assetlinks.json'])
+    assert.notEqual((await browser.request(path, {}, { origin: undefined }, 'GET')).status, 200);
+  for (const headers of [{ host: 'evil.invalid' }, { origin: otherAndroidOrigin }, { origin: 'https://evil.invalid' }])
+    assert.equal((await browser.request('/.well-known/assetlinks.json', {}, headers, 'GET')).status, 403);
+});
+
+test('public Digital Asset Links declares no Android trust by default', async t => {
+  const f = await fixture(t);
+  const result = await f.browser().request('/.well-known/assetlinks.json', {}, { origin: undefined }, 'GET');
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body, []);
 });
 
 test('ceremonies bind to one browser and are consumed before failed or repeated verification', { timeout: 10000 }, async t => {

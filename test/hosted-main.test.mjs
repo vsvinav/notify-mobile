@@ -21,7 +21,7 @@ function deviceKey() {
     Buffer.from('Notify remote authorization v1\0'), Buffer.from(flow.challenge)]), privateKey).toString('base64url') }) };
 }
 
-async function registerAccount(app) {
+async function registerAccount(app, credentialOrigin = origin) {
   const options = await app.request('/v1/account/register/options', { body: { name: 'Hosted account' }, headers: { origin } });
   assert.equal(options.status, 200);
   const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
@@ -34,7 +34,7 @@ async function registerAccount(app) {
   const response = { id: credential.toString('base64url'), rawId: credential.toString('base64url'),
     type: 'public-key', clientExtensionResults: {}, response: {
       clientDataJSON: Buffer.from(JSON.stringify({ type: 'webauthn.create', challenge: options.json().challenge,
-        origin, crossOrigin: false })).toString('base64url'),
+        origin: credentialOrigin, crossOrigin: false })).toString('base64url'),
       attestationObject: Buffer.from(isoCBOR.encode(new Map([['fmt', 'none'],
         ['authData', new Uint8Array(authData)], ['attStmt', new Map()]]))).toString('base64url') } };
   const verified = await app.request('/v1/account/register/verify', { body: { response }, headers: {
@@ -44,7 +44,7 @@ async function registerAccount(app) {
     .map(value => value.split(';')[0]).join('; ');
 }
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const previous = { RENDER: process.env.RENDER, RENDER_EXTERNAL_HOSTNAME: process.env.RENDER_EXTERNAL_HOSTNAME };
   process.env.RENDER = 'true';
   process.env.RENDER_EXTERNAL_HOSTNAME = hostname;
@@ -56,7 +56,7 @@ async function fixture(t) {
   await mkdir(resolve(directory, 'remote-crypto'));
   await writeFile(resolve(directory, 'remote-crypto/LICENSES.txt'), 'Dependency notices fixture');
   const errors = [];
-  const app = await createHostedService({ origin, managedIngress: 'render-free',
+  const app = await createHostedService({ origin, managedIngress: 'render-free', android: options.android,
     publicDirectory: directory, store: { read: async () => null, write: async () => {} },
     reportError: error => errors.push(error.message) });
   app.server.listen(0, '127.0.0.1');
@@ -168,6 +168,41 @@ test('account ceremonies receive the real request with origin and flow cookies',
     assert.equal((await app.request('/v1/account/login/options', { body: {}, headers })).status, 403);
   }
   assert.equal((await app.request('/v1/account/session', { body: {}, headers: { origin } })).status, 401);
+});
+
+test('hosted ingress exposes only the exact DAL GET and forwards configured Android origins to accounts', async t => {
+  const fingerprint = '00:01:02:03:04:05:06:07:08:09:0A:0B:0C:0D:0E:0F:10:11:12:13:14:15:16:17:18:19:1A:1B:1C:1D:1E:1F';
+  const app = await fixture(t, { android: { packageName: 'app.notify.android', sha256CertFingerprints: [fingerprint] } });
+  const response = await app.request('/.well-known/assetlinks.json');
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.json(), [{ relation: ['delegate_permission/common.get_login_creds'],
+    target: { namespace: 'android_app', package_name: 'app.notify.android', sha256_cert_fingerprints: [fingerprint] } }]);
+  assert.equal(response.headers['content-type'], 'application/json; charset=utf-8');
+  assert.equal(response.headers['cache-control'], 'no-store');
+  assert.equal(response.headers['set-cookie'], undefined);
+  assert.equal(response.headers.location, undefined);
+  for (const method of ['HEAD', 'POST', 'PUT', 'OPTIONS'])
+    assert.equal((await app.request('/.well-known/assetlinks.json', { method })).status, 405);
+  for (const path of ['/.well-known/assetlinks.json/', '/.well-known/assetlinks.json?package=evil',
+    '/.well-known/other.json', '/assetlinks.json', '/.well-known/%61ssetlinks.json'])
+    assert.equal((await app.request(path)).status, 404);
+  for (const headers of [{ host: 'evil.invalid' }, { 'x-forwarded-proto': 'http' },
+    { 'x-forwarded-proto': 'https,http' }, { origin: 'https://evil.invalid' }])
+    assert.equal((await app.request('/.well-known/assetlinks.json', { headers })).status, 403);
+  await registerAccount(app, 'android:apk-key-hash:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8');
+  await registerAccount(app);
+});
+
+test('hosted default DAL is empty and malformed Android configuration fails before reading storage', async t => {
+  const app = await fixture(t);
+  const response = await app.request('/.well-known/assetlinks.json');
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.json(), []);
+  let reads = 0;
+  await assert.rejects(createHostedService({ origin, managedIngress: 'render-free',
+    android: { packageName: 'app.notify.android', sha256CertFingerprints: ['not-a-certificate'] },
+    store: { read: async () => { reads++; return null; }, write: async () => {} } }), /Android/);
+  assert.equal(reads, 0);
 });
 
 test('remote native and browser routes are isolated and fields cannot inject credentials', async t => {

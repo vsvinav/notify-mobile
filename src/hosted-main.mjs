@@ -107,7 +107,7 @@ async function json(req, res) {
 }
 
 // Only the outer server listens. Inner modules receive the original request/socket.
-export async function createHostedService({ origin, managedIngress, store,
+export async function createHostedService({ origin, managedIngress, store, android,
   publicDirectory = resolve(ROOT, 'public'), reportError = () => {} } = {}) {
   if (typeof origin !== 'string' || new URL(origin).origin !== origin) throw new Error('An exact HTTPS origin is required.');
   const server = http.createServer({ maxHeaderSize: 8192, connectionsCheckingInterval: 1000 });
@@ -122,7 +122,7 @@ export async function createHostedService({ origin, managedIngress, store,
     catch (error) { if (error.code !== 'ENOENT') throw new Error('Hosted assets could not be read.'); }
   }
   const accountServer = http.createServer(), relayServer = http.createServer();
-  const accounts = await createAccountService({ server: accountServer, origin, store, managedIngress, reportError: report });
+  const accounts = await createAccountService({ server: accountServer, origin, store, managedIngress, android, reportError: report });
   let authority, relay;
   try {
     authority = createRemoteAuthority({ origin, accounts });
@@ -182,6 +182,10 @@ export async function createHostedService({ origin, managedIngress, store,
       if (ingress.health(req, res)) return;
       if (active >= 16) fail(503);
       active++; reserved = true;
+      if (req.url === '/.well-known/assetlinks.json') {
+        accountServer.emit('request', req, res);
+        return;
+      }
       if (ASSETS.has(req.url)) {
         if (!['GET', 'HEAD'].includes(req.method)) fail(405);
         const asset = assets.get(req.url);
@@ -295,12 +299,16 @@ export async function main() {
   process.umask(0o077);
   const hostname = process.env.RENDER_EXTERNAL_HOSTNAME;
   const origin = process.env.NOTIFY_ORIGIN ?? `https://${hostname}`;
+  const packageName = process.env.NOTIFY_ANDROID_PACKAGE_NAME;
+  const fingerprints = process.env.NOTIFY_ANDROID_SHA256_CERT_FINGERPRINTS;
+  const android = packageName === undefined && fingerprints === undefined ? undefined :
+    { packageName, sha256CertFingerprints: fingerprints?.split(',') };
   if (!/^[1-9][0-9]{0,4}$/.test(process.env.PORT ?? '') || Number(process.env.PORT) > 65535)
     throw new Error('Render PORT is required.');
   for (const [, [file]] of ASSETS) await readFile(resolve(ROOT, 'public', file));
   const directory = resolve(ROOT, '.hosted-data');
   await privateDirectory(directory);
-  const app = await createHostedService({ origin, managedIngress: 'render-free', store: stateStore(directory),
+  const app = await createHostedService({ origin, managedIngress: 'render-free', android, store: stateStore(directory),
     reportError: () => process.stderr.write('Hosted service operation failed.\n') });
   try {
     await new Promise((resolve, reject) => {
@@ -319,7 +327,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   main().then(value => { app = value; if (stopping) return app.close(); }).catch(() => {
-    process.stderr.write('Hosted startup failed; check Render origin, PORT, assets and private storage.\n');
+    process.stderr.write('Hosted startup failed; check Render origin, PORT, Android certificates, assets and private storage.\n');
     process.exitCode = 1;
   });
 }

@@ -78,9 +78,28 @@ function validAccount(account) {
   }
 }
 
+function androidPasskeys(config) {
+  if (config === undefined) return { origins: [], assetLinks: [] };
+  if (!shape(config, ['packageName', 'sha256CertFingerprints']) || config.packageName !== 'app.notify.android' ||
+    !Array.isArray(config.sha256CertFingerprints) || config.sha256CertFingerprints.length < 1 ||
+    config.sha256CertFingerprints.length > 4 ||
+    !Array.from(config.sha256CertFingerprints).every(value =>
+      typeof value === 'string' && /^(?:[0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(value)) ||
+    new Set(config.sha256CertFingerprints).size !== config.sha256CertFingerprints.length)
+    throw new Error('Invalid Android passkey configuration: use app.notify.android and 1–4 distinct uppercase colon-separated SHA-256 fingerprints.');
+  const fingerprints = [...config.sha256CertFingerprints];
+  return {
+    // Credential Manager uses the raw SHA-256 digest, not the textual fingerprint or package name.
+    origins: fingerprints.map(value => `android:apk-key-hash:${Buffer.from(value.replaceAll(':', ''), 'hex').toString('base64url')}`),
+    assetLinks: [{ relation: ['delegate_permission/common.get_login_creds'], target: {
+      namespace: 'android_app', package_name: config.packageName, sha256_cert_fingerprints: fingerprints
+    } }]
+  };
+}
+
 // Account identity only, never device trust or relay authority. One private store
 // has one authoritative service writer; restart invalidates every cookie session.
-export async function createAccountService({ server, origin, store, reportError, now = () => performance.now(), managedIngress }) {
+export async function createAccountService({ server, origin, store, reportError, now = () => performance.now(), managedIngress, android }) {
   const ingress = createIngressPolicy({ server, publicOrigin: origin, managedIngress });
   if (server.listening || server.listenerCount('request') ||
     server.listenerCount('upgrade')) throw new Error('Accounts require a dedicated unstarted HTTPS server.');
@@ -88,6 +107,8 @@ export async function createAccountService({ server, origin, store, reportError,
   if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.pathname !== '/' ||
     endpoint.search || endpoint.hash || isIP(endpoint.hostname)) throw new Error('Invalid account HTTPS origin.');
   origin = endpoint.origin;
+  const { origins, assetLinks } = androidPasskeys(android);
+  const expectedOrigin = [origin, ...origins];
   if (typeof store?.read !== 'function' || typeof store?.write !== 'function' ||
     typeof reportError !== 'function' || typeof now !== 'function') throw new Error('Invalid account service dependencies.');
   let state;
@@ -194,6 +215,13 @@ export async function createAccountService({ server, origin, store, reportError,
     try {
       ensureLive(); prune();
       if (ingress.health(req, res)) return;
+      if (req.url === '/.well-known/assetlinks.json') {
+        if (!ingress.accepts(req) || (req.headers.origin !== undefined && req.headers.origin !== origin))
+          fail(403, 'Account origin rejected.');
+        if (req.method !== 'GET') fail(405, 'Use GET for Digital Asset Links.');
+        respond(200, assetLinks);
+        return;
+      }
       if (!ingress.accepts(req) || req.headers.origin !== origin)
         fail(403, 'Account origin rejected.');
       if (req.method !== 'POST') fail(405, 'Use POST for account requests.');
@@ -279,7 +307,7 @@ export async function createAccountService({ server, origin, store, reportError,
           const clientData = decodeClientDataJSON(response.response.clientDataJSON);
           if ((clientData.crossOrigin !== undefined && clientData.crossOrigin !== false) ||
             clientData.topOrigin !== undefined) throw new Error();
-          const common = { response, expectedChallenge: flow.challenge, expectedOrigin: origin,
+          const common = { response, expectedChallenge: flow.challenge, expectedOrigin,
             expectedRPID: endpoint.hostname, requireUserVerification: true };
           if (registration) {
             const attestation = decodeAttestationObject(Buffer.from(response.response.attestationObject, 'base64url'));
