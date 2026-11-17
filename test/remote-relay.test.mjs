@@ -215,6 +215,30 @@ test('duplicate side is rejected and reconnect never receives an offline queue',
   phone.client.close(); await peerClosed;
 });
 
+test('a closing peer cannot block reconnect while its TCP shutdown is delayed', { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  let phoneSocket;
+  f.server.on('upgrade', (req, socket) => {
+    if (req.headers.origin === webOrigin) phoneSocket = socket;
+  });
+  const original = await f.pair();
+  const closingSocket = phoneSocket;
+  const finished = once(closingSocket, 'finish');
+  original.phone.client._socket.pause();
+  original.phone.client.close();
+  await finished;
+  assert.equal(closingSocket.destroyed, false, 'The old TCP connection must still be closing');
+  const next = await f.pair();
+  if (!next.phone.messages.length) await once(next.phone.client, 'message');
+  const oldClosed = once(original.phone.client, 'close');
+  original.phone.client._socket.resume();
+  await oldClosed;
+  const received = once(next.phone.client, 'message');
+  next.mac.client.send(Buffer.from('fresh-channel-only'));
+  assert.equal((await received)[0].toString(), 'fresh-channel-only');
+  assert.equal(next.phone.messages.filter(message => message.binary).length, 1);
+});
+
 test('local policy revocation closes both live relay sockets before its disk write finishes', { timeout: 10000 }, async t => {
   let saved = null, hold = false, release;
   const policy = await RemoteAccess.open({ owner, store: {

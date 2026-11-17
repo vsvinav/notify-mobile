@@ -166,6 +166,11 @@ export function createRemoteRelay({ server, publicOrigin, webOrigin, authorize, 
       const owner = JSON.stringify([grant.issuer, grant.subject, grant.macID]);
       const key = JSON.stringify([grant.issuer, grant.subject, grant.macID, grant.deviceID]);
       let room = rooms.get(key);
+      // A proxy can delay TCP shutdown after a peer has already closed WebSocket.
+      if (room && [room.mac, room.phone].some(peer => peer && peer.ws.readyState !== WebSocket.OPEN)) {
+        drop(room, 1001, 'Peer disconnected.');
+        room = undefined;
+      }
       if (room?.[role]) return deny(409);
       if (!room && (rooms.size >= 64 || [...rooms.values()].filter(value => value.owner === owner).length >= 8))
         return deny(429);
