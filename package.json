@@ -12,6 +12,7 @@
     "test:browser": "NODE_TLS_REJECT_UNAUTHORIZED=1 PLAYWRIGHT_BROWSERS_PATH=0 playwright test"
   },
   "dependencies": {
+    "@simplewebauthn/server": "14.1.0",
     "web-push": "4.0.0",
     "ws": "8.23.0"
   },
