@@ -120,12 +120,13 @@ export async function loadCrypto() {
 
 /** Connect creates a fresh MLS group; signed short-lease renewal preserves it without replaying RPCs. */
 export function createRemoteTransport({ origin = location.origin, macID, deviceID, pinnedMacKey, autoReconnect = false,
-  restorePeer, post = postJSON, WebSocketImpl = WebSocket, onStatus = () => {} }) {
+  restorePeer, post = postJSON, WebSocketImpl = WebSocket, onStatus = () => {},
+  lifecycle = globalThis.window, visibility = globalThis.document }) {
   let generation = 0, peer, socket, stage = 'closed', epoch, handshakeTimer, reconnectTimer, attempts = 0;
-  let lease, deadline, expiryTimer, renewalTimer, controller, renewing = false;
+  let lease, deadline, expiryTimer, renewalTimer, controller, renewing = false, wanted = false;
   const pending = new Map();
   const uncertainty = () => Object.assign(new Error('Connection lost; delivery is uncertain. Check the Mac before sending again. Nothing was retried.'), { network: true, uncertain: true });
-  function close(message = 'Disconnected. No actions are queued.') {
+  function reset(message = 'Disconnected. No actions are queued.') {
     generation++; clearTimeout(handshakeTimer); clearTimeout(reconnectTimer);
     clearTimeout(expiryTimer); clearTimeout(renewalTimer); controller?.abort();
     stage = 'closed'; epoch = undefined; lease = undefined; renewing = false;
@@ -136,12 +137,25 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
     peer?.free(); peer = undefined;
     onStatus({ state: 'disconnected', message });
   }
+  function close(message) {
+    wanted = false;
+    lifecycle?.removeEventListener('online', resume);
+    visibility?.removeEventListener('visibilitychange', resume);
+    reset(message);
+  }
+  function resume() {
+    if (!wanted || !autoReconnect || visibility?.hidden) return;
+    if (stage === 'closed' || (lease && !liveLease())) {
+      attempts = 0;
+      void start().catch(() => {});
+    }
+  }
   function disconnected(message) {
-    close(message);
-    if (!autoReconnect || attempts >= 5) return;
-    const delay = Math.min(16000, 1000 * 2 ** attempts++);
+    reset(message);
+    if (!autoReconnect || !wanted) return;
+    const delay = attempts < 5 ? 1000 * 2 ** attempts++ : 30000;
     onStatus({ state: 'disconnected', message: `${message} Reconnecting safely in ${delay / 1000}s; no actions will be retried.` });
-    reconnectTimer = setTimeout(() => { void connect().catch(() => {}); }, delay);
+    reconnectTimer = setTimeout(() => { void start().catch(() => {}); }, delay);
   }
   function validLease(result, id, previousChallenge) {
     const now = Date.now(), renewal = result?.renewal;
@@ -179,10 +193,12 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
         if (!liveLease()) throw uncertainty();
         validLease(result, id, challenge);
         applyLease(result);
-      } catch {
+      } catch (error) {
         // An uncertain response may already have consumed the nonce. Never retry it.
-        if (current === generation && !signal.aborted)
-          disconnected('Channel authorization lost. Delivery may be uncertain; no actions were retried.');
+        if (current === generation && !signal.aborted) {
+          if (error.status === 401 || error.status === 403) close(error.message);
+          else disconnected('Channel authorization lost. Delivery may be uncertain; no actions were retried.');
+        }
       } finally { if (current === generation) renewing = false; }
     }, 10000);
   }
@@ -192,8 +208,11 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
   }
   function encrypted(value) { send(peer.send(encoder.encode(JSON.stringify(value)))); }
   function receive(event) {
+    if (!liveLease()) {
+      disconnected('Channel authorization expired. No actions were retried.');
+      return;
+    }
     try {
-      if (!liveLease()) throw uncertainty();
       if (stage === 'greeting') {
         if (event.data !== '{"type":"ready","version":1}') throw new Error('Invalid relay greeting.');
         send(encoder.encode(JSON.stringify({ type: 'key_package', bytes: [...peer.key_package()] })));
@@ -234,10 +253,19 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
       else call.reject(Object.assign(new Error(typeof value.data.error === 'string' ? value.data.error : `Mac request failed (${value.status}).`), { status: value.status }));
     } catch { close('Encrypted channel validation failed. Reconnect only after checking the paired Mac.'); }
   }
-  async function connect() {
-    close(); const current = generation;
+  function connect() {
+    wanted = true; attempts = 0;
+    if (autoReconnect) {
+      lifecycle?.addEventListener('online', resume);
+      visibility?.addEventListener('visibilitychange', resume);
+    }
+    return start();
+  }
+  async function start() {
+    reset(); const current = generation;
     controller = new AbortController();
     const signal = controller.signal;
+    stage = 'connecting';
     onStatus({ state: 'connecting', message: 'Connecting to your Mac…' });
     try {
       const restored = await restorePeer();
@@ -265,7 +293,7 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
       handshakeTimer = setTimeout(() => disconnected('Pairing or connection timed out. Check your Mac.'), 120000);
     } catch (error) {
       if (current === generation) {
-        if (error.status || error.code) close(error.message);
+        if ((error.status && error.status !== 429 && error.status < 500) || error.code) close(error.message);
         else disconnected(error.message);
         throw error;
       }
@@ -287,7 +315,7 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
       const wait = timeout === undefined ? (mutation ? 25000 : 12000) : timeout;
       timer = setTimeout(abort, Number.isFinite(wait) ? Math.min(mutation ? 30000 : 15000, Math.max(1, wait)) : (mutation ? 25000 : 12000));
       try { encrypted({ id, epoch, payload: { path, data } }); }
-      catch { close(); }
+      catch { disconnected('Connection lost; delivery is uncertain. No actions were retried.'); }
     });
   }
   return { connect, api, close };

@@ -54,6 +54,66 @@ test('full QR key is mandatory and login never invents a user handle', () => {
     response: { clientDataJSON: new Uint8Array([1]), authenticatorData: new Uint8Array([2]), signature: new Uint8Array([3]), userHandle: null } }, 'login'), /user handle/i);
 });
 
+test('reconnect remains available after the fast retry budget is exhausted', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  let offline = false;
+  const h = harness({ autoReconnect: true, post: async path => {
+    if (offline) throw new Error('Mac network unavailable');
+    return path.endsWith('begin') ? { id: grantID, challenge: 'fresh' } :
+      { role: 'phone', macID: 'mac', deviceID: 'phone', approved: true, expiresAt: Date.now() + 30000,
+        renewal: { id: grantID, challenge: 'fresh-renewal' } };
+  } });
+  t.after(() => h.transport.close());
+  const socket = await h.connect();
+  const action = assert.rejects(h.transport.api('control', { action: 'stop' }), /uncertain/);
+  offline = true; socket.close(); await action;
+  for (const wait of [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000]) {
+    t.mock.timers.tick(wait); await flush();
+  }
+  const before = h.calls.length;
+  offline = false;
+  t.mock.timers.tick(30000); await flush();
+  assert.ok(h.calls.length > before, 'Long sleep must not permanently exhaust safe connection retries');
+  const fresh = h.sockets.at(-1);
+  assert.notEqual(fresh, socket);
+  fresh.onopen?.();
+  fresh.message('{"type":"ready","version":1}');
+  fresh.message(encode({ type: 'welcome', welcome: [1], tree: [2] }).buffer);
+  const freshEpoch = '22222222-2222-4222-8222-222222222222';
+  fresh.message(encode({ type: 'ready', epoch: freshEpoch }).buffer);
+  assert.equal(h.statuses.at(-1).state, 'connected');
+  assert.equal(fresh.sent.length, 2, 'Only the new handshake is sent, not the uncertain action');
+  const read = h.transport.api('state');
+  const request = JSON.parse(new TextDecoder().decode(fresh.sent.at(-1)));
+  assert.equal(request.epoch, freshEpoch);
+  fresh.message(encode({ id: request.id, status: 200, data: {} }).buffer);
+  await read;
+});
+
+test('foreground and online restart stale channels, but not explicitly closed transports', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+  const lifecycle = new EventTarget(), visibility = new EventTarget();
+  visibility.hidden = false;
+  const h = harness({ autoReconnect: true, lifecycle, visibility });
+  t.after(() => h.transport.close());
+  const socket = await h.connect();
+  const pending = assert.rejects(h.transport.api('reply'), /uncertain/);
+  t.mock.timers.setTime(Date.now() + 300001);
+  visibility.dispatchEvent(new Event('visibilitychange'));
+  await flush();
+  assert.equal(socket.readyState, 3);
+  await pending;
+  assert.equal(h.sockets.length, 2);
+  lifecycle.dispatchEvent(new Event('online'));
+  await flush();
+  assert.equal(h.sockets.length, 2, 'Foreground events must not overlap a live handshake');
+  h.transport.close();
+  lifecycle.dispatchEvent(new Event('online'));
+  visibility.dispatchEvent(new Event('visibilitychange'));
+  await flush();
+  assert.equal(h.sockets.length, 2);
+});
+
 test('renewal keeps the peer and pending mutation alive beyond the old lease and 12s ACK timeout', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
   const h = harness(); t.after(() => h.transport.close());
@@ -261,11 +321,14 @@ test('HTTP errors retain status with empty, non-JSON or invalid error bodies', a
 test('rejected setup authorization stops before opening a socket or automatically retrying', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
   for (const rejectedPhase of ['begin', 'finish']) {
-    const h = harness({ autoReconnect: true, post: async path => {
+    const lifecycle = new EventTarget(), visibility = new EventTarget();
+    const h = harness({ autoReconnect: true, lifecycle, visibility, post: async path => {
       if (path.endsWith(rejectedPhase)) throw Object.assign(new Error('Device enrollment required.'), { status: 401 });
       return { id: grantID, challenge: 'challenge' };
     } });
     await assert.rejects(h.transport.connect(), { status: 401 });
+    lifecycle.dispatchEvent(new Event('online'));
+    visibility.dispatchEvent(new Event('visibilitychange'));
     t.mock.timers.tick(120000); await flush();
     assert.equal(h.sockets.length, 0);
     assert.equal(h.calls.length, rejectedPhase === 'begin' ? 1 : 2);
@@ -340,10 +403,12 @@ test('unexpected encrypted sender label fails closed even after pinned join', as
   assert.equal(socket.readyState, 3);
 });
 
-test('actual WASM MLS establishes pinned channel and encrypts browser RPC (synthetic in-memory relay)', async () => {
+test('actual WASM MLS establishes pinned channel and safely restarts after sleep (synthetic in-memory relay)', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
   const { default: init, Peer } = await import('../public/remote-crypto/channel.js');
   await init({ module_or_path: await readFile(new URL('../public/remote-crypto/channel_bg.wasm', import.meta.url)) });
-  const native = new Peer('native'), phone = new Peer('phone');
+  let native = new Peer('native');
+  const phone = new Peer('phone'), macSecret = native.export_identity();
   const phoneKey = phone.identity_key(), secret = phone.export_identity(), macKey = native.identity_key();
   phone.free();
   let socket;
@@ -377,5 +442,28 @@ test('actual WASM MLS establishes pinned channel and encrypts browser RPC (synth
     assert.equal(request.payload.data.ticket,'synthetic-secret-ticket');
     socket.message(native.send(encode({id:request.id,status:200,data:{acknowledged:true}})).buffer);
     assert.deepEqual(await response,{acknowledged:true});
-  } finally { transport.close(); native.free(); secret.fill(0); }
+    const uncertain = assert.rejects(transport.api('reply', { ticket: 'never-replayed' }), /uncertain/);
+    const oldSocket = socket, oldCiphertext = socket.sent.at(-1);
+    t.mock.timers.setTime(Date.now() + 300001);
+    await transport.connect(); await uncertain;
+    assert.equal(oldSocket.readyState, 3);
+    native.free();
+    native = Peer.restore_identity('native', macSecret, macKey);
+    socket.message('{"type":"ready","version":1}');
+    const freshPackage = JSON.parse(new TextDecoder().decode(socket.sent[0]));
+    native.create(crypto.randomUUID());
+    const freshWelcome = native.add_pinned(new Uint8Array(freshPackage.bytes), phoneKey);
+    socket.message(encode({ type: 'welcome', welcome: [...freshWelcome], tree: [...native.tree()] }).buffer);
+    const freshHello = native.receive(socket.sent[1]); freshHello.free();
+    const newEpoch = '33333333-3333-4333-8333-333333333333';
+    socket.message(native.send(encode({ type: 'ready', epoch: newEpoch })).buffer);
+    assert.equal(socket.sent.length, 2, 'A new pinned MLS handshake never replays the old mutation');
+    assert.throws(() => native.receive(oldCiphertext), 'The new MLS group must reject pre-sleep ciphertext');
+    const read = transport.api('state');
+    const freshMessage = native.receive(socket.sent.at(-1));
+    const freshRequest = JSON.parse(new TextDecoder().decode(freshMessage.bytes())); freshMessage.free();
+    assert.equal(freshRequest.epoch, newEpoch);
+    socket.message(native.send(encode({ id: freshRequest.id, status: 200, data: { connected: true } })).buffer);
+    assert.deepEqual(await read, { connected: true });
+  } finally { transport.close(); native.free(); secret.fill(0); macSecret.fill(0); }
 });

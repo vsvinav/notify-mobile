@@ -17,6 +17,8 @@ const uuid = value => typeof value === 'string' && /^[a-f\d]{8}(-[a-f\d]{4}){3}-
 const text = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit && !/[\0-\x1f\x7f]/.test(value);
 const hash = key => createHash('sha256').update(Buffer.from(key, 'base64url')).digest('hex');
 const fail = (status, message) => { throw Object.assign(new Error(message), { status }); };
+const transient = error => error.retryable || ['TimeoutError', 'AbortError'].includes(error.name) ||
+  ['ECONNRESET', 'ENETUNREACH', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'EHOSTUNREACH', 'EPIPE', 'ECONNABORTED'].includes(error.code);
 function bytes(value) {
   if (!Array.isArray(value) || value.length > 1_064_960 ||
     !value.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) fail(400, 'Invalid encrypted-channel bytes.');
@@ -58,7 +60,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
   await privateDirectory(directory);
   const file = join(directory, 'identity.json');
   let state, writer = Promise.resolve(), auth, signer;
-  let closed = false, paused = false, polling, pending, approving, setupID, serverDevices = [];
+  let closed = false, paused = false, polling, pollController, pending, approving, setupID, serverDevices = [];
   let message = 'Waiting for phone sign-in.', fault, enrollmentError;
   const channels = new Map();
   const channelWork = new Set(), lifetime = new AbortController();
@@ -119,8 +121,9 @@ export async function createRemoteCompanion({ directory, origin, emit,
     requestSignal.throwIfAborted();
     let value;
     try { value = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-    catch { fail(502, 'Invalid internet service response.'); }
-    if (!response.ok) fail(response.status, text(value?.error, 500) ? value.error : 'Internet service rejected the request.');
+    catch { if (response.ok) fail(502, 'Invalid internet service response.'); }
+    if (!response.ok) throw Object.assign(new Error(text(value?.error, 500) ? value.error : 'Internet service rejected the request.'),
+      { status: response.status, retryable: response.status === 429 || response.status >= 500 });
     if (!object(value)) fail(502, 'Invalid internet service response.');
     return value;
   }
@@ -182,9 +185,9 @@ export async function createRemoteCompanion({ directory, origin, emit,
       (!grant.approved && channel.enrollmentExpiresAt && grant.expiresAt > channel.enrollmentExpiresAt))
       fail(502, 'Invalid Mac relay grant.');
   }
-  async function register() {
-    const begin = await api('mac/begin', { macID: state.macID, publicKey: state.publicKey });
-    const result = await api('mac/register', { id: begin.id, signature: await sign(begin.challenge) });
+  async function register(signal) {
+    const begin = await api('mac/begin', { macID: state.macID, publicKey: state.publicKey }, undefined, signal);
+    const result = await api('mac/register', { id: begin.id, signature: await sign(begin.challenge) }, undefined, signal);
     if (result.macID !== state.macID || typeof result.credential !== 'string' ||
       !/^[\w-]{43}$/.test(result.credential) || !text(result.setupID, 256)) fail(502, 'Invalid Mac registration.');
     await save(current => ({ ...current, credential: result.credential, setupID: result.setupID }));
@@ -212,6 +215,12 @@ export async function createRemoteCompanion({ directory, origin, emit,
     let crypto, relay, grant, renewalTimer, renewalWork, renewalStarted = false;
     const current = () => !closed && !paused && !fault && !channel.signal.aborted && channels.get(device.id) === channel;
     const unexpired = () => Date.now() < channel.expiresAt && performance.now() < channel.deadline;
+    function requireLive() {
+      if (!current() || !unexpired()) {
+        controller.abort();
+        fail(403, 'Encrypted channel closed or authorization expired.');
+      }
+    }
     function scheduleRenewal() {
       if (!current()) return;
       renewalTimer = setTimeout(() => {
@@ -262,14 +271,16 @@ export async function createRemoteCompanion({ directory, origin, emit,
       channel.deadline = performance.now() + grant.expiresAt - Date.now();
       crypto = openCrypto();
       channel.send = async data => {
-        if (channel.signal.aborted) fail(403, 'Encrypted channel closed.');
+        requireLive();
         const frame = bytes(await crypto.call('send', { bytes: [...Buffer.from(JSON.stringify(data))] }));
+        requireLive();
         await relay.send(frame);
       };
       const relayReady = connectRelay({ url: `${origin.replace('https:', 'wss:')}/v1/relay`,
         credential: grant.credential, expiresAt: grant.expiresAt, signal: channel.signal, onOpen: opened,
         receive: async data => {
           relay = await relayReady;
+          requireLive();
           if (channel.stage === 'package') {
             let value;
             try { value = JSON.parse(data.toString('utf8')); } catch { fail(400, 'Invalid key-package frame.'); }
@@ -284,6 +295,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
             return;
           }
           const decrypted = await crypto.call('receive', { bytes: [...data] });
+          requireLive();
           let value;
           try { value = JSON.parse(bytes(decrypted.bytes).toString('utf8')); } catch { fail(400, 'Invalid encrypted request.'); }
           if (!object(value)) fail(400, 'Invalid encrypted request.');
@@ -349,12 +361,14 @@ export async function createRemoteCompanion({ directory, origin, emit,
   }
   function tick() {
     if (closed || paused || fault || enrollmentError || polling) return;
-    polling = poll();
+    pollController = new AbortController();
+    polling = poll(pollController.signal);
   }
-  async function poll() {
+  async function poll(signal) {
     try {
-      if (!state.credential) await register();
-      const remote = await api('mac/status', {}, state.credential);
+      if (!state.credential) await register(signal);
+      const remote = await api('mac/status', {}, state.credential, signal);
+      signal.throwIfAborted();
       if (remote.macID !== state.macID || !Array.isArray(remote.devices) || remote.devices.length > 8 ||
         !remote.devices.every(d => uuid(d.deviceID) && validKey(d.publicKey) && text(d.name, 100)))
         fail(502, 'Invalid registered-phone state.');
@@ -384,6 +398,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
       }
       status();
     } catch (error) {
+      if (closed || signal.aborted) return;
       if (error.status === 401 || error.status === 403 || error.status === 409) {
         enrollmentError = error;
         message = error.status === 401
@@ -393,18 +408,24 @@ export async function createRemoteCompanion({ directory, origin, emit,
         auth?.disable();
         for (const channel of channels.values()) channel.controller.abort();
         status();
+      } else if (transient(error)) {
+        message = 'Internet connection unavailable. Reconnecting safely; no actions will be retried.';
+        auth?.disable();
+        for (const channel of channels.values()) channel.controller.abort();
+        actions.close();
+        status();
       } else fatal(error);
     } finally { polling = undefined; }
   }
   async function command(input) {
     if (!object(input) || closed || fault) fail(503, 'Internet helper is unavailable.');
     if (input.type === 'offline') {
-      paused = true; auth?.disable();
+      paused = true; pollController?.abort(); auth?.disable();
       for (const channel of channels.values()) channel.controller.abort();
       actions.close(); status(); return;
     }
     if (input.type === 'heartbeat') {
-      if (paused) { paused = false; auth?.enable(); }
+      paused = false;
       status(); void tick(); return;
     }
     if (input.type === 'invite') {

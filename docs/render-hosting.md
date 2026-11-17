@@ -93,6 +93,17 @@ Expired, closed or revoked connections cannot renew. Failed or uncertain renewal
 does not replay a challenge or user action; logout and revocation still close the
 connection. This protocol does not depend on a particular hosting plan.
 
+Mac sleep closes local channel authority and cancels the current status poll.
+Wake heartbeats retry transient network/service failures without replacing
+the saved identity or trusted account. The phone retries with a short backoff,
+then every 30 seconds; returning to a visible page or coming online checks for
+an expired channel immediately. **Reconnect** starts a fresh attempt.
+Recovery creates new grants, an encrypted channel and action epoch, never
+revives an expired lease or replays an uncertain action. Authorization rejection
+stops automatic recovery: an expired account requires explicit sign-in, and a
+lost Mac registration still requires explicit local re-enrollment. Recovery
+does not repair a Free-host account wipe.
+
 The phone waits up to 25 seconds for mutation acknowledgments, allowing the
 native runtime's 20-second action window to finish; reads retain a 12-second
 timeout. A missing acknowledgment means delivery may be uncertain, not that the

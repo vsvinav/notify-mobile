@@ -334,7 +334,7 @@ test('helper requires full-key local approval and native ACK (injected crypto fi
 });
 
 const settle = async () => { for (let i = 0; i < 25; i++) await new Promise(resolve => setImmediate(resolve)); };
-async function renewalFixture(t, { pendingApproval = false, renew } = {}) {
+async function renewalFixture(t, { pendingApproval = false, renew, status } = {}) {
   const root = join(process.cwd(), '.test-data');
   await mkdir(root, { recursive: true });
   const directory = await mkdtemp(join(root, 'remote-renew-'));
@@ -367,10 +367,11 @@ async function renewalFixture(t, { pendingApproval = false, renew } = {}) {
     fetchRequest: async (url, options) => {
       const path = new URL(url).pathname;
       requests.push({ path, options });
-      if (path.endsWith('/mac/status')) return Response.json({
-        macID, pending: approved ? null : pending,
-        devices: approved ? [{ deviceID, publicKey: phoneKey, name: 'Phone' }] : []
-      });
+      if (path.endsWith('/mac/status')) {
+        const value = { macID, pending: approved ? null : pending,
+          devices: approved ? [{ deviceID, publicKey: phoneKey, name: 'Phone' }] : [] };
+        return status ? status(value, options) : Response.json(value);
+      }
       if (path.endsWith('/grant/begin')) return Response.json({ id, challenge: 'initial' });
       if (path.endsWith('/grant/finish')) return Response.json(grant());
       if (path.endsWith('/grant/renew')) {
@@ -406,8 +407,80 @@ async function renewalFixture(t, { pendingApproval = false, renew } = {}) {
   await receiver(Buffer.from(JSON.stringify({ type: 'key_package', bytes: [1] })));
   await receiver(Buffer.from(JSON.stringify({ type: 'hello' })));
   return { helper, events, frames, requests, renewals, signed, pending,
-    receive: value => receiver(Buffer.from(JSON.stringify(value))), signal: relaySignal, disconnect: () => closeRelay() };
+    receive: value => receiver(Buffer.from(JSON.stringify(value))), signal: relaySignal, disconnect: () => closeRelay(),
+    saved: () => readFile(join(directory, 'identity.json'), 'utf8') };
 }
+
+for (const failure of ['network', 'timeout', 'service', 'service-html']) {
+  test(`wake after five minutes recovers from ${failure} failure without replacing trust or replaying actions`, async t => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
+    let unavailable = false;
+    const f = await renewalFixture(t, { status: value => {
+      if (unavailable && failure === 'network') throw Object.assign(new Error('Network unavailable'), { code: 'ENETUNREACH' });
+      if (unavailable && failure === 'timeout') throw new DOMException('Request aborted by timeout', 'AbortError');
+      if (unavailable && failure === 'service-html') return new Response('<html>Service waking up</html>', { status: 503 });
+      return unavailable ? Response.json({ error: 'Service unavailable' }, { status: 503 }) : Response.json(value);
+    } });
+    const saved = await f.saved(), oldEpoch = f.frames.find(frame => frame.type === 'ready').epoch;
+    await f.helper.command({ type: 'snapshot', total: 1, requests: [permission()] });
+    await f.receive({ id: randomUUID(), epoch: oldEpoch, payload: { path: 'reply', data: {
+      sessionID: 'session-1', requestID: 'request-1', ticket: 'ticket-1', decision: 'deny', answers: {}
+    } } });
+    await settle();
+    assert.equal(f.events.filter(event => event.type === 'reply').length, 1);
+    await f.helper.command({ type: 'offline' });
+    t.mock.timers.tick(300000); await settle();
+    assert.equal(f.signal.aborted, true);
+    unavailable = true;
+    await f.helper.command({ type: 'heartbeat' }); await settle();
+    assert.equal(f.events.some(event => event.type === 'error'), false, 'A wake-time network failure must not kill the native helper');
+    unavailable = false;
+    await f.helper.command({ type: 'heartbeat' }); await settle();
+    await f.receive({ type: 'key_package', bytes: [1] });
+    await f.receive({ type: 'hello' }); await settle();
+    const ready = f.frames.findLast(frame => frame.type === 'ready');
+    assert.notEqual(ready.epoch, oldEpoch);
+    assert.equal(f.events.findLast(event => event.type === 'status').status.state, 'connected');
+    assert.equal(f.events.filter(event => event.type === 'reply').length, 1, 'Unacknowledged action is never dispatched again');
+    await assert.rejects(f.receive({ id: randomUUID(), epoch: oldEpoch, payload: { path: 'state', data: {} } }), /expired connection/);
+    assert.equal(await f.saved(), saved, 'Wake must not re-register, change the owner, keys or trusted phones');
+  });
+}
+
+test('sleep cancels the old status poll and ignores its late authorization failure after wake', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
+  let hold = false, release, signal;
+  const f = await renewalFixture(t, { status: (value, options) => {
+    if (!hold) return Response.json(value);
+    signal = options.signal;
+    return new Promise(resolve => { release = resolve; });
+  } });
+  hold = true;
+  await f.helper.command({ type: 'heartbeat' }); await settle();
+  await f.helper.command({ type: 'offline' });
+  try {
+    assert.equal(signal.aborted, true, 'Sleep must cancel pre-sleep network work');
+  } finally {
+    hold = false;
+    await f.helper.command({ type: 'heartbeat' });
+    release(Response.json({ error: 'Expired old poll' }, { status: 401 }));
+    await settle();
+  }
+  t.mock.timers.tick(3000); await settle();
+  assert.equal(f.events.findLast(event => event.type === 'status').status.state, 'connecting');
+  await f.receive({ type: 'key_package', bytes: [1] });
+  await f.receive({ type: 'hello' });
+  assert.equal(f.events.findLast(event => event.type === 'status').status.state, 'connected');
+});
+
+test('elapsed wall-clock lease rejects a queued action before wake timers run', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
+  const f = await renewalFixture(t);
+  const epoch = f.frames.find(frame => frame.type === 'ready').epoch;
+  t.mock.timers.setTime(Date.now() + 300001);
+  await assert.rejects(f.receive({ id: randomUUID(), epoch, payload: { path: 'state', data: {} } }), /expired|closed/i);
+  assert.equal(f.events.some(event => event.type === 'watch'), false);
+});
 
 test('companion renews pending approval without data exposure, then retains live mutation and native ACK', async t => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: Date.now() });
