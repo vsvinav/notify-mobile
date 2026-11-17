@@ -33,11 +33,14 @@ Do not set fake Render variables to expose this listener on a public machine.
   Use only the new project's service account with Firestore data access, not
   an existing personal account. Keep browser/mobile Firestore rules deny-all:
   only this backend accesses the database using its project-scoped IAM identity.
-- Credentials must be a regular, non-symlink file, at most 32 KiB, contain a
+- Credentials must resolve to a regular file, at most 32 KiB, contain a
   matching project and service-account email, and an RSA private key of at
   least 2048 bits. Only Google's standard token endpoint/universe is accepted;
   the Firestore endpoint is pinned. No application-default credentials,
   `gcloud` login, or ambient Google credential file is used.
+  Ordinary credential paths reject symlinks. On Render, a projected secret directly
+  under `/etc/secrets` may resolve only within that managed secret mount; the final
+  file is still opened without following symlinks and validated normally.
   Emulator redirection and ambient Google client-certificate/mTLS opt-ins are
   rejected. Partial/invalid configuration,
   permission errors, quota exhaustion or unavailable storage fail closed;

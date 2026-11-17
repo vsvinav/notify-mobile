@@ -1,7 +1,7 @@
 import { createPrivateKey, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { open } from 'node:fs/promises';
-import { isAbsolute } from 'node:path';
+import { open, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, sep } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 const LIMIT = 900000;
@@ -176,7 +176,7 @@ export async function createFirestoreStores({ firestore, origin, now = () => per
   });
 }
 
-export async function firebaseConfiguration(env = process.env) {
+export async function firebaseConfiguration(env = process.env, files = { open, realpath }) {
   const projectId = env.NOTIFY_FIREBASE_PROJECT_ID, file = env.NOTIFY_FIREBASE_CREDENTIALS_FILE;
   if (projectId === undefined && file === undefined) return null;
   let handle, credentials;
@@ -187,7 +187,15 @@ export async function firebaseConfiguration(env = process.env) {
       [env, process.env].some(config => config.GOOGLE_API_USE_CLIENT_CERTIFICATE === 'true' ||
         config.GOOGLE_API_USE_MTLS_ENDPOINT === 'always') ||
       process.env.NODE_TLS_REJECT_UNAUTHORIZED !== '1') throw new Error();
-    handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      handle = await files.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error) {
+      if (error.code !== 'ELOOP' || env.RENDER !== 'true' || dirname(file) !== '/etc/secrets') throw error;
+      // Render projects secret files through links; never follow one outside its managed mount.
+      const root = await files.realpath('/etc/secrets'), target = await files.realpath(file);
+      if (!target.startsWith(`${root}${sep}`)) throw new Error();
+      handle = await files.open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+    }
     const stat = await handle.stat();
     if (!stat.isFile() || stat.nlink !== 1 || stat.size > 32768) throw new Error();
     const value = JSON.parse(await handle.readFile('utf8'));

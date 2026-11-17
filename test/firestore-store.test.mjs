@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomUUID } from 'node:crypto';
-import { mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolve } from 'node:path';
@@ -336,4 +336,34 @@ test('Firebase configured but unavailable fails startup with sanitized errors an
     /durable storage unavailable/.test(error.message) && !/Synthetic credential/.test(error.message) &&
       error.startupCode === 'firebase-storage-unavailable');
   assert.equal(terminated, true);
+});
+
+test('Render projected secrets resolve only within the managed secret mount', async t => {
+  const { firebaseConfiguration } = await module();
+  const directory = resolve('.test-data', randomUUID());
+  const mount = resolve(directory, 'mount');
+  await mkdir(resolve(mount, 'generation'), { recursive: true });
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const credential = { type: 'service_account', project_id: 'notify-fixture',
+    client_email: 'notify-backend@notify-fixture.iam.gserviceaccount.com',
+    token_uri: 'https://oauth2.googleapis.com/token',
+    private_key: privateKey.export({ type: 'pkcs8', format: 'pem' }) };
+  await writeFile(resolve(mount, 'generation', 'key.json'), JSON.stringify(credential));
+  await writeFile(resolve(directory, 'outside.json'), JSON.stringify(credential));
+  await symlink('generation/key.json', resolve(mount, 'key.json'));
+  await symlink('../outside.json', resolve(mount, 'escape.json'));
+  const translate = path => path === '/etc/secrets' ? mount :
+    path.startsWith('/etc/secrets/') ? resolve(mount, path.slice('/etc/secrets/'.length)) : path;
+  const files = {
+    open: (path, flags) => open(translate(path), flags),
+    realpath: path => realpath(translate(path))
+  };
+  const env = { RENDER: 'true', NOTIFY_FIREBASE_PROJECT_ID: 'notify-fixture',
+    NOTIFY_FIREBASE_CREDENTIALS_FILE: '/etc/secrets/key.json' };
+  assert.equal((await firebaseConfiguration(env, files)).projectId, 'notify-fixture');
+  await assert.rejects(firebaseConfiguration({ ...env, RENDER: 'false' }, files),
+    error => error.startupCode === 'firebase-file-symlink');
+  await assert.rejects(firebaseConfiguration({ ...env,
+    NOTIFY_FIREBASE_CREDENTIALS_FILE: '/etc/secrets/escape.json' }, files), /Firebase configuration/);
 });
