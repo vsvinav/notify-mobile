@@ -127,6 +127,18 @@ The org chart initially shows running helpers, with idle helpers grouped into **
 
 Phone drafts stay separate for each target and do not overwrite Mac drafts. Switching views or using browser Back/Forward keeps them; they are held only in the open phone page, so reloading or losing pairing clears them. Sending instructions can use your existing model credits. **Queued** means accepted into the agent's queue, not finished; failures and uncertain delivery are shown explicitly, and instructions are never retried automatically.
 
+**Native Android source preview:** matching updated Android and Mac builds can
+control the Mac-owned per-session Dangerous Auto-yes policy through this helper.
+Enabling requires explicit high-risk confirmation; eligible waiting and future
+tools may be approved, including destructive work, while questions remain manual.
+Phone disconnect does not disable it. Android shows Mac-acknowledged state, a red
+On indicator and direct Off; stale/unknown results are not replayed or shown as Off.
+Off has reserved capacity through the authenticated command path. A definite
+“not dispatched” rejection permits a fresh, explicit Off after refreshing;
+an unknown outcome remains blocked for that policy epoch. Neither path retries automatically.
+Old Mac/helper builds remain unsupported. This adds no automation engine to the
+helper and no Dangerous Auto-yes UI to the LAN web app. It is not a published release.
+
 Updates arrive while Sessions is open; hidden pages stop watching. Details are loaded only for the selected session, and earlier messages or very large teams can be omitted with a visible notice. Creating/removing subagents and automation settings remain Mac-only.
 
 **Connected** means the phone app recently reached your Mac. **Push enabled** means a notification subscription exists, not that every alert has been delivered. Focus and battery settings can delay alerts.

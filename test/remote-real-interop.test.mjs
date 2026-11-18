@@ -305,6 +305,25 @@ test('hardware native pipe ↔ phone WASM: sustained renewal, delayed chat ACK a
     assert.ok(renewals.mac >= 5 && renewals.phone >= 5, 'Both endpoints must renew repeatedly');
     clearInterval(heartbeat);
 
+    workspace.sessions[0].capabilities = { steering: false, subagentChat: false, subagentStop: false, dangerousAutoYes: true };
+    const offEpoch = '00000000-0000-8000-8000-000000000001';
+    workspace.sessions[0].dangerousAutoYes = { ticket: 'policy-1', offTicket: offEpoch, revision: 1, enabled: false, normalEnabled: false };
+    await helper.command(workspace);
+    const policyView = await transport.api('workspace', { sessionID: 'fixture-session' });
+    assert.equal(policyView.dangerousAutoYesControl, true);
+    for (const [enabled, revision] of [[true, 2], [false, 3]]) {
+      const command = { id: enabled ? randomUUID() : offEpoch, sessionID: 'fixture-session', ticket: 'fixture-chat-ticket',
+        action: 'dangerous_auto_yes', text: '', enabled, policyTicket: `policy-${revision - 1}`, offTicket: offEpoch };
+      const response = transport.api('control', command);
+      await until(() => events.some(event => event.action === 'dangerous_auto_yes' && event.enabled === enabled), 'encrypted policy dispatch');
+      const nativeCommand = events.findLast(event => event.action === 'dangerous_auto_yes');
+      assert.equal(nativeCommand.agentID, undefined);
+      const policy = { ticket: `policy-${revision}`, offTicket: enabled ? offEpoch : '00000000-0000-8000-8000-000000000002', revision, enabled, normalEnabled: false };
+      await helper.command({ type: 'control_result', id: nativeCommand.id, ok: true, commandID: nativeCommand.id,
+        status: 'applied', detail: 'Synthetic policy authority only; no real approvals', dangerousAutoYes: policy });
+      assert.deepEqual((await response).dangerousAutoYes, policy);
+    }
+
     const next = permission(`private-fixture-ticket-${randomUUID()}`);
     await helper.command({ type: 'snapshot', total: 1, requests: [next] });
     const disconnected = assert.rejects(transport.api('reply', { ...reply, ticket: next.ticket }),
@@ -339,5 +358,5 @@ test('hardware native pipe ↔ phone WASM: sustained renewal, delayed chat ACK a
     });
     // The synthetic CLI cannot reset an MLS group or export its hardware identity; reconnect needs persistent mode.
     await assert.rejects(native.call('create', { id: randomUUID() }), /Invalid fixture group/);
-    t.diagnostic('Real Secure Enclave ↔ WASM MLS stayed connected beyond60s and acknowledged synthetic chat after14s. Account/HTTP/relay/runtime are fixtures; reconnect is not covered.');
+    t.diagnostic('Real Secure Enclave ↔ WASM MLS stayed connected beyond60s, acknowledged chat after14s and carried exact Dangerous Auto-yes On/Off ACKs. Account/HTTP/relay/runtime are fixtures; reconnect is not covered.');
   });

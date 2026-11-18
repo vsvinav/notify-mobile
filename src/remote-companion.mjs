@@ -10,6 +10,7 @@ import { RemoteAccess } from './remote-access.mjs';
 import { connectRemoteRelay } from './remote-relay-client.mjs';
 import { NativeCrypto } from './remote-crypto.mjs';
 import { RemoteActions } from './remote-actions.mjs';
+import { isOffID, isPolicyOffRPC } from './workspace.mjs';
 import { object } from './validation.mjs';
 import { leaseStart, localLease } from '../public/remote-lease.mjs';
 
@@ -373,11 +374,19 @@ export async function createRemoteCompanion({ directory, origin, emit,
             Object.keys(value).some(k => !['id', 'epoch', 'payload'].includes(k)) ||
             Object.keys(value.payload).some(k => !['path', 'data'].includes(k))) fail(400, 'Invalid encrypted action envelope.');
           const payload = Buffer.from(JSON.stringify(value.payload));
-          if (payload.length > 131072 || channel.inflight.size >= 8 || channel.inflight.has(value.id))
+          const off = isPolicyOffRPC(value.id, value.payload);
+          if (isOffID(value.id) && !off) fail(400, 'Off UUIDs cannot identify other remote work.');
+          const rpcID = value.id.toLowerCase();
+          if (payload.length > 131072 || channel.inflight.has(rpcID))
             fail(429, 'Remote request is too large, duplicated or already busy.');
           auth.authorize(channel.handle);
           if (value.epoch !== auth.epoch) fail(409, 'Remote request belongs to an expired connection.');
-          channel.inflight.add(value.id);
+          if (channel.inflight.size >= (off ? 9 : 8)) {
+            if (off) return channel.send({ id: value.id, status: 429,
+              data: { notDispatched: true, error: 'Remote connection is busy. Off was not dispatched.' } });
+            fail(429, 'Remote request is already busy.');
+          }
+          channel.inflight.add(rpcID);
           const invoke = () => actions.request(value.payload.path, value.payload.data, {
               id: device.id, name: device.name, expires: channel.expiresAt
             }, channel.signal);
@@ -392,7 +401,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
                 try { await channel.send({ id: value.id, status: error.status ?? 503, data: { error: error.message.slice(0, 500) } }); }
                 catch { channel.controller.abort(); }
               }
-            }).finally(() => channel.inflight.delete(value.id));
+            }).finally(() => channel.inflight.delete(rpcID));
         }
       });
       relay = await relayReady;

@@ -4,12 +4,30 @@ import { object } from './validation.mjs';
 const str = (v, max, nonempty = false) => typeof v === 'string' && v.length <= max && (!nonempty || v.length > 0);
 const id = v => str(v, 128, true) && !v.includes('\0');
 const ticket = v => str(v, 256, true);
+// The Off epoch is also its UUIDv8 command ID; retirement cannot turn that UUID into different work.
+const offTicket = v => typeof v === 'string' && /^[a-f\d]{8}-[a-f\d]{4}-8[a-f\d]{3}-[a-f\d]{4}-[a-f\d]{12}$/i.test(v);
+export const isOffID = offTicket;
+export function isPolicyOffRPC(rpcID, payload) {
+  const c = payload?.data;
+  return object(payload) && Object.keys(payload).length === 2 && payload.path === 'control' &&
+    object(c) && Object.keys(c).length === 8 &&
+    c.action === 'dangerous_auto_yes' && c.enabled === false && c.text === '' &&
+    id(c.sessionID) && ticket(c.ticket) && ticket(c.policyTicket) &&
+    offTicket(c.offTicket) && offTicket(c.id) && offTicket(rpcID) &&
+    c.id.toLowerCase() === c.offTicket.toLowerCase() && rpcID.toLowerCase() === c.id.toLowerCase();
+}
+const notDispatched = (status, message) => {
+  throw Object.assign(new Error(message), { status, notDispatched: true });
+};
 const bool = v => typeof v === 'boolean';
 const count = v => Number.isSafeInteger(v) && v >= 0 && v <= 1000000;
 const unique = values => new Set(values).size === values.length;
 const bytes = v => Buffer.byteLength(JSON.stringify(v));
 const fingerprint = v => createHash('sha256').update(JSON.stringify(v)).digest('hex');
 const allowedStatuses = ['sending', 'queued', 'received', 'stopped', 'cancelled', 'failed', 'unknown'];
+const validPolicy = p => object(p) && ticket(p.ticket) && Number.isSafeInteger(p.revision) && p.revision > 0 &&
+  bool(p.enabled) && bool(p.normalEnabled) && !(p.enabled && p.normalEnabled) &&
+  (p.offTicket === undefined || ticket(p.offTicket));
 
 export function validWorkspace(m) {
   return Array.isArray(m.sessions) && m.sessions.length <= 256 && count(m.total) && bool(m.truncated) &&
@@ -17,6 +35,9 @@ export function validWorkspace(m) {
     m.sessions.every(s => object(s) && id(s.id) && ticket(s.ticket) && str(s.name, 65535) && str(s.project, 65535) &&
       str(s.agent, 128) && /^#[a-f\d]{6}$/i.test(s.color) && str(s.state, 128) && bool(s.connected) &&
       object(s.capabilities) && ['steering', 'subagentChat', 'subagentStop'].every(k => bool(s.capabilities[k])) &&
+      (s.capabilities.dangerousAutoYes === undefined || bool(s.capabilities.dangerousAutoYes)) &&
+      (s.dangerousAutoYes === undefined || validPolicy(s.dangerousAutoYes)) &&
+      (!s.capabilities.dangerousAutoYes || validPolicy(s.dangerousAutoYes)) &&
       count(s.runningCount) && count(s.idleCount));
 }
 
@@ -49,7 +70,7 @@ export class Workspace {
     Object.assign(this, { emit, now, fail, ackTimeout, devices });
     this.sessions = []; this.total = 0; this.truncated = false; this.available = false;
     this.details = new Map(); this.selections = new Map(); this.waiters = new Map();
-    this.controls = new Map(); this.pending = new Map(); this.error = 'Workspace unavailable. Update or reconnect Notify on the Mac.';
+    this.controls = new Map(); this.offControls = new Map(); this.pending = new Map(); this.error = 'Workspace unavailable. Update or reconnect Notify on the Mac.';
   }
   fresh() { return this.available && this.now() - this.updated < 12000; }
   live(sid, generation) { return this.fresh() && this.sessions.some(s => s.id === sid && s.ticket === generation); }
@@ -72,7 +93,8 @@ export class Workspace {
     const connected = this.fresh();
     const sid = this.selections.get(deviceID)?.sessionID;
     const detail = this.details.get(sid);
-    const value = { connected, sessions: connected ? this.sessions : [], total: connected ? this.total : 0,
+    const value = { dangerousAutoYesControl: true, dangerousAutoYesOffEpoch: true,
+      connected, sessions: connected ? this.sessions : [], total: connected ? this.total : 0,
       truncated: connected ? this.truncated : false,
       detail: connected && detail && this.live(sid, detail.ticket) ? detail : null,
       ...(!connected ? { error: this.error ?? 'Workspace snapshot expired. Reconnect to the Mac.' } : {}) };
@@ -111,18 +133,34 @@ export class Workspace {
       // Never evict uncertain safety records while their native generation can still accept work.
       if (!this.pending.has(r.nativeID) && this.available && !this.live(r.sessionID, r.ticket)) this.controls.delete(key);
     }
+    for (const [sid, r] of this.offControls) {
+      if (!this.pending.has(r.nativeID) && this.available && !this.live(r.sessionID, r.ticket)) this.offControls.delete(sid);
+    }
   }
   command(m) {
     if (m.type === 'control_result') {
       this.tick();
       const r = this.pending.get(m.id);
       if (!r) return;
+      const policy = r.action === 'dangerous_auto_yes';
       if (!bool(m.ok) || !str(m.detail ?? '', 4000) || !str(m.error ?? '', 1000) ||
-        (m.ok && (!id(m.commandID) || !(r.action === 'stop' ? m.status === 'stopped' : ['queued', 'received'].includes(m.status))))) {
+        (m.dangerousAutoYes !== undefined && (!policy || !validPolicy(m.dangerousAutoYes) || !offTicket(m.dangerousAutoYes.offTicket))) ||
+        (m.ok && (!id(m.commandID) || !(policy
+          ? m.status === 'applied' && validPolicy(m.dangerousAutoYes) && m.dangerousAutoYes.enabled === r.enabled &&
+            offTicket(m.dangerousAutoYes.offTicket) && m.dangerousAutoYes.ticket !== r.policyTicket &&
+            m.dangerousAutoYes.revision > r.policyRevision && (r.enabled || m.dangerousAutoYes.offTicket !== r.offTicket)
+          : r.action === 'stop' ? m.status === 'stopped' : ['queued', 'received'].includes(m.status))))) {
         this.complete(r, 502, { ok: false, status: 'unknown', error: 'Invalid native control acknowledgment. Check the Mac.' }); return;
       }
-      this.complete(r, m.ok ? 200 : 502, { ok: m.ok, commandID: m.commandID ?? null,
-        status: allowedStatuses.includes(m.status) ? m.status : 'unknown', detail: m.detail ?? '',
+      if (policy && validPolicy(m.dangerousAutoYes)) {
+        this.sessions = this.sessions.map(s => s.id === r.sessionID && s.ticket === r.ticket &&
+          s.dangerousAutoYes && m.dangerousAutoYes.revision >= s.dangerousAutoYes.revision
+          ? { ...s, dangerousAutoYes: m.dangerousAutoYes } : s);
+        this.wake();
+      }
+      this.complete(r, m.ok || policy && validPolicy(m.dangerousAutoYes) ? 200 : 502, { ok: m.ok, commandID: m.commandID ?? null,
+        status: (allowedStatuses.includes(m.status) || policy && m.status === 'applied') ? m.status : 'unknown', detail: m.detail ?? '',
+        ...(policy && validPolicy(m.dangerousAutoYes) ? { dangerousAutoYes: m.dangerousAutoYes } : {}),
         ...(!m.ok ? { error: m.error || 'Control not acknowledged. Check the Mac.' } : {}) });
       return;
     }
@@ -133,7 +171,12 @@ export class Workspace {
     if (m.type === 'workspace') {
       const first = !this.supported;
       this.supported = true;
-      this.sessions = m.sessions; this.total = m.total; this.truncated = m.truncated;
+      this.sessions = m.sessions.map(s => {
+        const previous = this.sessions.find(old => old.id === s.id && old.ticket === s.ticket)?.dangerousAutoYes;
+        return previous && s.dangerousAutoYes && previous.revision > s.dangerousAutoYes.revision
+          ? { ...s, dangerousAutoYes: previous } : s;
+      });
+      this.total = m.total; this.truncated = m.truncated;
       this.updated = this.now(); this.available = true; this.error = undefined;
       for (const [sid, detail] of this.details) if (!this.live(sid, detail.ticket)) this.details.delete(sid);
       for (const r of this.pending.values()) if (!this.live(r.sessionID, r.ticket))
@@ -171,30 +214,49 @@ export class Workspace {
   }
   async control(input, device) {
     this.tick();
+    const policy = input.action === 'dangerous_auto_yes';
+    const off = policy && input.enabled === false;
     if (!str(input.id, 36) || !/^[a-f\d]{8}(-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(input.id) ||
-      !id(input.sessionID) || !ticket(input.ticket) || !['queue', 'interrupt', 'stop'].includes(input.action) ||
-      !str(input.text, 16000) || (input.action === 'stop' ? input.text !== '' : !input.text.trim()) ||
+      !id(input.sessionID) || !ticket(input.ticket) || !['queue', 'interrupt', 'stop', 'dangerous_auto_yes'].includes(input.action) ||
+      !str(input.text, 16000) || (input.action === 'stop' || policy ? input.text !== '' : !input.text.trim()) ||
+      (policy ? !bool(input.enabled) || !ticket(input.policyTicket) || input.agentID !== undefined :
+        input.enabled !== undefined || input.policyTicket !== undefined) ||
+      (policy ? !offTicket(input.offTicket) || (off ? input.id.toLowerCase() !== input.offTicket.toLowerCase() : offTicket(input.id)) :
+        input.offTicket !== undefined || offTicket(input.id)) ||
       (input.agentID !== undefined && !id(input.agentID)) ||
-      Object.keys(input).some(k => !['id', 'sessionID', 'ticket', 'action', 'text', 'agentID'].includes(k))) this.fail(400, 'Invalid control payload.');
-    const payload = { sessionID: input.sessionID, ticket: input.ticket, action: input.action, text: input.text, agentID: input.agentID };
-    const key = `${device.id}\0${input.id.toLowerCase()}`, digest = fingerprint(payload), existing = this.controls.get(key);
+      Object.keys(input).some(k => !['id', 'sessionID', 'ticket', 'action', 'text', 'agentID', 'enabled', 'policyTicket', 'offTicket'].includes(k))) this.fail(400, 'Invalid control payload.');
+    const payload = { sessionID: input.sessionID, ticket: input.ticket, action: input.action, text: input.text, agentID: input.agentID,
+      ...(policy ? { enabled: input.enabled, policyTicket: input.policyTicket, offTicket: input.offTicket } : {}) };
+    const key = `${device.id}\0${input.id.toLowerCase()}`, digest = fingerprint(payload);
+    const existing = this.controls.get(key) ?? [...this.offControls.values()].find(r => r.key === key);
     if (existing) {
       if (existing.digest !== digest) this.fail(409, 'This control UUID was already used with different content.');
       if (existing.result) return existing.result;
       this.fail(409, 'This exact control is already awaiting acknowledgment. Do not resend.');
     }
-    if (!this.fresh()) this.fail(503, 'Workspace is offline or stale.');
+    if (!this.fresh()) notDispatched(503, 'Workspace is offline or stale.');
     const s = this.sessions.find(s => s.id === input.sessionID && s.ticket === input.ticket);
-    if (!s || !s.connected || s.agent !== 'copilot') this.fail(409, 'Session changed, disconnected, or does not support controls.');
-    if (input.agentID) {
+    if (!s || !s.connected || s.agent !== 'copilot') notDispatched(409, 'Session changed, disconnected, or does not support controls.');
+    if (policy) {
+      // Off still needs fresh session authority, but must be able to supersede an in-flight enable.
+      if (!s.capabilities.dangerousAutoYes || !validPolicy(s.dangerousAutoYes) || !offTicket(s.dangerousAutoYes.offTicket) ||
+        s.dangerousAutoYes.offTicket !== input.offTicket || !off && s.dangerousAutoYes.ticket !== input.policyTicket)
+        notDispatched(409, 'Dangerous Auto-yes is unsupported or its Mac policy changed. Refresh this exact session.');
+    } else if (input.agentID) {
       const d = this.details.get(s.id), a = d?.team?.agents.find(a => a.id === input.agentID);
       if (!d || d.ticket !== s.ticket || d.team?.error || !a || !['running', 'idle'].includes(a.status) ||
         !s.capabilities[input.action === 'stop' ? 'subagentStop' : 'subagentChat'] || input.action === 'interrupt')
         this.fail(409, 'Exact subagent is ended, unavailable, or unsupported. No fallback was sent.');
     } else if (!s.capabilities.steering) this.fail(409, 'This session does not support steering.');
-    if (this.controls.size >= 256 || this.pending.size >= 8) this.fail(429, 'Control safety history is full or too many commands await acknowledgment. Wait for a new native generation.');
-    const r = { ...payload, device: device.id, digest, nativeID: randomUUID() };
-    this.controls.set(key, r);
+    if (off && this.offControls.get(s.id)?.offTicket === input.offTicket)
+      this.fail(409, 'Off for this exact policy epoch is already pending or uncertain. Check the Mac; it will not be replayed.');
+    if ((!off && this.controls.size >= 256) || this.pending.size >= (off ? 9 : 8))
+      notDispatched(429, 'Control safety history is full or too many commands await acknowledgment. Wait for a new native generation.');
+    const r = { ...payload, key, device: device.id, digest, nativeID: off ? input.offTicket : randomUUID(),
+      ...(policy ? { policyRevision: s.dangerousAutoYes.revision } : {}) };
+    // One slot per session; replacement is safe only when native Off authority has invalidated the old epoch.
+    if (off) this.offControls.set(s.id, r);
+    else this.controls.set(key, r);
     return new Promise(resolve => {
       r.resolve = resolve;
       r.timer = setTimeout(() => this.complete(r, 504, { ok: false, status: 'unknown',

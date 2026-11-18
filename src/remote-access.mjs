@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { object } from './validation.mjs';
+import { isOffID, isPolicyOffRPC } from './workspace.mjs';
 
 const ownerFields = ['issuer', 'subject', 'macID'];
 const deviceFields = ['deviceID', 'keyHash'];
@@ -166,17 +167,24 @@ export class RemoteAccess {
       typeof send !== 'function') fail(400, 'Invalid remote command envelope.');
     if (command.epoch !== this.#epoch) fail(409, 'Remote command belongs to an expired epoch.');
     const payload = Buffer.from(command.payload);
+    let off = false;
+    try { off = isPolicyOffRPC(command.id, JSON.parse(payload)); } catch {}
+    if (isOffID(command.id) && !off) fail(400, 'Off UUIDs cannot identify other remote work.');
     const key = `${peer.deviceID}\0${command.id.toLowerCase()}`;
     const digest = createHash('sha256').update(payload).digest('hex');
-    const existing = this.#history.get(key);
+    const existing = this.#history.get(key) ?? [...this.#pending].find(record => record.offKey === key)?.digest;
     if (existing !== undefined) fail(409, existing === digest
       ? 'Remote command already dispatched; its outcome may be unknown. Do not resend.'
       : 'Remote command UUID was reused with different content.');
-    if (this.#history.size >= 256 || this.#pending.size >= 8)
+    if ((!off && this.#history.size >= 256) || this.#pending.size >= (off ? 9 : 8)) {
+      if (off) return { status: 429, data: { notDispatched: true, error: 'Too many remote commands await acknowledgment.' } };
       fail(429, 'Remote command safety history or pending limit reached.');
+    }
     this.authorize(handle);
-    const reservation = {};
-    this.#history.set(key, digest);
+    const reservation = { offKey: off ? key : undefined, digest };
+    // Only epoch-bound Off delegates replay admission to Workspace's bounded native-authority ledger.
+    // Ordinary UUID history is never evicted; malformed/repurposed Off IDs cannot enter this lane.
+    if (!off) this.#history.set(key, digest);
     this.#pending.add(reservation);
     try {
       // No await between final authorization/reservation and dispatch invocation.

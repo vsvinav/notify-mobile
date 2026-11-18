@@ -62,7 +62,14 @@ export class RemoteActions {
       try { return await this.#workspace.read(input, device, response); }
       finally { signal?.removeEventListener('abort', abort); }
     }
-    if (path === 'control') return this.#workspace.control(input, device);
+    if (path === 'control') {
+      try { return await this.#workspace.control(input, device); }
+      catch (error) {
+        if (input.action === 'dangerous_auto_yes' && input.enabled === false && error.notDispatched === true)
+          return { status: error.status, data: { error: error.message, notDispatched: true } };
+        throw error;
+      }
+    }
     if (path !== 'reply') fail(404, 'Unsupported remote action.');
     if (!fresh) fail(503, 'Native snapshot is stale. Reconnect before replying.');
     const item = this.#requests.find(item => item.sessionID === input.sessionID &&

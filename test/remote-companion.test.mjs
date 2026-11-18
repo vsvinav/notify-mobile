@@ -690,6 +690,96 @@ async function renewalFixture(t, { pendingApproval = false, renew, status, finis
     saved: () => readFile(join(directory, 'identity.json'), 'utf8') };
 }
 
+test('approved companion admits one urgent Off beyond eight inflight requests, not a tenth request', async t => {
+  const f = await renewalFixture(t);
+  const epoch = f.frames.find(frame => frame.type === 'ready').epoch;
+  const offTicket = '00000000-0000-8000-8000-000000000001';
+  await f.helper.command({ type: 'workspace', total: 1, truncated: false, sessions: [{
+    id: 's', ticket: 't', name: 'Synthetic', project: '', agent: 'copilot', color: '#123456',
+    state: 'working', connected: true, runningCount: 0, idleCount: 0,
+    capabilities: { steering: true, subagentChat: false, subagentStop: false, dangerousAutoYes: true },
+    dangerousAutoYes: { ticket: 'p', offTicket, revision: 1, enabled: true, normalEnabled: false }
+  }] });
+  const rpc = data => ({ id: data.id, epoch, payload: { path: 'control', data } });
+  const queue = () => ({ id: randomUUID(), sessionID: 's', ticket: 't', action: 'queue', text: 'Synthetic' });
+  for (let i = 0; i < 8; i++) await f.receive(rpc(queue()));
+  const off = rpc({ id: offTicket, sessionID: 's', ticket: 't', action: 'dangerous_auto_yes',
+    enabled: false, text: '', policyTicket: 'p', offTicket });
+  await f.receive(off);
+  assert.equal(f.events.filter(event => event.type === 'control').length, 9);
+  await assert.rejects(f.receive(rpc(queue())), /busy/);
+  await assert.rejects(f.receive(off), /duplicated/);
+  assert.equal(f.events.filter(event => event.type === 'control').length, 9);
+  await f.helper.command({ type: 'control_result', id: offTicket, ok: true, commandID: offTicket,
+    status: 'applied', detail: '', dangerousAutoYes: {
+      ticket: 'p2', offTicket: '00000000-0000-8000-8000-000000000002', revision: 2, enabled: false, normalEnabled: false
+    } });
+  await settle();
+  assert.equal(f.frames.findLast(frame => frame.id === offTicket).data.dangerousAutoYes.enabled, false);
+});
+
+test('approved companion stale Off can be explicitly retried after refresh and 300 Off epochs survive full history', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const f = await renewalFixture(t);
+  const epoch = f.frames.find(frame => frame.type === 'ready').epoch;
+  const token = () => randomUUID().replace(/^(.{14})./, '$18');
+  let policy = { ticket: randomUUID(), offTicket: token(), revision: 1, enabled: false, normalEnabled: false };
+  const publish = () => f.helper.command({ type: 'workspace', total: 1, truncated: false, sessions: [{
+    id: 's', ticket: 't', name: 'Synthetic', project: '', agent: 'copilot', color: '#123456',
+    state: 'working', connected: true, runningCount: 0, idleCount: 0,
+    capabilities: { steering: true, subagentChat: false, subagentStop: false, dangerousAutoYes: true },
+    dangerousAutoYes: { ...policy }
+  }] });
+  const command = enabled => ({ id: enabled ? randomUUID() : policy.offTicket, sessionID: 's', ticket: 't',
+    action: 'dangerous_auto_yes', enabled, text: '', policyTicket: policy.ticket, offTicket: policy.offTicket });
+  const send = async data => {
+    await f.receive({ id: data.id, epoch, payload: { path: 'control', data } });
+    await settle();
+  };
+  const ack = async () => {
+    const event = f.events.findLast(e => e.type === 'control');
+    if (event.action === 'dangerous_auto_yes')
+      policy = { ...policy, ticket: randomUUID(), revision: policy.revision + 1, enabled: event.enabled,
+        offTicket: event.enabled ? policy.offTicket : token() };
+    await f.helper.command({ type: 'control_result', id: event.id, ok: true, commandID: randomUUID(),
+      status: event.action === 'dangerous_auto_yes' ? 'applied' : 'queued', detail: '',
+      ...(event.action === 'dangerous_auto_yes' ? { dangerousAutoYes: { ...policy } } : {}) });
+    await settle();
+  };
+  await publish();
+  const declined = command(false);
+  t.mock.timers.tick(12001);
+  await send(declined);
+  assert.equal(f.frames.findLast(frame => frame.id === declined.id).status, 503);
+  assert.equal(f.frames.findLast(frame => frame.id === declined.id).data.notDispatched, true);
+  assert.equal(f.events.filter(e => e.type === 'control').length, 0);
+  await publish();
+  await send(declined); await ack();
+  assert.equal(f.frames.findLast(frame => frame.id === declined.id).status, 200);
+  const first = { id: randomUUID(), sessionID: 's', ticket: 't', action: 'queue', text: 'Synthetic' };
+  for (let i = 0; i < 255; i++) { await send(i === 0 ? first : { ...first, id: randomUUID() }); await ack(); }
+  await send(command(true)); await ack();
+  for (let i = 0; i < 300; i++) {
+    const off = command(false);
+    const count = f.events.filter(e => e.type === 'control').length;
+    await send(off);
+    assert.equal(f.events.filter(e => e.type === 'control').length, count + 1);
+    await ack();
+    assert.equal(f.frames.findLast(frame => frame.id === off.id).data.dangerousAutoYes.enabled, false);
+    policy = { ...policy, enabled: true, ticket: randomUUID(), revision: policy.revision + 1 };
+    await publish();
+  }
+  const count = f.events.filter(e => e.type === 'control').length;
+  await send(first);
+  assert.equal(f.frames.findLast(frame => frame.id === first.id).status, 409);
+  const excess = { ...first, id: randomUUID() };
+  await send(excess);
+  assert.equal(f.frames.findLast(frame => frame.id === excess.id).status, 429);
+  await send(declined);
+  assert.equal(f.frames.findLast(frame => frame.id === declined.id).status, 409);
+  assert.equal(f.events.filter(e => e.type === 'control').length, count);
+});
+
 for (const changedIdentity of [false, true]) {
   test(`retired native signer ${changedIdentity ? 'rejects a changed identity' : 'recovers with the pinned identity without replay'}`, async t => {
     const processes = [], otherKey = key();
