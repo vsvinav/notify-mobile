@@ -73,6 +73,20 @@ async function openSession(page) {
   await expect(page.getByLabel('Chat with', { exact: true })).toBeVisible();
 }
 
+test('main chat displays unconsumed steering submitted from a native client', async ({ page }) => {
+  workspace.detail.controls = [{ id: 'native-steering', action: 'send', message: 'Keep the current changes',
+    status: 'submitted', detail: 'Waiting for next model request', createdAt: '2026-11-14T12:01:00Z' }];
+  changed();
+  await openSession(page);
+  await expect(page.locator('.chat-feed')).toContainText('Keep the current changes');
+  await expect(page.locator('.chat-feed')).toContainText('Waiting for next model request');
+  workspace.detail.controls[0].status = 'received';
+  workspace.detail.activity.push({ ...entry('consumed-steering', 'user', 'Keep the current changes'),
+    clientTurnID: 'native-steering' });
+  changed();
+  await expect(page.locator('.chat-feed').getByText('Keep the current changes', { exact: true })).toHaveCount(1);
+});
+
 test('phone chat fills the viewport with reachable composer and bottom navigation', async ({ page }) => {
   await openSession(page);
   await expect(page.getByText('Comparing the reported release targets.', { exact: true })).toBeHidden();
