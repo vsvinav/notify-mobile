@@ -256,7 +256,7 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
     if (!selected) { feed.append(el('p', 'Waiting for this session’s details…', 'empty')); return; }
     const activity = selected.activity.filter(item => (item.agentID ?? '') === agentID);
     const messages = activity.filter(item => ['user', 'assistant'].includes(item.kind));
-    for (const control of selected.controls.filter(item => (item.agentID ?? '') === agentID && ['queue', 'interrupt'].includes(item.action))) {
+    for (const control of selected.controls.filter(item => (item.agentID ?? '') === agentID && ['send', 'queue', 'interrupt'].includes(item.action))) {
       if (!messages.some(item => item.clientTurnID === control.id)) messages.push({
         ...control, kind: 'user', title: 'Your message', timestamp: control.createdAt, detail: control.message,
         delivery: control.detail || control.status

@@ -127,6 +127,13 @@ The org chart initially shows running helpers, with idle helpers grouped into **
 
 Phone drafts stay separate for each target and do not overwrite Mac drafts. Switching views or using browser Back/Forward keeps them; they are held only in the open phone page, so reloading or losing pairing clears them. Sending instructions can use your existing model credits. **Queued** means accepted into the agent's queue, not finished; failures and uncertain delivery are shown explicitly, and instructions are never retried automatically.
 
+The LAN browser's main-agent Send continues to queue. Updated native Mac and
+Android clients can offer **Send** before Copilot's next model request, plus
+explicit **Queue**, only with the matching updated helper and reloaded extension.
+Older connections offer Queue instead. **Submitted** is acceptance, not
+consumption; **Received** requires the runtime's matching message event. The
+browser also displays these native-client receipts without changing how it sends.
+
 **Android approval alerts:** Mac build 11 and the matching helper can send a
 generic waiting-work nudge without an open encrypted phone conversation. Later
 requests are coalesced across the service cooldown; failed/deferred nudges get a

@@ -27,7 +27,7 @@ const count = v => Number.isSafeInteger(v) && v >= 0 && v <= 1000000;
 const unique = values => new Set(values).size === values.length;
 const bytes = v => Buffer.byteLength(JSON.stringify(v));
 const fingerprint = v => createHash('sha256').update(JSON.stringify(v)).digest('hex');
-const allowedStatuses = ['sending', 'queued', 'received', 'stopped', 'cancelled', 'failed', 'unknown'];
+const allowedStatuses = ['sending', 'submitted', 'queued', 'received', 'stopped', 'cancelled', 'failed', 'unknown'];
 const managementStatuses = { create_subagent: 'created', remove_subagent: 'removed', stop_idle_subagents: 'cleaned' };
 const sessionStatuses = { set_session_color: 'color_saved', reset_session_color: 'color_reset',
   move_session: 'session_moved', remove_session: 'session_removed', resume_session: 'launched' };
@@ -57,6 +57,7 @@ export function validWorkspace(m) {
     m.sessions.every(s => object(s) && id(s.id) && ticket(s.ticket) && str(s.name, 65535) && str(s.project, 65535) &&
       str(s.agent, 128) && /^#[a-f\d]{6}$/i.test(s.color) && str(s.state, 128) && bool(s.connected) &&
       object(s.capabilities) && ['steering', 'subagentChat', 'subagentStop'].every(k => bool(s.capabilities[k])) &&
+      (s.capabilities.steeringImmediate === undefined || bool(s.capabilities.steeringImmediate)) &&
       (s.capabilities.dangerousAutoYes === undefined || bool(s.capabilities.dangerousAutoYes)) &&
       (s.dangerousAutoYes === undefined || validPolicy(s.dangerousAutoYes)) &&
       (!s.capabilities.dangerousAutoYes || validPolicy(s.dangerousAutoYes)) &&
@@ -89,7 +90,8 @@ export function validWorkspaceDetail(m) {
       ['running', 'complete', 'failed', 'info'].includes(a.status) && str(a.timestamp, 64) &&
       (a.agentID == null || id(a.agentID)) && (a.clientTurnID == null || id(a.clientTurnID))) &&
     Array.isArray(m.controls) && m.controls.length <= 100 && unique(m.controls.map(c => c?.id)) &&
-    m.controls.every(c => object(c) && id(c.id) && ['queue', 'interrupt', 'stop'].includes(c.action) &&
+    m.controls.every(c => object(c) && id(c.id) && ['send', 'queue', 'interrupt', 'stop'].includes(c.action) &&
+      (c.action === 'send' ? c.agentID == null && c.status !== 'queued' : c.status !== 'submitted') &&
       str(c.message, 16000) && allowedStatuses.includes(c.status) && str(c.detail, 4000) &&
       (c.agentID == null || id(c.agentID)) && str(c.createdAt, 64, true) && Number.isFinite(Date.parse(c.createdAt)));
 }
@@ -122,7 +124,7 @@ export class Workspace {
     const connected = this.fresh();
     const sid = this.selections.get(deviceID)?.sessionID;
     const detail = this.details.get(sid);
-    const value = { dangerousAutoYesControl: true, dangerousAutoYesOffEpoch: true, subagentManagementControl: true, sessionActionsControl: true,
+    const value = { steeringImmediateControl: true, dangerousAutoYesControl: true, dangerousAutoYesOffEpoch: true, subagentManagementControl: true, sessionActionsControl: true,
       connected, sessions: connected ? this.sessions : [], total: connected ? this.total : 0,
       truncated: connected ? this.truncated : false,
       detail: connected && detail && this.live(sid, detail.ticket) ? detail : null,
@@ -183,7 +185,8 @@ export class Workspace {
             m.dangerousAutoYes.revision > r.policyRevision && (r.enabled || m.dangerousAutoYes.offTicket !== r.offTicket)
           : sessionAction ? m.status === sessionStatuses[r.action] && m.commandID === r.nativeID
           : management ? m.status === managementStatuses[r.action]
-          : r.action === 'stop' ? m.status === 'stopped' : ['queued', 'received'].includes(m.status))))) {
+          : r.action === 'stop' ? m.status === 'stopped'
+          : (r.action === 'send' ? ['submitted', 'received'] : ['queued', 'received']).includes(m.status))))) {
         this.complete(r, 502, { ok: false, status: 'unknown', error: 'Invalid native control acknowledgment. Check the Mac.' }); return;
       }
       if (policy && validPolicy(m.dangerousAutoYes)) {
@@ -257,7 +260,7 @@ export class Workspace {
     const management = Object.hasOwn(managementStatuses, input.action);
     const sessionAction = Object.hasOwn(sessionStatuses, input.action);
     if (!str(input.id, 36) || !/^[a-f\d]{8}(-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(input.id) ||
-      !id(input.sessionID) || !ticket(input.ticket) || !(['queue', 'interrupt', 'stop', 'dangerous_auto_yes'].includes(input.action) || management || sessionAction) ||
+      !id(input.sessionID) || !ticket(input.ticket) || !(['send', 'queue', 'interrupt', 'stop', 'dangerous_auto_yes'].includes(input.action) || management || sessionAction) ||
       !str(input.text, 16000) || (input.action === 'stop' || policy || management || sessionAction ? input.text !== '' : !input.text.trim()) ||
       (sessionAction ? !ticket(input.sessionTicket) || input.id[14] !== '4' || input.agentID !== undefined ||
         (input.action === 'set_session_color' ? !rgb(input.rgb) : input.rgb !== undefined) ||
@@ -339,9 +342,10 @@ export class Workspace {
     } else if (input.agentID) {
       const d = this.details.get(s.id), a = d?.team?.agents.find(a => a.id === input.agentID);
       if (!d || d.ticket !== s.ticket || d.team?.error || !a || !['running', 'idle'].includes(a.status) ||
-        !s.capabilities[input.action === 'stop' ? 'subagentStop' : 'subagentChat'] || input.action === 'interrupt')
+        !s.capabilities[input.action === 'stop' ? 'subagentStop' : 'subagentChat'] || ['send', 'interrupt'].includes(input.action))
         this.fail(409, 'Exact subagent is ended, unavailable, or unsupported. No fallback was sent.');
-    } else if (!s.capabilities.steering) this.fail(409, 'This session does not support steering.');
+    } else if (!s.capabilities.steering || input.action === 'send' && s.capabilities.steeringImmediate !== true)
+      this.fail(409, 'This session does not support the requested delivery mode. Reload its Notify extension or choose Queue.');
     if (off && this.offControls.get(s.id)?.offTicket === input.offTicket)
       this.fail(409, 'Off for this exact policy epoch is already pending or uncertain. Check the Mac; it will not be replayed.');
     if (management && (this.controls.size >= 256 || this.pending.size >= 8))

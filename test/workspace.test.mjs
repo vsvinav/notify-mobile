@@ -26,6 +26,40 @@ const managedSession = () => ({ ...session(), managementTicket: 'management-1',
 const creationControl = (extra = {}) => control({ action: 'create_subagent', text: '', managementTicket: 'management-1',
   creation: { name: 'Reviewer', agentType: 'reviewer', prompt: '  Review exactly\n', model: 'live-model' }, ...extra });
 
+test('immediate Send requires advertised main support and preserves submitted ACK identity', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  await assert.rejects(w.control(control({ action: 'send' }), devices[0]), { status: 409 });
+  const capable = { ...session(), capabilities: { ...session().capabilities, steeringImmediate: true } };
+  w.command(overview(capable));
+  assert.equal(w.payload(devices[0].id).steeringImmediateControl, true);
+  for (const extra of [{ agentID: 'child' }, { ticket: 'stale' }]) {
+    await assert.rejects(w.control(control({ action: 'send', ...extra }), devices[0]), { status: 409 });
+  }
+  const input = control({ action: 'send' });
+  const pending = w.control(input, devices[0]);
+  const sent = events.at(-1);
+  assert.equal(sent.action, 'send');
+  w.command({ type: 'control_result', id: sent.id, ok: true, commandID: 'send-receipt',
+    status: 'submitted', detail: 'Waiting for next model request' });
+  assert.equal((await pending).data.status, 'submitted');
+  assert.equal((await w.control(input, devices[0])).data.commandID, 'send-receipt');
+  assert.equal(events.at(-1), sent, 'Replaying a submitted command must not emit another send');
+  await assert.rejects(w.control({ ...input, action: 'queue' }, devices[0]), { status: 409 });
+  await w.read({ sessionID: 'one' }, devices[0], new EventEmitter());
+  const saved = detail();
+  saved.controls.push({ id: 'send-receipt', action: 'send', message: input.text, status: 'submitted',
+    detail: 'Waiting for next model request', createdAt: '2026-01-01T00:00:00Z' });
+  w.command(saved);
+  assert.equal(w.payload(devices[0].id).detail.controls[0].status, 'submitted');
+  for (const [action, status] of [['send', 'queued'], ['queue', 'submitted'], ['interrupt', 'submitted']]) {
+    const wrong = w.control(control({ action }), devices[0]);
+    w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'wrong', status, detail: '' });
+    assert.equal((await wrong).data.status, 'unknown', 'ACK mode cannot change the requested delivery mode');
+  }
+  w.command(overview(session()));
+  await assert.rejects(w.control(control({ action: 'send' }), devices[0]), { status: 409 });
+});
+
 test('phone management dispatch uses live catalogs and action-specific runtime ACK, not chat acceptance', async t => {
   const f = await fixture(); t.after(f.close);
   const auth = await pair(f);
