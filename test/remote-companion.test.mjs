@@ -14,6 +14,96 @@ import { createRemoteAuthority } from '../src/remote-authority.mjs';
 
 const key = () => { const ecdh = createECDH('prime256v1'); ecdh.generateKeys(); return ecdh.getPublicKey().toString('base64url'); };
 
+test('generic attention reaches an enrolled background phone without a live relay', async t => {
+  const root = join(process.cwd(), '.test-data');
+  await mkdir(root, { recursive: true });
+  const directory = await mkdtemp(join(root, 'background-attention-'));
+  const origin = 'https://notify.example', macID = randomUUID(), macKey = key();
+  const device = { id: randomUUID(), name: 'Phone', publicKey: key() };
+  await writeFile(join(directory, 'identity.json'), JSON.stringify({
+    version: 1, origin, macID, publicKey: macKey, owner: { issuer: origin, subject: 'owner' },
+    devices: [device], credential: 'c'.repeat(43), setupID: 'setup'
+  }), { mode: 0o600 });
+  let time = 0, rejectAttention = false;
+  t.mock.method(performance, 'now', () => time);
+  const sent = [], events = [];
+  const helper = await createRemoteCompanion({
+    directory, origin, emit: event => events.push(event),
+    cryptoProcess: () => ({
+      async call(op) {
+        assert.equal(op, 'identity');
+        return [...Buffer.from(macKey, 'base64url')];
+      },
+      async close() {}
+    }),
+    fetchRequest: async (url, options) => {
+      if (url.endsWith('/mac/attention')) {
+        sent.push(JSON.parse(options.body));
+        return rejectAttention ? Response.json({ error: 'Unavailable' }, { status: 503 })
+          : Response.json({ accepted: true });
+      }
+      if (url.endsWith('/mac/status')) return Response.json({
+        macID, pending: null, devices: [{ deviceID: device.id, name: device.name, publicKey: device.publicKey }]
+      });
+      return Response.json({ error: 'No foreground phone' }, { status: 503 });
+    }
+  });
+  try {
+    await helper.command({ type: 'attention', waiting: true, changed: true });
+    await until(() => sent.length === 1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(Object.keys(sent[0]).sort(), ['eventID', 'issuedAt']);
+    assert.ok(events.every(e => e.type !== 'status' || e.status.state !== 'connected'));
+
+    time = 5000;
+    await helper.command({ type: 'attention', waiting: true, changed: true });
+    assert.equal(sent.length, 1, 'Burst requests are coalesced, not spammed');
+    time = 32000;
+    await helper.command({ type: 'attention', waiting: true, changed: false });
+    await until(() => sent.length === 2);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.notEqual(sent[0].eventID, sent[1].eventID, 'A later waiting request must not be dropped');
+
+    rejectAttention = true;
+    time = 64000;
+    await helper.command({ type: 'attention', waiting: true, changed: true });
+    await until(() => events.some(e => e.status?.message?.includes('Phone alert')));
+    rejectAttention = false;
+    time = 96000;
+    await helper.command({ type: 'attention', waiting: true, changed: false });
+    await until(() => sent.length === 4);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.notEqual(sent[2].eventID, sent[3].eventID);
+
+    await helper.command({ type: 'attention', waiting: true, changed: true });
+    await helper.command({ type: 'attention', waiting: false, changed: false });
+    time = 128000;
+    await helper.command({ type: 'attention', waiting: false, changed: false });
+    assert.equal(sent.length, 4, 'Resolved work cancels a deferred reminder');
+    await assert.rejects(helper.command({ type: 'attention', waiting: true, changed: true, request: 'private' }));
+    time = 160000;
+    await helper.command({ type: 'attention', waiting: true, changed: true });
+    await until(() => sent.length === 5);
+    await new Promise(resolve => setImmediate(resolve));
+    time = 165000;
+    await helper.command({ type: 'attention', waiting: true, changed: true });
+    await helper.command({ type: 'offline' });
+    time = 175000;
+    await helper.command({ type: 'heartbeat' });
+    time = 192000;
+    await helper.command({ type: 'attention', waiting: true, changed: false });
+    assert.equal(sent.length, 6, 'A brief Mac sleep must not erase a still-waiting deferred alert');
+    await new Promise(resolve => setImmediate(resolve));
+    time = 197000;
+    await helper.command({ type: 'attention', waiting: true, changed: true });
+    await helper.command({ type: 'offline' });
+    time = 400000;
+    await helper.command({ type: 'heartbeat' });
+    await helper.command({ type: 'attention', waiting: true, changed: false });
+    assert.equal(sent.length, 6, 'Sleep must not extend the original retry expiry');
+  } finally { await helper.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test('native startup prepares one QR without blocking heartbeats behind the invitation', async () => {
   const source = await readFile(new URL('../src/remote-main.mjs', import.meta.url), 'utf8');
   const dependency = "import { createRemoteCompanion } from './remote-companion.mjs';";

@@ -127,6 +127,18 @@ The org chart initially shows running helpers, with idle helpers grouped into **
 
 Phone drafts stay separate for each target and do not overwrite Mac drafts. Switching views or using browser Back/Forward keeps them; they are held only in the open phone page, so reloading or losing pairing clears them. Sending instructions can use your existing model credits. **Queued** means accepted into the agent's queue, not finished; failures and uncertain delivery are shown explicitly, and instructions are never retried automatically.
 
+**Android approval alerts:** Mac build 11 and the matching helper can send a
+generic waiting-work nudge without an open encrypted phone conversation. Later
+requests are coalesced across the service cooldown; failed/deferred nudges get a
+bounded two-minute retry window while work remains waiting, including a brief
+Mac sleep/wake. No conversation or command data is added to push. Android 0.3.1
+also accepts foreground alerts and removes a redundant client cooldown.
+An installed-build, real-internet locked-phone check confirmed delivery and
+physical vibration; sound and other device/network configurations remain
+unverified. Internet must be explicitly re-enabled after Notify launches, and
+the Mac must be awake and online. These are native-helper/client changes, not a
+requirement to redeploy the hosted service.
+
 **Native Android source preview:** matching updated Android and Mac builds can
 control the Mac-owned per-session Dangerous Auto-yes policy through this helper.
 Enabling requires explicit high-risk confirmation; eligible waiting and future
