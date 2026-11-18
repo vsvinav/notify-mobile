@@ -35,6 +35,7 @@ process.stdin.on('data', chunk => {
           throw new Error('Invalid or duplicate internet start command.');
         companion = await createRemoteCompanion({ directory: command.directory, origin: command.origin, emit });
         if (stopping) await companion.close();
+        else void companion.prepareInvitation();
       } else if (command?.type === 'stop') await stop();
       else {
         if (!companion) throw new Error('Start internet access locally first.');

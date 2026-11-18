@@ -63,6 +63,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
   const file = join(directory, 'identity.json');
   let state, writer = Promise.resolve(), auth, signer, signerWork, policyWork;
   let closed = false, paused = false, polling, pollController, registration, pending, approving, setupID, serverDevices = [];
+  let invitationWork, invitationUnavailable = false;
   let message = 'Waiting for phone sign-in.', fault, enrollmentError;
   const channels = new Map();
   const channelWork = new Set(), lifetime = new AbortController();
@@ -158,7 +159,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
     emit({ type: 'status', status: {
       state: fault || enrollmentError ? 'error' : paused ? 'paused' : active ? 'connected' : pending ? 'pairing' : 'connecting',
       url: origin, devices, pendingPairingIDs: pending ? [pending.id] : [],
-      ...(setupID ? { setupURL: `${origin}/#setup=${encodeURIComponent(setupID)}&mac=${state.macID}&key=${state.publicKey}` } : {}),
+      ...(setupID && !invitationUnavailable ? { setupURL: `${origin}/#setup=${encodeURIComponent(setupID)}&mac=${state.macID}&key=${state.publicKey}` } : {}),
       ...(message ? { message } : {})
     } });
   }
@@ -420,16 +421,20 @@ export async function createRemoteCompanion({ directory, origin, emit,
     polling = poll(pollController.signal);
   }
   async function poll(signal) {
+    let credential;
     try {
       if (!state.credential) await register(signal);
-      const remote = await api('mac/status', {}, state.credential, signal);
+      credential = state.credential;
+      const remote = await api('mac/status', {}, credential, signal);
       signal.throwIfAborted();
+      if (credential !== state.credential) return;
       if (remote.macID !== state.macID || !Array.isArray(remote.devices) || remote.devices.length > 8 ||
         !remote.devices.every(d => uuid(d.deviceID) && validKey(d.publicKey) && text(d.name, 100)))
         fail(502, 'Invalid registered-phone state.');
-      serverDevices = remote.devices;
       while (policyWork) await policyWork;
       signal.throwIfAborted();
+      if (credential !== state.credential) return;
+      serverDevices = remote.devices;
       if (auth) auth.enable();
       if (remote.pending !== null) {
         const p = remote.pending;
@@ -455,7 +460,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
       }
       status();
     } catch (error) {
-      if (closed || signal.aborted) return;
+      if (closed || signal.aborted || (credential && credential !== state.credential)) return;
       if (error.status === 401 || error.status === 403 || error.status === 409) {
         enrollmentError = error;
         message = error.status === 401
@@ -474,6 +479,40 @@ export async function createRemoteCompanion({ directory, origin, emit,
       } else fatal(error);
     } finally { polling = undefined; }
   }
+  function invite() {
+    invitationWork ??= inviteOnce().finally(() => { invitationWork = undefined; });
+    return invitationWork;
+  }
+  async function inviteOnce() {
+    invitationUnavailable = true;
+    status();
+    if (pending) fail(409, 'Finish or reject the pending phone first.');
+    let existing = false;
+    if (state.credential) {
+      try { await api('mac/status', {}, state.credential); existing = true; }
+      catch (error) { if (error.status !== 401) throw error; }
+    }
+    if (!existing) await register();
+    else {
+      const invitation = await api('mac/invite', {}, state.credential);
+      if (!/^[\w-]{43}$/.test(invitation.setupID) || !Number.isSafeInteger(invitation.expiresAt) ||
+        invitation.expiresAt <= Date.now() || invitation.expiresAt > Date.now() + 180000)
+        fail(502, 'Invalid pairing invitation.');
+      await save(current => ({ ...current, setupID: invitation.setupID }));
+    }
+    enrollmentError = undefined;
+    invitationUnavailable = false;
+    setupID = state.setupID ?? undefined;
+    message = "Scan this Mac's code and sign in on your phone."; status();
+  }
+  async function prepareInvitation() {
+    try { await command({ type: 'invite' }); }
+    catch (error) {
+      if (closed || paused) return;
+      message = `Could not prepare a fresh pairing QR. Choose "Pair an internet device" to retry. ${error.message}`.slice(0, 500);
+      status();
+    }
+  }
   async function command(input) {
     if (!object(input) || closed || fault) fail(503, 'Internet helper is unavailable.');
     if (input.type === 'offline') {
@@ -486,23 +525,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
       status(); void tick(); return;
     }
     if (input.type === 'invite') {
-      if (pending) fail(409, 'Finish or reject the pending phone first.');
-      let existing = false;
-      if (state.credential) {
-        try { await api('mac/status', {}, state.credential); existing = true; }
-        catch (error) { if (error.status !== 401) throw error; }
-      }
-      if (!existing) await register();
-      else {
-        const invitation = await api('mac/invite', {}, state.credential);
-        if (!/^[\w-]{43}$/.test(invitation.setupID) || !Number.isSafeInteger(invitation.expiresAt) ||
-          invitation.expiresAt <= Date.now() || invitation.expiresAt > Date.now() + 180000)
-          fail(502, 'Invalid pairing invitation.');
-        await save(current => ({ ...current, setupID: invitation.setupID }));
-      }
-      enrollmentError = undefined;
-      setupID = state.setupID ?? undefined;
-      message = "Scan this Mac's code and sign in on your phone."; status(); return;
+      return invite();
     }
     if (input.type === 'pair') {
       if (!pending || pending.id !== input.id || pending.expiresAt <= Date.now()) fail(409, 'Phone pairing expired.');
@@ -547,12 +570,13 @@ export async function createRemoteCompanion({ directory, origin, emit,
   const timer = setInterval(() => { void tick(); }, 3000);
   timer.unref();
   status(); void tick();
-  return { command, async close() {
+  return { command, prepareInvitation, async close() {
     if (closed) return;
     closed = true; clearInterval(timer); lifetime.abort(); auth?.disable(); actions.close();
     for (const channel of channels.values()) channel.controller.abort();
     await signer.close();
     await polling;
+    await Promise.allSettled([invitationWork]);
     await attentionWork;
     await Promise.all(channelWork);
     await writer;

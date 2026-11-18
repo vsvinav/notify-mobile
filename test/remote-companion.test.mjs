@@ -13,6 +13,38 @@ import { certificates } from '../src/certificates.mjs';
 import { createRemoteAuthority } from '../src/remote-authority.mjs';
 
 const key = () => { const ecdh = createECDH('prime256v1'); ecdh.generateKeys(); return ecdh.getPublicKey().toString('base64url'); };
+
+test('native startup prepares one QR without blocking heartbeats behind the invitation', async () => {
+  const source = await readFile(new URL('../src/remote-main.mjs', import.meta.url), 'utf8');
+  const dependency = "import { createRemoteCompanion } from './remote-companion.mjs';";
+  assert.equal(source.split(dependency).length, 2);
+  const fixture = source.replace(dependency, `
+    const createRemoteCompanion = async ({ emit }) => {
+      let prepared = 0, release;
+      return {
+        prepareInvitation() {
+          prepared++;
+          return new Promise(resolve => { release = resolve; });
+        },
+        async command(value) {
+          if (value.type !== 'heartbeat') throw Error('Unexpected fixture command');
+          emit({ type: 'fixture', prepared, heartbeat: true });
+          release?.();
+        },
+        async close() { release?.(); }
+      };
+    };
+  `);
+  const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', fixture + `
+    process.stdin.emit('data', Buffer.from(
+      JSON.stringify({ type: 'start', directory: 'fixture', origin: 'https://notify.example' }) + '\\n' +
+      JSON.stringify({ type: 'heartbeat' }) + '\\n'));
+    setImmediate(() => process.stdin.emit('end'));
+  `], { timeout: 5000 });
+  const events = stdout.trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(events, [{ type: 'fixture', prepared: 1, heartbeat: true }]);
+});
+
 async function until(predicate) {
   const end = Date.now() + 3000;
   while (!predicate()) {
@@ -243,7 +275,7 @@ for (const outcome of ['registered', 'retry', 'cancelled']) {
   });
 }
 
-test('explicit invitation refreshes a restarted service locator without replacing saved Mac trust', async t => {
+test('preparing the startup QR and an immediate manual request share one fresh invitation', async t => {
   const directory = join(process.cwd(), '.test-data', randomUUID());
   await mkdir(directory, { recursive: true });
   const origin = 'https://notify.example', events = [], calls = [];
@@ -265,11 +297,110 @@ test('explicit invitation refreshes a restarted service locator without replacin
   });
   t.after(async () => { await helper.close(); await rm(directory, { recursive: true }); });
   await until(() => events.filter(event => event.type === 'status').length >= 2);
-  await helper.command({ type: 'invite' });
-  assert.ok(calls.includes('/v1/remote/mac/invite'));
+  await Promise.all([helper.prepareInvitation(), helper.command({ type: 'invite' })]);
+  assert.equal(calls.filter(path => path === '/v1/remote/mac/invite').length, 1);
   const updated = JSON.parse(await readFile(join(directory, 'identity.json'), 'utf8'));
   assert.deepEqual(updated, { ...state, setupID: 'n'.repeat(43) });
   assert.match(events.findLast(event => event.type === 'status').status.setupURL, new RegExp('n'.repeat(43)));
+});
+
+test('startup QR failure is visible without stopping the saved connection or advertising an old QR', async t => {
+  const directory = join(process.cwd(), '.test-data', randomUUID());
+  await mkdir(directory, { recursive: true });
+  const origin = 'https://notify.example', events = [];
+  const saved = { version: 1, origin, macID: randomUUID(), publicKey: key(),
+    owner: { issuer: origin, subject: 'owner' }, devices: [], credential: 'c'.repeat(43), setupID: 'old-setup' };
+  await writeFile(join(directory, 'identity.json'), JSON.stringify(saved), { mode: 0o600 });
+  let deny = true;
+  const helper = await createRemoteCompanion({ directory, origin, emit: event => events.push(event),
+    cryptoProcess: () => ({
+      async call() { return [...Buffer.from(saved.publicKey, 'base64url')]; }, async close() {}
+    }),
+    fetchRequest: async url => new URL(url).pathname.endsWith('/mac/invite')
+      ? deny ? Response.json({ error: 'Unavailable' }, { status: 503 })
+        : Response.json({ setupID: 'n'.repeat(43), expiresAt: Date.now() + 180000 })
+      : Response.json({ macID: saved.macID, pending: null, devices: [] })
+  });
+  t.after(async () => { await helper.close(); await rm(directory, { recursive: true }); });
+  await helper.prepareInvitation();
+  await helper.command({ type: 'heartbeat' });
+  await settle();
+  const status = events.findLast(event => event.type === 'status').status;
+  assert.equal(status.setupURL, undefined);
+  assert.match(status.message, /Pair an internet device/);
+  assert.notEqual(status.state, 'error');
+  assert.equal(events.some(event => event.type === 'error'), false);
+  assert.deepEqual(JSON.parse(await readFile(join(directory, 'identity.json'), 'utf8')), saved);
+  deny = false;
+  await helper.command({ type: 'invite' });
+  assert.match(events.findLast(event => event.type === 'status').status.setupURL, /n{43}/);
+});
+
+test('a late expired-registration poll cannot invalidate the fresh startup QR', async t => {
+  const directory = join(process.cwd(), '.test-data', randomUUID());
+  await mkdir(directory, { recursive: true });
+  const origin = 'https://notify.example', events = [], gate = Promise.withResolvers();
+  const saved = { version: 1, origin, macID: randomUUID(), publicKey: key(),
+    owner: null, devices: [], credential: 'c'.repeat(43), setupID: 'expired-setup' };
+  await writeFile(join(directory, 'identity.json'), JSON.stringify(saved), { mode: 0o600 });
+  let polls = 0;
+  const helper = await createRemoteCompanion({ directory, origin, emit: event => events.push(event),
+    cryptoProcess: () => ({
+      async call() { return [...Buffer.from(saved.publicKey, 'base64url')]; }, async close() {}
+    }),
+    fetchRequest: async (url, options) => {
+      const path = new URL(url).pathname;
+      if (path.endsWith('/mac/begin')) return Response.json({ id: 'begin', challenge: 'challenge' });
+      if (path.endsWith('/mac/register'))
+        return Response.json({ macID: saved.macID, credential: 'd'.repeat(43), setupID: 'n'.repeat(43) });
+      assert.ok(path.endsWith('/mac/status'));
+      if (++polls === 1) await gate.promise;
+      return options.headers.Authorization === `Bearer ${saved.credential}`
+        ? Response.json({ error: 'Expired' }, { status: 401 })
+        : Response.json({ macID: saved.macID, pending: null, devices: [] });
+    }
+  });
+  t.after(async () => { gate.resolve(); await helper.close(); await rm(directory, { recursive: true }); });
+  await until(() => polls === 1);
+  await helper.prepareInvitation();
+  assert.match(events.findLast(event => event.type === 'status').status.setupURL, /n{43}/);
+  gate.resolve();
+  await settle();
+  const status = events.findLast(event => event.type === 'status').status;
+  assert.notEqual(status.state, 'error');
+  assert.match(status.setupURL, /n{43}/);
+});
+
+test('closing during startup QR preparation cannot save or advertise a late invitation', async t => {
+  const directory = join(process.cwd(), '.test-data', randomUUID());
+  await mkdir(directory, { recursive: true });
+  const origin = 'https://notify.example', events = [], gate = Promise.withResolvers();
+  const saved = { version: 1, origin, macID: randomUUID(), publicKey: key(),
+    owner: null, devices: [], credential: 'c'.repeat(43), setupID: 'previous-setup' };
+  await writeFile(join(directory, 'identity.json'), JSON.stringify(saved), { mode: 0o600 });
+  let invitationSignal;
+  const helper = await createRemoteCompanion({ directory, origin, emit: event => events.push(event),
+    cryptoProcess: () => ({
+      async call() { return [...Buffer.from(saved.publicKey, 'base64url')]; }, async close() {}
+    }),
+    fetchRequest: async (url, options) => {
+      if (new URL(url).pathname.endsWith('/mac/invite')) {
+        invitationSignal = options.signal;
+        await gate.promise;
+        return Response.json({ setupID: 'n'.repeat(43), expiresAt: Date.now() + 180000 });
+      }
+      return Response.json({ macID: saved.macID, pending: null, devices: [] });
+    }
+  });
+  t.after(async () => { gate.resolve(); await helper.close(); await rm(directory, { recursive: true }); });
+  const preparation = helper.prepareInvitation();
+  await until(() => invitationSignal);
+  const closing = helper.close(), eventCount = events.length;
+  assert.equal(invitationSignal.aborted, true);
+  gate.resolve();
+  await Promise.all([preparation, closing]);
+  assert.equal(events.length, eventCount);
+  assert.deepEqual(JSON.parse(await readFile(join(directory, 'identity.json'), 'utf8')), saved);
 });
 
 for (const subject of ['original-owner', 'different-owner']) {
