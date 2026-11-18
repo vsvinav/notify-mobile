@@ -73,13 +73,54 @@ async function openSession(page) {
   await expect(page.getByLabel('Chat with', { exact: true })).toBeVisible();
 }
 
+test('phone chat fills the viewport with reachable composer and bottom navigation', async ({ page }) => {
+  await openSession(page);
+  await expect(page.getByText('Comparing the reported release targets.', { exact: true })).toBeHidden();
+  expect((await page.locator('.chat-feed').boundingBox()).height).toBeGreaterThan(280);
+  for (const size of [{ width: 390, height: 844 }, { width: 320, height: 480 }]) {
+    await page.setViewportSize(size);
+    await expect.poll(async () => {
+      const bounds = await page.getByRole('navigation', { name: 'Notify views' }).boundingBox();
+      return bounds.y + bounds.height;
+    }).toBeLessThanOrEqual(size.height);
+    const send = await page.getByRole('button', { name: 'Send', exact: true }).boundingBox();
+    const nav = await page.getByRole('navigation', { name: 'Notify views' }).boundingBox();
+    expect(send.y + send.height).toBeLessThanOrEqual(nav.y);
+    expect(nav.y + nav.height).toBeLessThanOrEqual(size.height);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(size.width);
+  }
+  await page.getByLabel('Message').fill('An unsent phone draft');
+  await page.goBack();
+  await expect(page.getByRole('button', { name: 'Open Website release', exact: true })).toBeVisible();
+  await page.goForward();
+  await expect(page.getByLabel('Message')).toHaveValue('An unsent phone draft');
+});
+
+test('new chat messages preserve reading position and offer an explicit jump', async ({ page }) => {
+  workspace.detail.activity = Array.from({ length: 24 }, (_, index) =>
+    entry(`reply-${index}`, 'assistant', `Reply ${index}: ${'A longer reported message. '.repeat(8)}`));
+  changed();
+  await openSession(page);
+  await expect(page.locator('.chat-feed')).toContainText('Reply 23:');
+  await page.locator('.chat-feed').evaluate(node => { node.scrollTop = 0; });
+  workspace.detail.activity.push(entry('latest', 'assistant', 'The latest reported update.'));
+  changed();
+  await expect(page.getByRole('button', { name: 'Jump to latest', exact: true })).toBeVisible();
+  expect(await page.locator('.chat-feed').evaluate(node => node.scrollTop)).toBe(0);
+  await page.getByRole('button', { name: 'Jump to latest', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Jump to latest', exact: true })).toBeHidden();
+  expect(await page.locator('.chat-feed').evaluate(node => node.scrollHeight - node.scrollTop - node.clientHeight)).toBeLessThan(2);
+});
+
 test('live exact-target chat preserves drafts, separates activity and waits for acknowledgment', async ({ page }) => {
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   await expect(page.getByRole('button', { name: 'Allow once', exact: true })).toBeVisible();
   await openSession(page);
   await expect(page.locator('.chat-feed')).toContainText('Reviewing the release notes.');
   await expect(page.locator('.chat-feed')).not.toContainText('Comparing the reported');
+  await page.locator('.reported-tools > summary').click();
   await expect(page.getByText('Comparing the reported release targets.', { exact: true })).toBeVisible();
+  await page.locator('.reported-tools > summary').click();
   const sendBounds = await page.getByRole('button', { name: 'Send', exact: true }).boundingBox();
   expect(sendBounds.y + sendBounds.height).toBeLessThanOrEqual(844);
   const composer = page.getByLabel('Message');
@@ -110,7 +151,7 @@ test('live exact-target chat preserves drafts, separates activity and waits for 
   await page.getByRole('button', { name: 'All sessions', exact: true }).click();
   await page.getByRole('button', { name: 'Open Website release', exact: true }).click();
   await expect(composer).toHaveValue('Keep my main-agent draft');
-  await page.getByRole('button', { name: 'Requests', exact: true }).click();
+  await page.getByRole('button', { name: 'Inbox', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Allow once', exact: true })).toBeVisible();
   expect(errors).toEqual([]);
 });
@@ -250,6 +291,6 @@ test('an unavailable workspace backs off instead of consuming the approval API b
   await expect(page.getByText('The Mac workspace is unavailable. Keep Notify and the session connected.', { exact: true })).toBeVisible();
   await page.waitForTimeout(300);
   expect(reads).toBe(1);
-  await page.getByRole('button', { name: 'Requests', exact: true }).click();
+  await page.getByRole('button', { name: 'Inbox', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Allow once', exact: true })).toBeEnabled();
 });

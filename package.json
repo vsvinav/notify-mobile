@@ -8,11 +8,16 @@
   },
   "scripts": {
     "start": "node src/main.mjs",
+    "start:hosted": "node src/hosted-main.mjs",
     "test": "NODE_TLS_REJECT_UNAUTHORIZED=1 node --test test/*.test.mjs",
     "test:browser": "NODE_TLS_REJECT_UNAUTHORIZED=1 PLAYWRIGHT_BROWSERS_PATH=0 playwright test"
   },
   "dependencies": {
-    "web-push": "4.0.0"
+    "@google-cloud/firestore": "9.4.1",
+    "@simplewebauthn/server": "14.1.0",
+    "google-auth-library": "11.3.4",
+    "web-push": "4.0.0",
+    "ws": "8.23.0"
   },
   "devDependencies": {
     "@playwright/test": "1.65.1"

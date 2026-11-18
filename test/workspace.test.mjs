@@ -20,6 +20,111 @@ const detail = (id = 'one', ticket = 'generation-1') => ({
   }, activity: [], controls: [], truncated: false
 });
 const control = (extra = {}) => ({ id: randomUUID(), sessionID: 'one', ticket: 'generation-1', action: 'queue', text: 'exact text', ...extra });
+const managedSession = () => ({ ...session(), managementTicket: 'management-1',
+  capabilities: { ...session().capabilities, subagentCreate: true, subagentRemove: true, subagentCleanup: true },
+  subagentTypes: ['reviewer'], subagentModels: ['live-model'] });
+const creationControl = (extra = {}) => control({ action: 'create_subagent', text: '', managementTicket: 'management-1',
+  creation: { name: 'Reviewer', agentType: 'reviewer', prompt: '  Review exactly\n', model: 'live-model' }, ...extra });
+
+test('phone management dispatch uses live catalogs and action-specific runtime ACK, not chat acceptance', async t => {
+  const f = await fixture(); t.after(f.close);
+  const auth = await pair(f);
+  await f.app.command(overview(managedSession()));
+  const snapshot = await f.call('/api/workspace', { sessionID: 'one' }, auth);
+  assert.equal(snapshot.data.subagentManagementControl, true);
+  await f.app.command(detail());
+  for (const [action, status, extra] of [
+    ['create_subagent', 'created', { creation: creationControl().creation }],
+    ['stop_idle_subagents', 'cleaned', {}],
+  ]) {
+    const input = control({ action, text: '', managementTicket: 'management-1', ...extra });
+    const pending = f.call('/api/control', input, auth);
+    await pause();
+    const sent = f.events.findLast(e => e.type === 'control');
+    assert.equal(sent.action, action);
+    assert.equal(sent.agentID, undefined);
+    assert.deepEqual(sent.creation, extra.creation);
+    assert.equal((await f.call('/api/control', { ...input, sessionID: 'other' }, auth)).status, 409);
+    await f.app.command({ type: 'control_result', id: sent.id, ok: true, commandID: 'receipt', status,
+      detail: 'Stopped 2; skipped 1; failed 0; uncertain 0' });
+    assert.equal((await pending).data.status, status);
+    assert.equal((await f.call('/api/control', input, auth)).data.status, status);
+  }
+  assert.equal((await f.call('/api/control', control({ action: 'remove_subagent', text: '',
+    managementTicket: 'management-1', agentID: 'child' }), auth)).data.status, 'failed');
+  const ended = detail(); ended.team.agents[0].status = 'completed'; ended.team.idleCount = 0;
+  await f.app.command(ended);
+  const remove = control({ action: 'remove_subagent', text: '', managementTicket: 'management-1', agentID: 'child' });
+  const pending = f.call('/api/control', remove, auth); await pause();
+  const sent = f.events.findLast(e => e.type === 'control');
+  assert.equal(sent.agentID, 'child');
+  await f.app.command({ type: 'control_result', id: sent.id, ok: true, commandID: 'receipt', status: 'removed', detail: 'Removed Child' });
+  assert.equal((await pending).data.status, 'removed');
+});
+
+test('management rejects stale catalogs, invalid fields and unknown creation never replays', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  assert.equal((await w.control(creationControl(), devices[0])).data.status, 'failed');
+  w.command(overview(managedSession()));
+  for (const extra of [
+    { creation: { ...creationControl().creation, model: 'missing' } },
+    { creation: { ...creationControl().creation, agentType: 'missing' } },
+    { managementTicket: 'old' },
+  ]) assert.equal((await w.control(creationControl(extra), devices[0])).data.status, 'failed');
+  for (const extra of [
+    { agentID: 'child' }, { text: 'main prompt' }, { creation: { ...creationControl().creation, name: 'x'.repeat(161) } },
+    { creation: { ...creationControl().creation, extra: true } }, { enabled: false },
+    { creation: { ...creationControl().creation, prompt: '😀'.repeat(8001) } },
+  ]) await assert.rejects(w.control(creationControl(extra), devices[0]), { status: 400 });
+  const input = creationControl();
+  const unknown = await w.control(input, devices[0]);
+  assert.equal(unknown.data.status, 'unknown');
+  const sent = events.length;
+  assert.equal((await w.control(input, devices[0])).data.status, 'unknown');
+  assert.equal(events.length, sent);
+  await assert.rejects(w.control({ ...input, creation: { ...input.creation, model: undefined } }, devices[0]), { status: 409 });
+  for (const status of ['queued', 'received', 'stopped', 'removed', 'cleaned']) {
+    const pending = w.control(creationControl(), devices[0]);
+    w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'cmd', status, detail: '' });
+    assert.equal((await pending).data.status, 'unknown');
+  }
+  w.command(overview({ ...managedSession(), subagentModels: [] }));
+  const fallback = w.control(creationControl({ creation: { name: 'Default', agentType: 'reviewer', prompt: 'Review' } }), devices[0]);
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'cmd', status: 'created', detail: 'Created' });
+  assert.equal((await fallback).data.status, 'created');
+});
+
+test('native uncertain cleanup retains its actual partial counts in a correlated response', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  w.command(overview(managedSession()));
+  await w.read({ sessionID: 'one' }, devices[0], new EventEmitter());
+  w.command(detail());
+  const pending = w.control(control({ action: 'stop_idle_subagents', text: '', managementTicket: 'management-1' }), devices[0]);
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: false, commandID: 'cleanup-receipt',
+    status: 'unknown', detail: 'Cancelled 2; skipped 3; failed 1; uncertain 1', error: 'Some outcomes are uncertain.' });
+  const result = await pending;
+  assert.equal(result.status, 200, 'The caller must be able to inspect an actual partial runtime result');
+  assert.equal(result.data.status, 'unknown');
+  assert.equal(result.data.ok, false);
+  assert.equal(result.data.detail, 'Cancelled 2; skipped 3; failed 1; uncertain 1');
+});
+
+test('management admission rejection preserves an actionable failed result without reserving or replaying a command', async () => {
+  const { w, devices, events, advance } = memoryWorkspace();
+  w.command(overview(managedSession()));
+  const input = creationControl();
+  advance(12000);
+  const rejected = await w.control(input, devices[0]);
+  assert.equal(rejected.data.status, 'failed');
+  assert.equal(rejected.data.ok, false);
+  assert.equal(w.controls.size, 0);
+  assert.equal(events.filter(e => e.type === 'control').length, 0);
+  w.command(overview(managedSession()));
+  const freshExplicitCommand = creationControl();
+  const pending = w.control(freshExplicitCommand, devices[0]);
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'new', status: 'created', detail: 'Created' });
+  assert.equal((await pending).data.status, 'created');
+});
 
 test('workspace authenticated long poll, exact selection and ticket isolation', async t => {
   const f = await fixture(); t.after(f.close);
@@ -74,6 +179,112 @@ function memoryWorkspace() {
   return { w, events, devices, advance: value => { clock += value; } };
 }
 
+const offEpoch = n => `00000000-0000-8000-8000-${String(n).padStart(12, '0')}`;
+const policySession = (enabled = false, policyTicket = 'policy-1', offTicket = offEpoch(1)) => ({
+  ...session(), capabilities: { ...session().capabilities, steering: false, dangerousAutoYes: true },
+  dangerousAutoYes: { ticket: policyTicket, offTicket, revision: policyTicket === 'policy-1' ? 1 : 2, enabled, normalEnabled: false }
+});
+const policyControl = (extra = {}) => control({ action: 'dangerous_auto_yes', text: '', enabled: true, policyTicket: 'policy-1',
+  offTicket: offEpoch(1),
+  ...(extra.enabled === false ? { id: extra.offTicket ?? offEpoch(1), offTicket: offEpoch(1) } : {}), ...extra });
+
+test('dangerous policy uses native capability, exact policy revision and full payload dedup without steering', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  w.command(overview(policySession()));
+  const input = policyControl();
+  const pending = w.control(input, devices[0]);
+  assert.equal(events.at(-1).action, 'dangerous_auto_yes');
+  await assert.rejects(w.control({ ...input, enabled: false, offTicket: offEpoch(1) }, devices[0]), { status: 400 });
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'policy-command', status: 'applied',
+    detail: 'Enabled', dangerousAutoYes: policySession(true, 'policy-2').dangerousAutoYes });
+  assert.equal((await pending).data.dangerousAutoYes.enabled, true);
+  assert.equal((await w.control(input, devices[0])).data.status, 'applied');
+  w.command(overview(policySession(false, 'newer-off')));
+  await assert.rejects(w.control(policyControl(), devices[0]), { status: 409 });
+  await assert.rejects(w.control(policyControl({ policyTicket: 'newer-off', agentID: 'child' }), devices[0]), { status: 400 });
+  await assert.rejects(w.control(policyControl({ policyTicket: 'newer-off', sessionID: 'other' }), devices[0]), { status: 409 });
+});
+
+test('dangerous policy never fabricates legacy support or replays uncertain controls', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  assert.equal(w.payload(devices[0].id).dangerousAutoYesControl, true, 'New helper explicitly advertises its typed policy dispatcher');
+  await assert.rejects(w.control(policyControl(), devices[0]), { status: 409 });
+  w.command(overview(policySession()));
+  const input = policyControl();
+  const pending = w.control(input, devices[0]);
+  w.invalidate('Phone disconnected');
+  assert.equal((await pending).data.status, 'unknown');
+  w.command(overview(policySession()));
+  const count = events.length;
+  assert.equal((await w.control(input, devices[0])).data.status, 'unknown');
+  assert.equal(events.length, count);
+});
+
+test('dangerous ACK must match requested policy, not queued steering or invented Off', async () => {
+  for (const ack of [
+    { status: 'queued' }, { status: 'applied' },
+    { status: 'applied', dangerousAutoYes: { ...policySession(true, 'different').dangerousAutoYes, revision: 1 } },
+    { status: 'applied', dangerousAutoYes: policySession(false, 'new').dangerousAutoYes }
+  ]) {
+    const { w, devices, events } = memoryWorkspace();
+    w.command(overview(policySession()));
+    const pending = w.control(policyControl(), devices[0]);
+    w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'cmd', detail: '', ...ack });
+    assert.equal((await pending).data.status, 'unknown');
+  }
+});
+
+test('policy ACK refreshes exact policy without extending the native lease; failed Off is authoritative', async () => {
+  const { w, devices, events, advance } = memoryWorkspace();
+  w.command(overview(policySession()));
+  const enabling = w.control(policyControl(), devices[0]);
+  const on = { ...policySession(true, 'on').dangerousAutoYes, revision: 2 };
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'on', status: 'applied', detail: '', dangerousAutoYes: on });
+  await enabling;
+  assert.deepEqual(w.sessions[0].dangerousAutoYes, on);
+  const disabling = w.control(policyControl({ enabled: false, policyTicket: 'on' }), devices[0]);
+  const off = { ...on, ticket: 'off', offTicket: offEpoch(2), revision: 3, enabled: false };
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: false, commandID: 'off', status: 'failed',
+    detail: 'Off', error: 'Off, but audit could not be saved', dangerousAutoYes: off });
+  const result = await disabling;
+  assert.equal(result.status, 200);
+  assert.equal(result.data.ok, false);
+  assert.deepEqual(result.data.dangerousAutoYes, off);
+  w.command(overview(policySession(true, 'older')));
+  assert.deepEqual(w.sessions[0].dangerousAutoYes, off, 'Older snapshot cannot undo authoritative Off');
+  advance(12000);
+  await assert.rejects(w.control(policyControl({ policyTicket: 'off' }), devices[0]), { status: 503 });
+});
+
+test('policy payload and advertised state are strict and cannot bypass ordinary controls', async () => {
+  const { w, devices } = memoryWorkspace();
+  w.command(overview(policySession()));
+  for (const extra of [{ enabled: 'true' }, { enabled: undefined }, { text: 'extra' }, { policyTicket: '' },
+    { action: 'queue', text: 'message' }, { agentID: 'child' }])
+    await assert.rejects(w.control(policyControl(extra), devices[0]), { status: 400 });
+  for (const value of [
+    { ...policySession(), dangerousAutoYes: undefined },
+    { ...policySession(), dangerousAutoYes: { ...policySession().dangerousAutoYes, enabled: 'false' } },
+    { ...policySession(), dangerousAutoYes: { ...policySession().dangerousAutoYes, enabled: true, normalEnabled: true } }
+  ]) assert.throws(() => w.command(overview(value)), /Invalid workspace/);
+});
+
+test('explicit Off supersedes an in-flight enable even if its reviewed policy ticket is older', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  w.command(overview(policySession()));
+  const on = w.control(policyControl(), devices[0]);
+  const onID = events.at(-1).id;
+  w.command({ type: 'control_result', id: onID, ok: true, commandID: 'on', status: 'applied', detail: '',
+    dangerousAutoYes: policySession(true, 'on').dangerousAutoYes });
+  await on;
+  const off = w.control(policyControl({ enabled: false }), devices[0]);
+  assert.equal(events.at(-1).enabled, false, 'Off must not wait for a watch refresh after On');
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'off', status: 'applied', detail: '',
+    dangerousAutoYes: { ...policySession(false, 'off', offEpoch(2)).dangerousAutoYes, revision: 3 } });
+  assert.equal((await off).data.dangerousAutoYes.enabled, false);
+  await assert.rejects(w.control(policyControl(), devices[0]), { status: 409 });
+});
+
 test('bounded UUID safety history retains uncertain records until their generation is invalid', async () => {
   const { w, events, devices } = memoryWorkspace();
   const timedOut = control();
@@ -90,6 +301,97 @@ test('bounded UUID safety history retains uncertain records until their generati
   w.command(overview(session('one', 'new-generation')));
   assert.equal(w.controls.size, 0);
   await assert.rejects(w.control(timedOut, devices[0]), { status: 409 });
+});
+
+test('urgent Off remains available after 255 ordinary controls and the enabling control fill history', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  const supported = policySession();
+  supported.capabilities.steering = true;
+  w.command(overview(supported));
+  for (let i = 0; i < 255; i++) {
+    const pending = w.control(control(), devices[0]);
+    w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: randomUUID(), status: 'queued', detail: '' });
+    assert.equal((await pending).status, 200);
+  }
+  const enabling = w.control(policyControl(), devices[0]);
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: randomUUID(), status: 'applied', detail: '',
+    dangerousAutoYes: policySession(true, 'on').dangerousAutoYes });
+  assert.equal((await enabling).status, 200);
+  assert.equal(w.controls.size, 256);
+  const before = events.length;
+  const disabling = w.control(policyControl({ enabled: false, policyTicket: 'on' }), devices[0])
+    .catch(error => ({ status: error.status }));
+  if (events.length > before) {
+    w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: randomUUID(), status: 'applied', detail: '',
+      dangerousAutoYes: { ...policySession(false, 'off', offEpoch(2)).dangerousAutoYes, revision: 3 } });
+  }
+  assert.equal((await disabling).status, 200, 'Full ordinary history must not strand enabled policy');
+  const firstOff = policyControl({ enabled: false, policyTicket: 'on' });
+  for (let cycle = 0; cycle < 300; cycle++) {
+    const live = { ...supported, dangerousAutoYes: { ...supported.dangerousAutoYes,
+      enabled: true, ticket: `manual-on-${cycle}`, offTicket: offEpoch(3 + cycle * 2), revision: 4 + cycle * 2 } };
+    w.command(overview(live));
+    const input = policyControl({ enabled: false, policyTicket: live.dangerousAutoYes.ticket, offTicket: live.dangerousAutoYes.offTicket });
+    const pending = w.control(input, devices[0]);
+    w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: randomUUID(), status: 'applied', detail: '',
+      dangerousAutoYes: { ...live.dangerousAutoYes, enabled: false, ticket: `off-${cycle}`,
+        offTicket: offEpoch(4 + cycle * 2), revision: live.dangerousAutoYes.revision + 1 } });
+    assert.equal((await pending).status, 200);
+    assert.equal(w.controls.size, 256);
+    assert.equal(w.offControls.size, 1, 'One retained Off record per session, not 300 extra UUID records');
+    const beforeDuplicate = events.length;
+    assert.equal((await w.control(input, devices[0])).status, 200);
+    await assert.rejects(w.control({ ...input, policyTicket: 'changed-payload' }, devices[0]), { status: 409 });
+    assert.equal(events.length, beforeDuplicate);
+  }
+  await assert.rejects(w.control(firstOff, devices[0]), { status: 409 }, 'Retired Off payload cannot replay');
+  await assert.rejects(w.control(policyControl({ enabled: false, id: firstOff.id, offTicket: offEpoch(602) }), devices[0]), { status: 400 });
+  await assert.rejects(w.control(control({ id: firstOff.id }), devices[0]), { status: 400 }, 'Retired Off UUID cannot change into an ordinary command');
+  await assert.rejects(w.control(control(), devices[0]), { status: 429 }, 'Ordinary safety history is never evicted to make room for Off');
+});
+
+test('Off epoch slot retains uncertain dispatch and rejects reuse until native authority retires it', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  w.command(overview(policySession(true)));
+  const off = policyControl({ enabled: false });
+  assert.equal((await w.control(off, devices[0])).status, 504);
+  const count = events.length;
+  assert.equal((await w.control(off, devices[0])).status, 504);
+  await assert.rejects(w.control(policyControl({ enabled: false, id: randomUUID() }), devices[0]), { status: 400 });
+  await assert.rejects(w.control(policyControl({ enabled: false, policyTicket: 'changed' }), devices[0]), { status: 409 });
+  w.invalidate('Phone disconnected');
+  w.command(overview(policySession(true)));
+  assert.equal((await w.control(off, devices[0])).status, 504);
+  assert.equal(events.length, count);
+  assert.equal(w.offControls.size, 1);
+});
+
+test('dedicated Off still requires fresh exact session authority and native capability', async () => {
+  const { w, devices, events, advance } = memoryWorkspace();
+  const supported = policySession(true);
+  w.command(overview(supported));
+  for (const extra of [{ ticket: 'stale' }, { sessionID: 'other' }, { offTicket: offEpoch(2) }])
+    await assert.rejects(w.control(policyControl({ enabled: false, ...extra }), devices[0]), { status: 409 });
+  await assert.rejects(w.control(policyControl({ enabled: false, agentID: 'child' }), devices[0]), { status: 400 });
+  w.command(overview({ ...supported, capabilities: { ...supported.capabilities, dangerousAutoYes: false } }));
+  await assert.rejects(w.control(policyControl({ enabled: false }), devices[0]), { status: 409 });
+  w.command(overview(supported));
+  advance(12000);
+  await assert.rejects(w.control(policyControl({ enabled: false }), devices[0]), { status: 503 });
+  assert.equal(events.filter(e => e.type === 'control').length, 0);
+  assert.equal(w.offControls.size, 0);
+});
+
+test('legacy policy clients cannot enable without knowing the bounded Off epoch', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  w.command(overview(policySession()));
+  const legacy = policyControl();
+  delete legacy.offTicket;
+  const result = w.control(legacy, devices[0]).catch(error => ({ status: error.status }));
+  if (events.at(-1)?.type === 'control')
+    w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: randomUUID(), status: 'applied', detail: '',
+      dangerousAutoYes: policySession(true, 'on').dangerousAutoYes });
+  assert.equal((await result).status, 400, 'An older client must not enable a mode it cannot turn off');
 });
 
 test('workspace read bounds and HTTP disconnect release; watched selections expire and revoked waiters fail', async () => {

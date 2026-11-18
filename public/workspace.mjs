@@ -29,16 +29,17 @@ function portrait(main, state) {
   return svg;
 }
 
-export function createWorkspace({ api, el, button, onUnauthorized, onNetworkError }) {
+export function createWorkspace({ api, el, button, onUnauthorized, onNetworkError, onNavigate }) {
   const node = el('section', undefined, 'sessions-panel');
   const notice = el('p', 'Loading sessions…', 'banner');
   notice.setAttribute('role', 'status');
-  const content = el('div');
+  const content = el('div', undefined, 'workspace-content');
   node.append(notice, content);
   let visible = false, connected = false, disposed = false, request, retry, revision;
   let generation = 0, data, sessionID = null, agentID = '', tab = 'chat', lastRead = 0;
   let showIdle = false, showInactive = false, fit = true, dialog, resize, chartFrame;
-  let heading, metadata, target, composer, feed, tools, toolFeed, chat, chart, controlNote, sendButton, interruptButton, stopButton;
+  let heading, metadata, target, composer, feed, tools, toolFeed, chat, chart, controlNote, sendButton, interruptButton, stopButton, jumpLatest;
+  let messageSignature = '';
   let signature = '', targetSignature = '', chartSignature = '', listSignature = '';
   const drafts = new Map(), deliveries = new Map(), collapsed = new Set();
   const key = () => JSON.stringify([sessionID, agentID]);
@@ -47,12 +48,6 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
   const agent = () => detail()?.team?.agents.find(item => item.id === agentID);
   const name = () => agentID ? agent()?.name ?? 'Unavailable subagent' : 'Main agent';
   const live = () => connected && data?.connected && visible && Date.now() - lastRead < 10000 && !!detail() && session()?.connected;
-  function fitChat() {
-    if (disposed || !sessionID || !chat || chat.hidden || node.hidden) return;
-    chat.style.height = `calc(100dvh - ${Math.ceil(chat.getBoundingClientRect().top + window.scrollY) + 12}px)`;
-  }
-  window.addEventListener('resize', fitChat);
-
   function cancelRead() {
     generation++; request?.abort(); request = undefined;
     clearTimeout(retry); revision = undefined;
@@ -85,16 +80,19 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
       if (current === generation && !disposed) retry = setTimeout(watch, delay);
     }
   }
-  function open(id) {
+  function open(id, remember = true) {
     cancelRead(); sessionID = id; agentID = ''; tab = 'chat';
     showIdle = false; showInactive = false; fit = true; collapsed.clear();
     signature = targetSignature = chartSignature = listSignature = '';
+    messageSignature = '';
     resize?.disconnect(); content.replaceChildren();
     if (id) { buildDetail(); composer.value = drafts.get(key()) ?? ''; }
     render(); void watch();
+    node.classList.toggle('has-detail', !!id);
+    if (remember) onNavigate(id);
   }
   function selectAgent(id) {
-    agentID = id; tab = 'chat'; signature = '';
+    agentID = id; tab = 'chat'; signature = ''; messageSignature = '';
     composer.value = drafts.get(key()) ?? '';
     renderDetail(); setTab('chat'); composer.focus();
   }
@@ -104,7 +102,6 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
       tabButton.setAttribute('aria-pressed', String(tabButton.dataset.workspaceTab === value));
     }
     if (value === 'hierarchy') renderChart();
-    else fitChat();
   }
   function render() {
     if (!sessionID) {
@@ -142,11 +139,19 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
     target = el('select'); target.setAttribute('aria-label', 'Chat with');
     target.addEventListener('change', () => selectAgent(target.value)); label.append(target);
     feed = el('div', undefined, 'chat-feed'); feed.setAttribute('role', 'region'); feed.setAttribute('aria-label', 'Conversation');
-    tools = el('details', undefined, 'reported-tools'); tools.open = true;
+    jumpLatest = button('Jump to latest', 'jump-latest', () => {
+      jumpLatest.hidden = true; feed.scrollTop = feed.scrollHeight;
+    });
+    jumpLatest.hidden = true;
+    feed.addEventListener('scroll', () => {
+      if (feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48) jumpLatest.hidden = true;
+    });
+    tools = el('details', undefined, 'reported-tools');
     toolFeed = el('div', undefined, 'tool-feed'); tools.append(el('summary', 'Tools & thinking'), toolFeed);
     const form = el('form', undefined, 'chat-composer');
     const inputLabel = el('label', 'Message', 'input-label');
     composer = el('textarea'); composer.maxLength = 16000; composer.setAttribute('aria-label', 'Message');
+    composer.rows = 2;
     composer.placeholder = 'Give this agent an instruction…'; inputLabel.append(composer);
     composer.addEventListener('input', () => {
       const draftKey = key(), text = composer.value;
@@ -167,7 +172,7 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
     controlNote = el('p', '', 'message'); controlNote.setAttribute('role', 'status');
     form.append(inputLabel, actions, controlNote);
     form.addEventListener('submit', event => { event.preventDefault(); prepare('queue'); });
-    chat.append(label, feed, tools, form);
+    chat.append(label, feed, jumpLatest, tools, form);
     chart = el('section', undefined, 'session-hierarchy'); chart.hidden = true;
     content.append(header, tabs, chat, chart);
   }
@@ -192,7 +197,7 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
     stopButton.disabled = busy || !!unsupported('stop');
     controlNote.classList.toggle('error', !!delivery?.error);
     controlNote.textContent = busy ? 'Waiting for agent acknowledgment…' :
-      delivery?.error || delivery?.detail || unsupported('queue') || 'Only the selected agent receives this. Uses your agent’s model credits.';
+      delivery?.error || delivery?.detail || unsupported('queue') || '';
   }
   function renderDetail() {
     const item = session(), selected = detail();
@@ -220,7 +225,6 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
       signature = next; renderMessages(selected);
     }
     updateControls();
-    fitChat();
     if (tab === 'hierarchy') renderChart();
   }
   function copyButton(text) {
@@ -247,7 +251,7 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
     return body;
   }
   function renderMessages(selected) {
-    const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48, scroll = feed.scrollTop;
+    const atBottom = !messageSignature || feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48, scroll = feed.scrollTop;
     feed.replaceChildren(); toolFeed.replaceChildren();
     if (!selected) { feed.append(el('p', 'Waiting for this session’s details…', 'empty')); return; }
     const activity = selected.activity.filter(item => (item.agentID ?? '') === agentID);
@@ -259,6 +263,11 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
       });
     }
     messages.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    const latest = messages.at(-1);
+    const nextSignature = JSON.stringify([latest?.id, latest?.detail, latest?.delivery]);
+    if (atBottom) jumpLatest.hidden = true;
+    else if (messageSignature !== nextSignature) jumpLatest.hidden = false;
+    messageSignature = nextSignature;
     if (selected.truncated) feed.append(el('p', 'Showing recent reported messages. Earlier history is on your Mac.', 'support'));
     if (!messages.length) feed.append(el('p', 'No messages reported for this agent yet.', 'empty'));
     for (const message of messages) {
@@ -430,9 +439,10 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
   }
   return {
     node,
+    selectSession(id) { open(id, false); },
     setVisible(value) {
       visible = value; node.hidden = !value; node.classList.toggle('workspace-paused', !value);
-      if (!value) cancelRead(); else { updateControls(); fitChat(); void watch(); }
+      if (!value) cancelRead(); else { updateControls(); void watch(); }
     },
     setConnected(value) {
       if (connected === value) return;
@@ -442,7 +452,6 @@ export function createWorkspace({ api, el, button, onUnauthorized, onNetworkErro
     },
     clear() {
       disposed = true; cancelRead(); resize?.disconnect(); dialog?.close(); dialog?.remove();
-      window.removeEventListener('resize', fitChat);
       drafts.clear(); deliveries.clear(); data = undefined; node.replaceChildren();
     }
   };

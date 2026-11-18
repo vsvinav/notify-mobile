@@ -10,3 +10,5 @@ docs/superpowers/
 test-results/
 playwright-report/
 .test-data/
+.hosted-data/
+.local-build/

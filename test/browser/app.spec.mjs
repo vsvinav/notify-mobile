@@ -27,6 +27,80 @@ async function connect(page) {
   await expect(page.getByText('Connected', { exact: true })).toBeVisible();
 }
 
+test('focused review keeps one request, stable drafts and separate settings', async ({ page }) => {
+  current = [permission(), question()];
+  await f.app.command({ type: 'snapshot', requests: current, total: 2 });
+  await connect(page);
+  await expect(page.getByRole('button', { name: 'Inbox', exact: true })).toBeVisible();
+  await expect(page.locator('.request:visible')).toHaveCount(1);
+  await expect(page.getByText('Install & connection help', { exact: true })).toBeHidden();
+  await page.getByLabel('Review request', { exact: true }).selectOption('question-ticket');
+  await page.getByLabel('Custom answer for Release instructions').fill('Keep this draft while I check another request.');
+  current.unshift({ ...permission('new-ticket'), request: { ...permission().request, id: 'new-request', title: 'A newer request' },
+    notificationID: 'new-notification' });
+  await f.app.command({ type: 'snapshot', requests: current, total: 3 });
+  await expect(page.getByLabel('Review request', { exact: true }).locator('option')).toHaveCount(3);
+  await expect(page.getByLabel('Review request', { exact: true })).toHaveValue('question-ticket');
+  await expect(page.getByLabel('Custom answer for Release instructions')).toHaveValue('Keep this draft while I check another request.');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByText('Install & connection help', { exact: true })).toBeVisible();
+  await expect(page.locator('.request:visible')).toHaveCount(0);
+  await mkdir('.impeccable/review', { recursive: true });
+  await page.screenshot({ path: '.impeccable/review/settings-light-390.png' });
+  await page.goBack();
+  await expect(page.getByLabel('Custom answer for Release instructions')).toHaveValue('Keep this draft while I check another request.');
+  const nav = await page.getByRole('navigation', { name: 'Notify views' }).boundingBox();
+  expect(nav.y + nav.height).toBeLessThanOrEqual(844);
+  expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThanOrEqual(844);
+});
+
+test('focused review removes acknowledged requests and advances without another tap or approval', async ({ page }) => {
+  const second = { ...permission('second-ticket'), notificationID: 'second-notification',
+    request: { ...permission().request, id: 'second-request', title: 'Second request' } };
+  current = [permission(), second];
+  await f.app.command({ type: 'snapshot', requests: current, total: 2 });
+  await connect(page);
+  await page.getByRole('button', { name: 'Allow once', exact: true }).click();
+  await expect(page.getByText('Waiting for agent acknowledgment…', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: permission().request.title, exact: true })).toBeVisible();
+  const command = f.events.findLast(e => e.type === 'reply');
+  await f.app.command({ type: 'result', id: command.id, ok: true });
+  await expect(page.getByRole('heading', { name: 'Second request', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: permission().request.title, exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toHaveCount(0);
+  await expect(page.locator('.inbox-badge')).toHaveText('1');
+  await page.waitForResponse(response => new URL(response.url()).pathname === '/api/state');
+  await expect(page.getByRole('heading', { name: permission().request.title, exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Allow once', exact: true })).toBeEnabled();
+  expect(f.events.filter(e => e.type === 'reply')).toHaveLength(1);
+});
+
+test('focused review removes a request answered elsewhere without submitting the next one', async ({ page }) => {
+  current = [permission(), question()];
+  await f.app.command({ type: 'snapshot', requests: current, total: 2 });
+  await connect(page);
+  current = [question()];
+  await f.app.command({ type: 'snapshot', requests: current, total: 1 });
+  await expect(page.getByRole('heading', { name: 'How should we ship this?', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Allow once', exact: true })).toHaveCount(0);
+  expect(f.events.filter(e => e.type === 'reply')).toHaveLength(0);
+});
+
+test('denial instructions stay optional and send only with the exact denial', async ({ page }) => {
+  await connect(page);
+  await expect(page.getByLabel('Optional feedback when denying')).toBeHidden();
+  await page.getByText('Add denial instructions', { exact: true }).click();
+  await page.getByLabel('Optional feedback when denying').fill('Use the local preview instead.');
+  await page.getByRole('button', { name: 'Deny', exact: true }).click();
+  await expect(page.getByText('Waiting for agent acknowledgment…', { exact: true })).toBeVisible();
+  const command = f.events.findLast(e => e.type === 'reply');
+  expect(command).toMatchObject({ decision: 'deny', ticket: permission().ticket, feedback: 'Use the local preview instead.' });
+  await f.app.command({ type: 'result', id: command.id, ok: true });
+  await expect(page.getByText('All caught up', { exact: true })).toBeVisible();
+  await expect(page.locator('.request')).toHaveCount(0);
+  await expect(page.locator('.inbox-badge')).toBeHidden();
+});
+
 test('certificate setup continues to the actual app without automatic navigation', async ({ page }) => {
   await page.goto(f.app.setupURL);
   const continueLink = page.getByRole('link', { name: 'Continue to Notify', exact: true });
