@@ -151,7 +151,45 @@ outcomes. No timeout is success or automatically retried. This does not consume
 the reserved Dangerous Auto-yes Off lane, alter chat drafts, delete files, or
 add a scheduler. Claude helper management remains unsupported.
 
-Updates arrive while Sessions is open; hidden pages stop watching. Details are loaded only for the selected session, and earlier messages or very large teams can be omitted with a visible notice. The **LAN web app** does not expose creation/removal/idle cleanup or automation settings; use the Mac or the matching native Android source preview.
+**Native Android session settings (unpublished source preview):** matching updated
+Mac/helper/Android builds expose Mac-synchronized session colors/reset and
+same-group Move up/down, plus confirmed disconnected-cache removal and supported
+saved-session resume. The helper advertises `sessionActionsControl`; each native
+row supplies separate `sessionActions` admission metadata, its exact original
+identity, current RGB/override, named palette, group, neighbors and resume status.
+Old native/helper builds do not gain imaginary support. The existing control
+dispatcher accepts only typed color/reset/move/remove/resume payloads, not client
+shell commands, paths or arbitrary session orders.
+
+Session actions retain the ordinary 256-UUID/eight-pending bounds, full-payload
+deduplication, fresh authorization and revocation checks. The urgent Off ninth
+slot is unchanged. Metadata changes do not invalidate runtime/management results.
+An already-dispatched session action retains its original native ID, session,
+action and metadata ticket through its exact result; snapshots can precede ACKs.
+Timeout/channel loss stays unknown and is never replayed.
+Definitive session-action admission failures return a correlated failed receipt
+without native dispatch. Refresh and explicitly review a new command; the old UUID
+remains consumed. After an actual launch owner is observed and later exits to
+Saved, native `resumeAuthority` reports a scoped epoch and monotonic `retired`
+high-water mark. Each reviewed attempt captures this metadata locally; a higher
+mark in the same epoch can reopen a new review even after other phones' launches
+or missed snapshots. It is not a client-supplied launch parameter. Color, order,
+ordinary work updates and timeouts cannot advance it. The bounded native scope
+follows the original agent/session/project through connected aliases, but resets
+on identity removal/recreation, project replacement or Mac app replacement;
+a different epoch cannot clear an old uncertain attempt.
+
+Removal affects only a disconnected cached row: no owner is stopped, no CLI
+history/project files are deleted, and discovery may restore it. Resume opens
+the original supported saved CLI in iTerm2 on the Mac, with native history,
+executable, live-owner and in-flight checks. Mac sign-in/Automation prompts may
+need attention there. Saved CLI permissions can carry over; the action sends no
+approvals and enables no session Auto-yes. `launched` confirms only terminal
+launch, not an agent connection. Native metadata separately reports a detected
+owner/connected session or the 30-second no-owner warning. Uncertain launch is
+not a retry instruction. Android's System/Light/Dark setting is phone-local.
+
+Updates arrive while Sessions is open; hidden pages stop watching. Details are loaded only for the selected session, and earlier messages or very large teams can be omitted with a visible notice. The **LAN web app** does not expose creation/removal/idle cleanup, these new session actions, or automation settings; use the Mac or the matching native Android source preview.
 
 **Connected** means the phone app recently reached your Mac. **Push enabled** means a notification subscription exists, not that every alert has been delivered. Focus and battery settings can delay alerts.
 

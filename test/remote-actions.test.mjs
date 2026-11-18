@@ -5,7 +5,7 @@ import { RemoteActions } from '../src/remote-actions.mjs';
 import { randomUUID } from 'node:crypto';
 import { RemoteAccess } from '../src/remote-access.mjs';
 
-async function linkedPolicy(t) {
+async function linkedPolicy(t, options = {}) {
   let now = 0;
   const owner = { issuer: 'https://synthetic.invalid', subject: 'synthetic', macID: 'synthetic' };
   const peer = { ...owner, deviceID: 'phone', keyHash: 'a'.repeat(64) };
@@ -17,7 +17,7 @@ async function linkedPolicy(t) {
   const handle = access.connect(peer, 30000);
   const device = { id: peer.deviceID, name: 'Synthetic', expires: 30000 };
   const events = [];
-  const actions = new RemoteActions({ emit: event => events.push(event), devices: () => [device], now: () => now });
+  const actions = new RemoteActions({ emit: event => events.push(event), devices: () => [device], now: () => now, ...options });
   t.after(() => { actions.close(); access.disable(); });
   const token = () => randomUUID().replace(/^(.{14})./, '$18');
   let policy = { ticket: randomUUID(), offTicket: token(), revision: 1, enabled: false, normalEnabled: false };
@@ -30,6 +30,7 @@ async function linkedPolicy(t) {
       dangerousAutoYes: { ...policy }
     }] });
   }
+
   snapshot();
   const control = (enabled) => enabled === undefined
     ? { id: randomUUID(), sessionID: 's', ticket: 't', action: 'queue', text: 'synthetic' }
@@ -52,6 +53,188 @@ async function linkedPolicy(t) {
   return { access, handle, actions, events, device, control, send, ack, snapshot, setClock: value => { now = value; },
     macEnable() { policy = { ...policy, ticket: randomUUID(), revision: policy.revision + 1, enabled: true }; snapshot(); } };
 }
+
+test('authorized session metadata actions retain exact ACK after authoritative snapshot changes', async t => {
+  const f = await linkedPolicy(t);
+  const row = (await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.sessions[0];
+  const sessionActions = { ticket: 'metadata', sourceID: 'canonical', group: 'saved', rgb: 0x123456,
+    overridden: true, colors: [{ name: 'Sky', rgb: 0xA6C8FF }], editable: true, removable: true,
+    resumable: true, resumeStatus: 'available', resumeDetail: '', moveUp: null, moveDown: null };
+  const publish = sessions => f.actions.command({ type: 'workspace', total: sessions.length, truncated: false, sessions });
+  for (const [action, status, extra] of [
+    ['set_session_color', 'color_saved', { rgb: 0x010203 }], ['reset_session_color', 'color_reset', {}],
+    ['remove_session', 'session_removed', {}], ['resume_session', 'launched', {}]
+  ]) {
+    publish([{ ...row, connected: false, sessionActions }]);
+    const input = { id: randomUUID(), sessionID: 's', ticket: 't', action, text: '', sessionTicket: 'metadata', ...extra };
+    const pending = f.send(input);
+    const sent = f.events.at(-1);
+    assert.equal(sent.action, action);
+    publish(action === 'remove_session' ? [] : [{ ...row, ticket: 'after', sessionActions: { ...sessionActions, ticket: 'after' } }]);
+    f.actions.command({ type: 'control_result', id: sent.id, commandID: sent.id, ok: true, status, detail: 'Native result',
+      sessionID: sent.sessionID, action: sent.action, sessionTicket: sent.sessionTicket });
+    assert.equal((await pending).data.status, status);
+    await assert.rejects(f.send(input), { status: 409 });
+  }
+});
+
+test('authorized stale session admission returns exact failed receipt and needs a fresh UUID', async t => {
+  const f = await linkedPolicy(t);
+  const row = (await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.sessions[0];
+  const metadata = { ticket: 'before', sourceID: 'original', group: 'saved', rgb: 1, overridden: false,
+    colors: [], editable: true, removable: true, resumable: true, resumeStatus: 'available', resumeDetail: '',
+    resumeAuthority: { epoch: 'source-epoch', retired: 2 } };
+  const publish = ticket => f.actions.command({ type: 'workspace', total: 1, truncated: false,
+    sessions: [{ ...row, connected: false, sessionActions: { ...metadata, ticket } }] });
+  for (const action of ['resume_session', 'reset_session_color', 'set_session_color', 'remove_session']) {
+    publish('before');
+    const original = { id: randomUUID(), sessionID: 's', ticket: 't', sessionTicket: 'before', action, text: '',
+      ...(action === 'set_session_color' ? { rgb: 0x123456 } : {}) };
+    publish('after');
+    assert.deepEqual((await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.sessions[0].sessionActions.resumeAuthority,
+      { epoch: 'source-epoch', retired: 2 });
+    const before = f.events.filter(e => e.type === 'control').length;
+    const receipt = await f.send(original);
+    assert.equal(receipt.status, 200);
+    assert.equal(receipt.data.ok, false);
+    assert.equal(receipt.data.status, 'failed');
+    for (const field of ['sessionID', 'action', 'sessionTicket']) assert.equal(receipt.data[field], original[field]);
+    assert.match(receipt.data.detail, /nothing was dispatched/i);
+    assert.equal(receipt.data.notDispatched, undefined, 'No urgent-Off marker or same-ID release');
+    assert.equal(f.events.filter(e => e.type === 'control').length, before);
+    await assert.rejects(f.send(original), { status: 409 });
+    await assert.rejects(f.send({ ...original, sessionTicket: 'after' }), { status: 409 });
+    const fresh = { ...original, id: randomUUID(), sessionTicket: 'after' };
+    const pending = f.send(fresh);
+    const emitted = f.events.at(-1);
+    assert.equal(emitted.action, action);
+    const status = { resume_session: 'launched', reset_session_color: 'color_reset', set_session_color: 'color_saved', remove_session: 'session_removed' }[action];
+    f.actions.command({ type: 'control_result', id: emitted.id, commandID: emitted.id, sessionID: emitted.sessionID,
+      sessionTicket: emitted.sessionTicket, action, ok: true, status, detail: 'Native completed result' });
+    assert.equal((await pending).data.status, status);
+  }
+});
+
+test('session action offline and replaced-work admission failures remain definite and consume their UUID', async t => {
+  for (const reason of ['offline', 'replaced', 'missing']) {
+    const f = await linkedPolicy(t);
+    const row = (await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.sessions[0];
+    if (reason === 'offline') f.setClock(13000);
+    else f.actions.command({ type: 'workspace', total: reason === 'missing' ? 0 : 1, truncated: false,
+      sessions: reason === 'missing' ? [] : [{ ...row, ticket: 'different-work' }] });
+    const input = { id: randomUUID(), sessionID: 's', ticket: 't', sessionTicket: 'm', action: 'reset_session_color', text: '' };
+    const receipt = await f.send(input);
+    assert.equal(receipt.status, 200);
+    assert.equal(receipt.data.status, 'failed');
+    assert.equal(receipt.data.ok, false);
+    for (const field of ['sessionID', 'action', 'sessionTicket']) assert.equal(receipt.data[field], input[field]);
+    assert.equal(f.events.filter(e => e.type === 'control').length, 0);
+    await assert.rejects(f.send(input), { status: 409 });
+  }
+});
+
+test('native resume authority is bounded typed metadata and never a client retirement assertion', async t => {
+  for (const authority of [
+    { epoch: '', retired: 0 }, { epoch: 123, retired: 0 }, { epoch: 'scope', retired: -1 },
+    { epoch: 'scope', retired: '1' }, { epoch: 'scope', retired: 0.5 }, { epoch: 'scope', retired: Number.MAX_SAFE_INTEGER + 1 }
+  ]) {
+    const f = await linkedPolicy(t);
+    const row = (await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.sessions[0];
+    assert.throws(() => f.actions.command({ type: 'workspace', total: 1, truncated: false, sessions: [{ ...row,
+      sessionActions: { ticket: 'm', sourceID: 'original', group: 'saved', rgb: 1, overridden: false,
+        colors: [], editable: true, removable: true, resumable: true, resumeStatus: 'available', resumeDetail: '',
+        resumeAuthority: authority } }] }), /Invalid workspace snapshot/);
+    assert.equal((await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.connected, false);
+    assert.equal(f.events.filter(e => e.type === 'control').length, 0);
+  }
+});
+
+test('session actions reject malformed colors stale targets cross-group moves and reconnected removal', async t => {
+  const f = await linkedPolicy(t);
+  const row = (await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.sessions[0];
+  const a = { ticket: 'meta', sourceID: 'original', group: 'saved', rgb: 0x010203, overridden: true,
+    colors: [], editable: true, removable: true, resumable: true, resumeStatus: 'available', resumeDetail: '', moveDown: 'peer' };
+  const peer = { ...row, id: 'peer', ticket: 'tp', connected: false, sessionActions: { ...a, sourceID: 'other', ticket: 'mp', moveDown: null, moveUp: 's' } };
+  const publish = (changes = {}, target = peer) => f.actions.command({ type: 'workspace', total: 2, truncated: false,
+    sessions: [{ ...row, connected: false, sessionActions: a, ...changes }, target] });
+  const command = (action, extra = {}) => ({ id: randomUUID(), sessionID: 's', ticket: 't', action, text: '', sessionTicket: 'meta', ...extra });
+  publish();
+  for (const rgb of ['1', true, -1, 0x1000000, 1.1, null]) await assert.rejects(f.send(command('set_session_color', { rgb })), { status: 400 });
+  for (const extra of [{ cwd: '/synthetic' }, { argv: ['--resume'] }, { sourceID: 'other' }, { agentID: 'child' },
+    { resumeAuthority: { epoch: 'client-guess', retired: 999 } }])
+    await assert.rejects(f.send(command('resume_session', extra)), { status: 400 });
+  const move = () => command('move_session', { targetID: 'peer', targetTicket: 'mp' });
+  for (const target of [
+    { ...peer, sessionActions: { ...peer.sessionActions, group: 'monitoring' } },
+    { ...peer, sessionActions: { ...peer.sessionActions, ticket: 'changed' } },
+    { ...peer, sessionActions: { ...peer.sessionActions, sourceID: 'original' } }
+  ]) {
+   publish({}, target);
+   const input = move();
+   const before = f.events.filter(e => e.type === 'control').length;
+   const rejected = await f.send(input);
+   assert.equal(rejected.data.status, 'failed');
+   for (const field of ['sessionID', 'action', 'sessionTicket']) assert.equal(rejected.data[field], input[field]);
+   assert.equal(f.events.filter(e => e.type === 'control').length, before);
+   await assert.rejects(f.send(input), { status: 409 });
+  }
+  publish({ connected: true });
+  assert.equal((await f.send(command('remove_session'))).data.status, 'failed');
+  assert.equal((await f.send(command('resume_session'))).data.status, 'failed');
+  publish({ sessionActions: undefined });
+  assert.equal((await f.send(command('reset_session_color'))).data.status, 'failed');
+  publish();
+  const pending = f.send(move());
+  const sent = f.events.at(-1);
+  assert.equal(sent.targetID, 'peer');
+  f.actions.command({ type: 'control_result', id: sent.id, commandID: sent.id, ok: true, status: 'session_moved',
+    sessionID: sent.sessionID, action: sent.action, sessionTicket: sent.sessionTicket, detail: 'Order saved' });
+  assert.equal((await pending).data.status, 'session_moved');
+});
+
+test('session action unknown deadline late ACK and mismatched correlation never become launch success', async t => {
+  for (const failure of ['deadline', 'correlation', 'connected-status', 'native-failure', 'revoked']) {
+    const f = await linkedPolicy(t, { ackTimeout: 15 });
+    const row = (await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.sessions[0];
+    f.actions.command({ type: 'workspace', total: 1, truncated: false, sessions: [{ ...row, connected: false,
+      sessionActions: { ticket: 'm', sourceID: 'original', group: 'saved', rgb: 1, overridden: false, colors: [],
+        editable: true, removable: true, resumable: true, resumeStatus: 'available', resumeDetail: '' } }] });
+    const input = { id: randomUUID(), sessionID: 's', ticket: 't', sessionTicket: 'm', action: 'resume_session', text: '' };
+    const pending = f.send(input);
+    const sent = f.events.at(-1);
+    const ack = { type: 'control_result', id: sent.id, commandID: sent.id, ok: true, status: 'launched',
+      sessionID: sent.sessionID, action: sent.action, sessionTicket: sent.sessionTicket, detail: 'Launch only' };
+    if (failure === 'revoked') f.actions.disconnect(f.device.id);
+    else if (failure === 'correlation') f.actions.command({ ...ack, sessionID: 'other' });
+    else if (failure === 'connected-status') f.actions.command({ ...ack, status: 'connected' });
+    else if (failure === 'native-failure') f.actions.command({ ...ack, ok: false, status: 'failed', detail: 'Original CLI is missing' });
+    const result = await pending;
+    assert.equal(result.data.status, failure === 'native-failure' ? 'failed' : 'unknown', failure);
+    f.actions.command(ack);
+    await assert.rejects(f.send(input), { status: 409 });
+    assert.equal((await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.sessions[0].connected, false);
+  }
+});
+
+test('session actions share eight ordinary pending slots without consuming the urgent Off ninth', async t => {
+  const f = await linkedPolicy(t);
+  const row = (await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.sessions[0];
+  f.actions.command({ type: 'workspace', total: 1, truncated: false, sessions: [{ ...row,
+    sessionActions: { ticket: 'm', sourceID: 'original', group: 'monitoring', rgb: 1, overridden: false, colors: [],
+      editable: true, removable: false, resumable: false, resumeStatus: 'connected', resumeDetail: '' } }] });
+  const pending = [];
+  for (let i = 0; i < 8; i++) pending.push(f.send({ id: randomUUID(), sessionID: 's', ticket: 't',
+    sessionTicket: 'm', action: 'reset_session_color', text: '' }));
+  const events = f.events.filter(e => e.type === 'control');
+  assert.equal(events.length, 8);
+  await assert.rejects(f.send({ id: randomUUID(), sessionID: 's', ticket: 't',
+    sessionTicket: 'm', action: 'reset_session_color', text: '' }), { status: 429 });
+  const off = f.send(f.control(false)); f.ack();
+  assert.equal((await off).data.status, 'applied');
+  for (const e of events) f.actions.command({ type: 'control_result', id: e.id, commandID: e.id, ok: true,
+    status: 'color_reset', sessionID: e.sessionID, action: e.action, sessionTicket: e.sessionTicket, detail: '' });
+  assert.equal((await Promise.all(pending)).filter(r => r.data.status === 'color_reset').length, 8);
+});
 
 test('authorized management retains exact runtime results after capability, catalog or helper-row changes', async t => {
   const f = await linkedPolicy(t);
