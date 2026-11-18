@@ -20,6 +20,111 @@ const detail = (id = 'one', ticket = 'generation-1') => ({
   }, activity: [], controls: [], truncated: false
 });
 const control = (extra = {}) => ({ id: randomUUID(), sessionID: 'one', ticket: 'generation-1', action: 'queue', text: 'exact text', ...extra });
+const managedSession = () => ({ ...session(), managementTicket: 'management-1',
+  capabilities: { ...session().capabilities, subagentCreate: true, subagentRemove: true, subagentCleanup: true },
+  subagentTypes: ['reviewer'], subagentModels: ['live-model'] });
+const creationControl = (extra = {}) => control({ action: 'create_subagent', text: '', managementTicket: 'management-1',
+  creation: { name: 'Reviewer', agentType: 'reviewer', prompt: '  Review exactly\n', model: 'live-model' }, ...extra });
+
+test('phone management dispatch uses live catalogs and action-specific runtime ACK, not chat acceptance', async t => {
+  const f = await fixture(); t.after(f.close);
+  const auth = await pair(f);
+  await f.app.command(overview(managedSession()));
+  const snapshot = await f.call('/api/workspace', { sessionID: 'one' }, auth);
+  assert.equal(snapshot.data.subagentManagementControl, true);
+  await f.app.command(detail());
+  for (const [action, status, extra] of [
+    ['create_subagent', 'created', { creation: creationControl().creation }],
+    ['stop_idle_subagents', 'cleaned', {}],
+  ]) {
+    const input = control({ action, text: '', managementTicket: 'management-1', ...extra });
+    const pending = f.call('/api/control', input, auth);
+    await pause();
+    const sent = f.events.findLast(e => e.type === 'control');
+    assert.equal(sent.action, action);
+    assert.equal(sent.agentID, undefined);
+    assert.deepEqual(sent.creation, extra.creation);
+    assert.equal((await f.call('/api/control', { ...input, sessionID: 'other' }, auth)).status, 409);
+    await f.app.command({ type: 'control_result', id: sent.id, ok: true, commandID: 'receipt', status,
+      detail: 'Stopped 2; skipped 1; failed 0; uncertain 0' });
+    assert.equal((await pending).data.status, status);
+    assert.equal((await f.call('/api/control', input, auth)).data.status, status);
+  }
+  assert.equal((await f.call('/api/control', control({ action: 'remove_subagent', text: '',
+    managementTicket: 'management-1', agentID: 'child' }), auth)).data.status, 'failed');
+  const ended = detail(); ended.team.agents[0].status = 'completed'; ended.team.idleCount = 0;
+  await f.app.command(ended);
+  const remove = control({ action: 'remove_subagent', text: '', managementTicket: 'management-1', agentID: 'child' });
+  const pending = f.call('/api/control', remove, auth); await pause();
+  const sent = f.events.findLast(e => e.type === 'control');
+  assert.equal(sent.agentID, 'child');
+  await f.app.command({ type: 'control_result', id: sent.id, ok: true, commandID: 'receipt', status: 'removed', detail: 'Removed Child' });
+  assert.equal((await pending).data.status, 'removed');
+});
+
+test('management rejects stale catalogs, invalid fields and unknown creation never replays', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  assert.equal((await w.control(creationControl(), devices[0])).data.status, 'failed');
+  w.command(overview(managedSession()));
+  for (const extra of [
+    { creation: { ...creationControl().creation, model: 'missing' } },
+    { creation: { ...creationControl().creation, agentType: 'missing' } },
+    { managementTicket: 'old' },
+  ]) assert.equal((await w.control(creationControl(extra), devices[0])).data.status, 'failed');
+  for (const extra of [
+    { agentID: 'child' }, { text: 'main prompt' }, { creation: { ...creationControl().creation, name: 'x'.repeat(161) } },
+    { creation: { ...creationControl().creation, extra: true } }, { enabled: false },
+    { creation: { ...creationControl().creation, prompt: '😀'.repeat(8001) } },
+  ]) await assert.rejects(w.control(creationControl(extra), devices[0]), { status: 400 });
+  const input = creationControl();
+  const unknown = await w.control(input, devices[0]);
+  assert.equal(unknown.data.status, 'unknown');
+  const sent = events.length;
+  assert.equal((await w.control(input, devices[0])).data.status, 'unknown');
+  assert.equal(events.length, sent);
+  await assert.rejects(w.control({ ...input, creation: { ...input.creation, model: undefined } }, devices[0]), { status: 409 });
+  for (const status of ['queued', 'received', 'stopped', 'removed', 'cleaned']) {
+    const pending = w.control(creationControl(), devices[0]);
+    w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'cmd', status, detail: '' });
+    assert.equal((await pending).data.status, 'unknown');
+  }
+  w.command(overview({ ...managedSession(), subagentModels: [] }));
+  const fallback = w.control(creationControl({ creation: { name: 'Default', agentType: 'reviewer', prompt: 'Review' } }), devices[0]);
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'cmd', status: 'created', detail: 'Created' });
+  assert.equal((await fallback).data.status, 'created');
+});
+
+test('native uncertain cleanup retains its actual partial counts in a correlated response', async () => {
+  const { w, devices, events } = memoryWorkspace();
+  w.command(overview(managedSession()));
+  await w.read({ sessionID: 'one' }, devices[0], new EventEmitter());
+  w.command(detail());
+  const pending = w.control(control({ action: 'stop_idle_subagents', text: '', managementTicket: 'management-1' }), devices[0]);
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: false, commandID: 'cleanup-receipt',
+    status: 'unknown', detail: 'Cancelled 2; skipped 3; failed 1; uncertain 1', error: 'Some outcomes are uncertain.' });
+  const result = await pending;
+  assert.equal(result.status, 200, 'The caller must be able to inspect an actual partial runtime result');
+  assert.equal(result.data.status, 'unknown');
+  assert.equal(result.data.ok, false);
+  assert.equal(result.data.detail, 'Cancelled 2; skipped 3; failed 1; uncertain 1');
+});
+
+test('management admission rejection preserves an actionable failed result without reserving or replaying a command', async () => {
+  const { w, devices, events, advance } = memoryWorkspace();
+  w.command(overview(managedSession()));
+  const input = creationControl();
+  advance(12000);
+  const rejected = await w.control(input, devices[0]);
+  assert.equal(rejected.data.status, 'failed');
+  assert.equal(rejected.data.ok, false);
+  assert.equal(w.controls.size, 0);
+  assert.equal(events.filter(e => e.type === 'control').length, 0);
+  w.command(overview(managedSession()));
+  const freshExplicitCommand = creationControl();
+  const pending = w.control(freshExplicitCommand, devices[0]);
+  w.command({ type: 'control_result', id: events.at(-1).id, ok: true, commandID: 'new', status: 'created', detail: 'Created' });
+  assert.equal((await pending).data.status, 'created');
+});
 
 test('workspace authenticated long poll, exact selection and ticket isolation', async t => {
   const f = await fixture(); t.after(f.close);

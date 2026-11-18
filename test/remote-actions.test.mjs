@@ -25,7 +25,8 @@ async function linkedPolicy(t) {
     actions.command({ type: 'workspace', total: 1, truncated: false, sessions: [{
       id: 's', ticket: 't', name: 'Synthetic', project: '', agent: 'copilot', color: '#123456', state: 'working',
       connected: true, runningCount: 0, idleCount: 0,
-      capabilities: { steering: true, subagentChat: false, subagentStop: false, dangerousAutoYes: true },
+      capabilities: { steering: true, subagentChat: false, subagentStop: false, dangerousAutoYes: true, subagentCreate: true },
+      managementTicket: 'm', subagentTypes: ['reviewer'], subagentModels: [],
       dangerousAutoYes: { ...policy }
     }] });
   }
@@ -44,12 +45,104 @@ async function linkedPolicy(t) {
     if (event.action === 'dangerous_auto_yes') policy = { ...policy, enabled: event.enabled,
       ticket: randomUUID(), revision: policy.revision + 1, offTicket: event.enabled ? policy.offTicket : token() };
     actions.command({ type: 'control_result', id: event.id, commandID: randomUUID(), ok: true,
-      status: event.action === 'dangerous_auto_yes' ? 'applied' : 'queued', detail: '',
+      status: event.action === 'dangerous_auto_yes' ? 'applied' : event.action === 'create_subagent' ? 'created' : 'queued', detail: '',
       ...(event.action === 'dangerous_auto_yes' ? { dangerousAutoYes: { ...policy } } : {}) });
   }
-  return { access, handle, actions, events, control, send, ack, snapshot, setClock: value => { now = value; },
+
+  return { access, handle, actions, events, device, control, send, ack, snapshot, setClock: value => { now = value; },
     macEnable() { policy = { ...policy, ticket: randomUUID(), revision: policy.revision + 1, enabled: true }; snapshot(); } };
 }
+
+test('authorized management retains exact runtime results after capability, catalog or helper-row changes', async t => {
+  const f = await linkedPolicy(t);
+  const row = {
+    id: 's', ticket: 't', name: 'Synthetic', project: '', agent: 'copilot', color: '#123456', state: 'working',
+    connected: true, runningCount: 0, idleCount: 0, managementTicket: 'before',
+    capabilities: { steering: true, subagentChat: false, subagentStop: false,
+      subagentCreate: true, subagentRemove: true, subagentCleanup: true },
+    subagentTypes: ['reviewer'], subagentModels: ['live-model']
+  };
+  const overview = session => ({ type: 'workspace', total: 1, truncated: false, sessions: [session] });
+  const detail = agents => ({ type: 'workspace_detail', sessionID: 's', ticket: 't', activity: [], controls: [],
+    truncated: false, team: { agents, runningCount: 0, idleCount: 0, truncated: false } });
+  for (const [action, status] of [
+    ['stop_idle_subagents', 'failed'], ['stop_idle_subagents', 'unknown'],
+    ['create_subagent', 'failed'], ['create_subagent', 'created'], ['remove_subagent', 'removed']
+  ]) {
+    f.actions.command(overview(row));
+    await f.actions.request('workspace', { sessionID: 's' }, f.device);
+    f.actions.command(detail([{ id: 'ended', name: 'Ended', task: '', status: 'completed', parentKnown: true }]));
+    const input = { id: randomUUID(), sessionID: 's', ticket: 't', managementTicket: 'before', action, text: '',
+      ...(action === 'create_subagent' ? { creation: { name: 'Synthetic', agentType: 'reviewer', model: 'live-model', prompt: 'Synthetic' } } : {}),
+      ...(action === 'remove_subagent' ? { agentID: 'ended' } : {}) };
+    let settled = false;
+    const pending = f.send(input).then(result => { settled = true; return result; });
+    const sent = f.events.at(-1);
+    assert.equal(sent.action, action);
+    // The runtime publishes availability/catalog/team changes before returning its operation result.
+    f.actions.command(overview({ ...row, managementTicket: 'after', subagentModels: [],
+      capabilities: { ...row.capabilities, subagentCleanup: false, subagentRemove: false } }));
+    f.actions.command(detail([]));
+    await new Promise(setImmediate);
+    assert.equal(settled, false, `${action}: admission changes must not discard the original pending runtime result`);
+    const rejected = await f.send({ ...input, id: randomUUID() });
+    assert.equal(rejected.data.status, 'failed', 'The old reviewed management ticket still cannot admit new work');
+    const counts = action === 'stop_idle_subagents'
+      ? `Cancelled 2; skipped 3; failed 0; uncertain ${status === 'unknown' ? 1 : 0}. Later runtime observation failed. Main agent was not targeted.`
+      : action === 'create_subagent'
+        ? status === 'created' ? 'Created subagent “Synthetic”. Requested model: live-model.' : 'This model is no longer available in the live session catalog.'
+        : 'Ended subagent removed from the list. No files were deleted.';
+    f.actions.command({ type: 'control_result', id: sent.id, commandID: 'native-receipt', status,
+      ok: ['created', 'removed'].includes(status), detail: counts });
+    const result = await pending;
+    assert.equal(result.status, 200);
+    assert.equal(result.data.status, status);
+    assert.equal(result.data.detail, counts);
+    assert.equal(result.data.ok, ['created', 'removed'].includes(status));
+    await assert.rejects(f.send(input), { status: 409 });
+  }
+});
+
+test('management result correlation still ends on replacement, disconnect, missing session or expired lease', async t => {
+  for (const fence of ['replacement', 'disconnected', 'missing', 'provider', 'channel', 'lease']) {
+    const f = await linkedPolicy(t);
+    const row = (await f.actions.request('workspace', { sessionID: 's' }, f.device)).data.sessions[0];
+    const input = { id: randomUUID(), sessionID: 's', ticket: 't', managementTicket: 'm',
+      action: 'create_subagent', text: '', creation: { name: 'Synthetic', agentType: 'reviewer', prompt: 'Synthetic' } };
+    const pending = f.send(input);
+    const sent = f.events.at(-1);
+    if (fence === 'channel') f.actions.disconnect(f.device.id);
+    else if (fence === 'lease') f.setClock(12000);
+    else {
+      const sessions = fence === 'missing' ? [] : [{
+        ...row, ...(fence === 'replacement' ? { ticket: 'replaced' } :
+          fence === 'disconnected' ? { connected: false } : { agent: 'claude' })
+      }];
+      f.actions.command({ type: 'workspace', sessions, total: sessions.length, truncated: false });
+    }
+    f.actions.command({ type: 'control_result', id: sent.id, commandID: 'late', ok: true, status: 'created', detail: 'Late result' });
+    const result = await pending;
+    assert.equal(result.data.status, 'unknown', fence);
+    assert.equal(result.data.ok, false, fence);
+    assert.notEqual(result.data.detail, 'Late result', fence);
+  }
+});
+
+test('authorized management fills only ordinary history and never consumes urgent Off capacity', async t => {
+  const f = await linkedPolicy(t);
+  const create = () => ({ id: randomUUID(), sessionID: 's', ticket: 't', managementTicket: 'm',
+    action: 'create_subagent', text: '', creation: { name: 'Synthetic', agentType: 'reviewer', prompt: 'Synthetic instructions' } });
+  const first = create();
+  for (let i = 0; i < 256; i++) {
+    const pending = f.send(i === 0 ? first : create());
+    assert.equal(f.events.at(-1).action, 'create_subagent');
+    f.ack(); assert.equal((await pending).data.status, 'created');
+  }
+  await assert.rejects(f.send({ ...first, creation: { ...first.creation, name: 'Changed' } }), { status: 409 });
+  await assert.rejects(f.send(create()), { status: 429 });
+  const off = f.send(f.control(false));
+  f.ack(); assert.equal((await off).data.status, 'applied');
+});
 
 test('authorized full history retains urgent Off through 300 Mac re-enables without evicting ordinary UUIDs', async t => {
   const f = await linkedPolicy(t);

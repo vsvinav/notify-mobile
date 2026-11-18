@@ -139,7 +139,19 @@ an unknown outcome remains blocked for that policy epoch. Neither path retries a
 Old Mac/helper builds remain unsupported. This adds no automation engine to the
 helper and no Dangerous Auto-yes UI to the LAN web app. It is not a published release.
 
-Updates arrive while Sessions is open; hidden pages stop watching. Details are loaded only for the selected session, and earlier messages or very large teams can be omitted with a visible notice. Creating/removing subagents and automation settings remain Mac-only.
+**Native Android helper management (unpublished source preview):** matching updated
+Mac/helper/Android builds expose **Add subagent**, ended-only **Remove from list**,
+and confirmed **Stop idle >10 min** for one selected session. Types and optional
+models come only from live native catalogs; an omitted model means **Configured
+default**, never an invented catalog entry. Management uses its own live catalog
+ticket, ordinary UUIDv4 command history and native audit/runtime acknowledgment.
+Only `created`, `removed`, or the runtime’s existing `cleaned` status confirms the
+corresponding action; cleanup detail includes actual counts and partial/uncertain
+outcomes. No timeout is success or automatically retried. This does not consume
+the reserved Dangerous Auto-yes Off lane, alter chat drafts, delete files, or
+add a scheduler. Claude helper management remains unsupported.
+
+Updates arrive while Sessions is open; hidden pages stop watching. Details are loaded only for the selected session, and earlier messages or very large teams can be omitted with a visible notice. The **LAN web app** does not expose creation/removal/idle cleanup or automation settings; use the Mac or the matching native Android source preview.
 
 **Connected** means the phone app recently reached your Mac. **Push enabled** means a notification subscription exists, not that every alert has been delivered. Focus and battery settings can delay alerts.
 
