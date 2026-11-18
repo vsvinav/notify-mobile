@@ -69,6 +69,8 @@ export async function createRemoteCompanion({ directory, origin, emit,
   const channels = new Map();
   const channelWork = new Set(), lifetime = new AbortController();
   let attentionWork, lastAttention = -Infinity;
+  let genericAttention = false, attentionWaiting = false, attentionPending = false;
+  let attentionUntil = 0, attentionWallUntil = 0, attentionError;
   const openCrypto = () => cryptoProcess(executable, ['load-identity', state.macID, JSON.stringify([...Buffer.from(state.publicKey, 'base64url')])]);
   const raw = await readPrivate(file);
   if (raw === null) {
@@ -110,17 +112,47 @@ export async function createRemoteCompanion({ directory, origin, emit,
     finally { if (policyWork === work) policyWork = undefined; }
   }
   const actions = new RemoteActions({
-    attention() {
-      if (closed || paused || fault || enrollmentError || !state.owner || !state.credential ||
-        !state.devices.length || attentionWork || performance.now() - lastAttention < 30000) return;
-      lastAttention = performance.now();
-      attentionWork = api('mac/attention', { eventID: randomUUID(), issuedAt: Date.now() }, state.credential)
-        .catch(() => { /* Best effort only; never replay a request or its attention event. */ })
-        .finally(() => { attentionWork = undefined; });
-    },
+    attention() { if (!genericAttention) publishAttention(true, true); },
     emit, devices: () => [...channels.values()].filter(c => c.handle && !c.signal.aborted)
       .map(c => ({ id: c.device.id, name: c.device.name, expires: c.expiresAt }))
   });
+  function publishAttention(waiting, changed) {
+    attentionWaiting = waiting;
+    if (!waiting) { attentionPending = false; attentionError = undefined; return; }
+    const now = performance.now();
+    if (changed) {
+      attentionPending = true;
+      attentionUntil = now + 120000;
+      attentionWallUntil = Date.now() + 120000;
+    }
+    if (attentionPending && (now >= attentionUntil || Date.now() >= attentionWallUntil)) {
+      attentionPending = false;
+      if (attentionError) {
+        attentionError = 'Phone alert delivery was not confirmed. Check notification registration on the phone.';
+        status();
+      }
+    }
+    if (!attentionPending || closed || paused || fault || enrollmentError ||
+      !state.owner || !state.credential || !state.devices.length || attentionWork || now - lastAttention < 32000) return;
+    attentionPending = false;
+    lastAttention = now;
+    const credential = state.credential;
+    const unavailable = () => {
+      if (closed || credential !== state.credential || !attentionWaiting) return;
+      attentionPending = true;
+      attentionError = 'Phone alert delivery was not confirmed. Retrying briefly while a request is waiting.';
+      status();
+    };
+    attentionWork = api('mac/attention', { eventID: randomUUID(), issuedAt: Date.now() }, credential)
+      .then(result => {
+        if (closed || credential !== state.credential) return;
+        if (result.accepted !== true) { unavailable(); return; }
+        attentionError = undefined;
+        status();
+      })
+      .catch(unavailable)
+      .finally(() => { attentionWork = undefined; });
+  }
   async function api(path, body = {}, credential, signal) {
     const requestSignal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(10000), ...(signal ? [signal] : [])]);
     requestSignal.throwIfAborted();
@@ -161,7 +193,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
       state: fault || enrollmentError ? 'error' : paused ? 'paused' : active ? 'connected' : pending ? 'pairing' : 'connecting',
       url: origin, devices, pendingPairingIDs: pending ? [pending.id] : [],
       ...(setupID && !invitationUnavailable ? { setupURL: `${origin}/#setup=${encodeURIComponent(setupID)}&mac=${state.macID}&key=${state.publicKey}` } : {}),
-      ...(message ? { message } : {})
+      ...(message || attentionError ? { message: fault || enrollmentError ? message : attentionError ?? message } : {})
     } });
   }
   function fatal(error) {
@@ -532,6 +564,14 @@ export async function createRemoteCompanion({ directory, origin, emit,
     if (input.type === 'heartbeat') {
       paused = false;
       status(); void tick(); return;
+    }
+    if (input.type === 'attention') {
+      if (Object.keys(input).length !== 3 || typeof input.waiting !== 'boolean' ||
+        typeof input.changed !== 'boolean' || (input.changed && !input.waiting))
+        fail(400, 'Invalid generic attention signal.');
+      genericAttention = true;
+      publishAttention(input.waiting, input.changed);
+      return;
     }
     if (input.type === 'invite') {
       return invite();
