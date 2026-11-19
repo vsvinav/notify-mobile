@@ -153,6 +153,141 @@ test('hosted push endpoints bind exact signed device and dispatch generic attent
   assert.equal((await app.request('/v1/remote/push/begin', { body: input, headers: account })).status, 401);
 });
 
+test('hosted remembered routes require native opt-in, fresh account plus Mac consent, and issue scoped relay cookies', async t => {
+  const app = await fixture(t, { fcm: { prepare: async () => () => {} } });
+  const cookie = await registerAccount(app), account = { origin, cookie };
+  const mac = deviceKey(), phone = deviceKey(), macID = randomUUID(), deviceID = randomUUID();
+  const call = async (path, body, headers = {}) => {
+    const result = await app.request(`/v1/remote/${path}`, { body, headers });
+    assert.equal(result.status, 200, `${path}: ${result.text}`);
+    return result;
+  };
+  const bootstrap = (await call('mac/begin', { macID, publicKey: mac.publicKey })).json();
+  const host = (await call('mac/register', mac.finish(bootstrap))).json();
+  const native = { authorization: `Bearer ${host.credential}` };
+  const pair = (await call('pair', { setupID: host.setupID, deviceID, publicKey: phone.publicKey, name: 'Phone' }, account)).json();
+  await call('mac/decision', { id: pair.id, allow: true }, native);
+  const target = { macID, deviceID };
+  const before = await app.request('/v1/remote/remember/status', { body: target, headers: account });
+  assert.equal(before.status, 200, 'Remembered routes must exist separately from pairing');
+  assert.equal(before.json().committed, null);
+  for (const [body, headers, status] of [
+    [target, account, 400],
+    [{ ...target, optIn: false }, account, 400],
+    [{ ...target, optIn: true, expiresAt: Date.now() + 10000 }, account, 400],
+    [{ ...target, optIn: true }, {}, 403],
+    [{ ...target, optIn: true }, { ...account, 'sec-fetch-site': 'same-origin' }, 403],
+    [{ ...target, optIn: true }, { origin }, 401]
+  ]) assert.equal((await app.request('/v1/remote/remember/begin', { body, headers })).status, status);
+  const proposal = (await call('remember/begin', { ...target, optIn: true }, account)).json();
+  assert.equal(JSON.parse(proposal.challenge).operation, 'enable');
+  const pending = (await call('remember/finish', phone.finish(proposal), account)).json();
+  assert.equal((await call('mac/status', {}, native)).json().rememberPending.generation, pending.generation);
+  const input = { ...target, generation: pending.generation };
+  assert.equal((await app.request('/v1/remote/remember/grant/begin', { body: input, headers: { origin } })).status, 401);
+  await call('mac/remember/decision', { id: pending.id, allow: true }, native);
+  const logout = await app.request('/v1/account/logout', { body: {}, headers: account });
+  assert.equal(logout.status, 200);
+  assert.equal((await app.request('/v1/remote/remember/status', { body: target, headers: account })).status, 401);
+  const req = { origin };
+  const flow = (await call('remember/grant/begin', input, req)).json();
+  assert.equal((await app.request('/v1/remote/grant/finish', { body: phone.finish(flow), headers: req })).status, 401);
+  const granted = await call('remember/grant/finish', phone.finish(flow), req);
+  assert.equal(granted.json().scope, 'remembered');
+  assert.equal(granted.json().generation, pending.generation);
+  assert.equal(granted.json().credential, undefined);
+  assert.match(granted.headers['set-cookie'][0], /^__Host-notify-relay=.+; Path=\/; Max-Age=(?:[1-9]|[12]\d|30); Secure; HttpOnly; SameSite=Strict$/);
+  assert.equal(granted.headers['set-cookie'].length, 1, 'Never issue an account cookie for device proof');
+  const socket = new WebSocket(`ws://127.0.0.1:${app.server.address().port}/v1/relay`, 'notify-relay-v1',
+    { headers: { host: hostname, 'x-forwarded-proto': 'https', origin,
+      cookie: granted.headers['set-cookie'][0].split(';')[0] } });
+  await once(socket, 'open');
+  t.after(() => socket.terminate());
+  const renewed = await call('grant/renew', phone.finish(granted.json().renewal), req);
+  assert.equal(renewed.json().scope, 'remembered');
+  assert.equal(renewed.json().generation, pending.generation);
+  const push = (await call('remember/push/begin', { ...input, token: 'synthetic-token-123', registrationGeneration: null }, req)).json();
+  const registered = (await call('remember/push/finish', phone.finish(push), req)).json();
+  assert.ok(registered.registrationGeneration);
+  const revoke = (await call('remember/revoke/begin', input, req)).json();
+  const closed = once(socket, 'close');
+  await call('remember/revoke/finish', phone.finish(revoke), req);
+  await closed;
+  assert.equal((await app.request('/v1/remote/remember/grant/begin', { body: input, headers: req })).status, 401);
+  const cleanup = (await call('remember/push/begin', {
+    ...input, token: null, registrationGeneration: registered.registrationGeneration
+  }, req)).json();
+  assert.equal((await call('remember/push/finish', phone.finish(cleanup), req)).json().enabled, false);
+});
+
+test('hosted remember reconciliation reloads a committed lost decision without renewing account sessions or expiry', async t => {
+  const db = firestoreFixture();
+  const app = await fixture(t, { storageFactory: () => createFirestoreStores({ firestore: db.firestore, origin }) });
+  const account = await registerAccount(app, origin, true);
+  const mac = deviceKey(), phone = deviceKey(), macID = randomUUID(), deviceID = randomUUID();
+  const call = (path, body, headers = {}) => app.request(`/v1/remote/${path}`, { body, headers });
+  const bootstrap = (await call('mac/begin', { macID, publicKey: mac.publicKey })).json();
+  const host = (await call('mac/register', mac.finish(bootstrap))).json();
+  const native = { authorization: `Bearer ${host.credential}` }, headers = { origin, cookie: account.cookie };
+  const pair = (await call('pair', { setupID: host.setupID, deviceID, publicKey: phone.publicKey, name: 'Phone' }, headers)).json();
+  assert.equal((await call('mac/decision', { id: pair.id, allow: true }, native)).status, 200);
+  const proposal = (await call('remember/begin', { macID, deviceID, optIn: true }, headers)).json();
+  assert.equal((await call('remember/finish', phone.finish(proposal), headers)).status, 200);
+  const pending = (await call('remember/status', { macID, deviceID }, headers)).json();
+  assert.equal(pending.committed, null);
+  assert.equal(pending.pending.generation, proposal.generation);
+  assert.equal(pending.pending.awaitingMac, true);
+  const fence = db.documents.get('notifyState/fence').generation;
+  db.afterCommit(writes => {
+    if (writes.some(([path]) => path === 'notifyState/trust'))
+      throw Object.assign(new Error('Synthetic lost response'), { code: 14 });
+  });
+  assert.equal((await call('mac/remember/decision', { id: proposal.id, allow: true }, native)).status, 503);
+  db.afterCommit(undefined);
+  await healthy(app);
+  assert.equal(db.documents.get('notifyState/fence').generation, fence);
+  assert.equal((await call('remember/status', { macID, deviceID }, headers)).status, 401);
+  const input = { macID, deviceID, generation: proposal.generation };
+  const flow = await call('remember/grant/begin', input, { origin });
+  assert.equal(flow.status, 200, 'Committed device authority reconnects without resurrecting an account cookie');
+  assert.equal((await call('remember/grant/finish', phone.finish(flow.json()), { origin })).status, 200);
+  const cookie = await account.login();
+  const restored = (await call('remember/status', { macID, deviceID }, { origin, cookie })).json();
+  assert.equal(restored.pending, null);
+  assert.deepEqual(restored.committed, { generation: proposal.generation,
+    authorizationExpiresAt: proposal.authorizationExpiresAt, state: 'active' });
+  assert.equal((await call('remember/finish', phone.finish(proposal), { origin, cookie })).status, 401);
+  const writes = db.metrics.writes;
+  await call('remember/status', { macID, deviceID }, { origin, cookie });
+  assert.equal(db.metrics.writes, writes);
+  const serialized = JSON.stringify([...db.documents]);
+  assert.ok(!serialized.includes(proposal.challenge));
+  assert.ok(!serialized.includes(account.cookie.split('=')[1]));
+});
+
+test('hosted remembered endpoints retain strict fields, body, origin and shared request limits', async t => {
+  const app = await fixture(t);
+  for (const path of ['remember/begin', 'remember/finish', 'remember/status', 'remember/grant/begin',
+    'remember/grant/finish', 'remember/push/begin', 'remember/push/finish', 'remember/revoke/begin',
+    'remember/revoke/finish', 'mac/remember/decision']) {
+    assert.equal((await app.request(`/v1/remote/${path}`, { body: {}, headers: { origin: 'https://evil.example' } })).status, 403);
+    assert.equal((await app.request(`/v1/remote/${path}`, { body: {}, headers: path.startsWith('mac/') ? {} : { origin } })).status, 400);
+  }
+  assert.equal((await app.request('/v1/remote/remember/grant/begin', {
+    body: 'x'.repeat(17000), headers: { origin, 'content-length': '17000' }
+  })).status, 413);
+  assert.equal((await app.request('/v1/remote/remember/grant/begin', {
+    body: {}, headers: { origin, 'content-type': 'text/plain' }
+  })).status, 415);
+  let limited = false;
+  for (let i = 0; i < 121; i++) {
+    const result = await app.request('/v1/remote/remember/grant/begin', { body: {}, headers: { origin } });
+    if (result.status === 429) { limited = true; break; }
+    assert.equal(result.status, 400);
+  }
+  assert.equal(limited, true);
+});
+
 test('hosted durable accounts and approved pairing survive reconstruction without saving sessions or grants', async t => {
   const db = firestoreFixture();
   const app = await fixture(t, { storageFactory: () => createFirestoreStores({ firestore: db.firestore, origin }) });

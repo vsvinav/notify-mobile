@@ -1,7 +1,7 @@
 import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 
-const ENROLL_TTL = 180000, GRANT_TTL = 30000;
+const ENROLL_TTL = 180000, GRANT_TTL = 30000, REMEMBER_TTL = 30 * 86400000;
 const PREFIX = Buffer.from('Notify remote authorization v1\0');
 const COOKIE = '__Host-notify-relay';
 const secret = () => randomBytes(32).toString('base64url');
@@ -59,6 +59,8 @@ const pushToken = value => typeof value === 'string' && /^[A-Za-z0-9_:.-]{16,204
 // credentials in URLs or logs. Account-bound operations may be asynchronous.
 // finishGrant(input, req) requires the real account request for phone challenges;
 // accounts.authorize must be synchronous, and both begin/finish sessions stay live.
+// Remembered phone authority is a separate, fixed-expiry device scope. Its stored
+// generation never refreshes an account session or slides during lease renewal.
 // Supplying a fenced store makes construction and all operations except close asynchronous.
 export function createRemoteAuthority({ origin, accounts, now = () => performance.now(), wallNow = Date.now,
   store, initialState = null }) {
@@ -70,6 +72,7 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     fail(400, 'Invalid authorization configuration.');
 
   const bootstraps = new Map(), macs = new Map(), challenges = new Map(), grants = new Map();
+  const acknowledgements = new WeakMap();
   if (initialState !== null) {
     try {
       shape(initialState, ['version', 'origin', 'macs']);
@@ -95,11 +98,26 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
         hashes.add(mac.credentialHash);
         const devices = new Map();
         for (const device of mac.devices) {
-          shape(device, ['deviceID', 'publicKey', 'name'], ['pushToken']);
+          shape(device, ['deviceID', 'publicKey', 'name'], ['pushToken', 'remembered', 'pushGeneration']);
+          if (device.pushGeneration !== undefined) decode(device.pushGeneration, 32);
+          if (device.remembered !== undefined) {
+            const r = device.remembered;
+            shape(r, ['version', 'account', 'macID', 'macPublicKey', 'deviceID', 'publicKey',
+              'generation', 'issuedAt', 'expiresAt', 'state']);
+            shape(r.account, ['issuer', 'subject']);
+            decode(r.generation, 32);
+            if (r.version !== 1 || !sameAccount(r.account, mac.account) ||
+              r.macID !== mac.macID || r.macPublicKey !== mac.publicKey ||
+              r.deviceID !== device.deviceID || r.publicKey !== device.publicKey ||
+              !Number.isSafeInteger(r.issuedAt) || r.issuedAt < 0 ||
+              !Number.isSafeInteger(r.expiresAt) || r.expiresAt <= r.issuedAt ||
+              r.expiresAt - r.issuedAt > REMEMBER_TTL || !['active', 'revoked'].includes(r.state))
+              throw new Error();
+          }
           if (device.pushToken !== undefined && !pushToken(device.pushToken)) throw new Error();
           if (!uuid(device.deviceID) || devices.has(device.deviceID) || !identity(device.name) ||
             device.name.length > 128 || device.name.trim() !== device.name) throw new Error();
-          devices.set(device.deviceID, { ...device, key: key(device.publicKey),
+          devices.set(device.deviceID, { ...structuredClone(device), key: key(device.publicKey),
             approved: true, account: accountCopy(mac.account) });
         }
         macs.set(mac.macID, { ...mac, account: accountCopy(mac.account), key: key(mac.publicKey),
@@ -145,6 +163,7 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     record.controller.abort();
   }
   function dropDevice(mac, device) {
+    if (mac.rememberProposal?.device === device) dropRememberProposal(mac);
     if (mac.pending === device) mac.pending = null;
     if (mac.devices.get(device.deviceID) === device) mac.devices.delete(device.deviceID);
     unwatch(device);
@@ -156,7 +175,10 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     timer = undefined;
     for (const record of challenges.values()) dropChallenge(record);
     for (const record of grants.values()) dropGrant(record);
-    for (const mac of macs.values()) if (mac.pending) unwatch(mac.pending);
+    for (const mac of macs.values()) {
+      if (mac.pending) unwatch(mac.pending);
+      if (mac.rememberProposal) unwatch(mac.rememberProposal);
+    }
     bootstraps.clear();
     macs.clear();
     pendingAttention.clear();
@@ -169,7 +191,7 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     if (!Number.isFinite(nextMono) || nextMono < 0 || nextMono < mono ||
       nextMono > Number.MAX_SAFE_INTEGER - ENROLL_TTL ||
       !Number.isSafeInteger(nextWall) || nextWall < 0 || nextWall < wall ||
-      nextWall > Number.MAX_SAFE_INTEGER - ENROLL_TTL) {
+      nextWall > Number.MAX_SAFE_INTEGER - REMEMBER_TTL) {
       fault = true;
       clear();
       fail(503, 'Remote authorization clock is invalid.');
@@ -183,14 +205,26 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
         (mac.pending === device && mono < device.deadline && !device.proof.signal.aborted));
   }
   function valid(record) {
-    return mono < record.deadline && !record.proof.signal.aborted &&
+    return mono < record.deadline && (record.scope === 'remembered'
+      ? rememberedCurrent(record)
+      : !record.proof.signal.aborted) &&
       !record.finishProof?.signal.aborted &&
       current(record.mac, record.device) &&
       sameAccount(record.proof, record.mac.account ?? record.device.account);
   }
+  function rememberedCurrent(record) {
+    // Signout cancellation follows the same generation if Mac approval wins the race.
+    if (record.proposal) return (record.mac.rememberProposal === record.proposal && valid(record.proposal)) ||
+      (record.purpose === 'remember-revoke' && record.device.remembered?.generation === record.proposal.generation &&
+        wall < record.device.remembered.expiresAt);
+    return record.device.remembered === record.remembered && wall < record.remembered.expiresAt &&
+      (record.remembered.state === 'active' || record.purpose === 'remember-revoke' ||
+        (record.purpose === 'remember-push' && record.token === null));
+  }
   function prune() {
     for (const [id, record] of bootstraps) if (mono >= record.deadline) bootstraps.delete(id);
     for (const mac of macs.values()) {
+      if (mac.rememberProposal && !valid(mac.rememberProposal)) dropRememberProposal(mac);
       if (mac.pending && (mono >= mac.pending.deadline || mac.pending.proof.signal.aborted))
         dropDevice(mac, mac.pending);
       if (!mac.account && mono >= mac.deadline) macs.delete(mac.macID);
@@ -209,6 +243,7 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     for (const mac of macs.values()) {
       if (!mac.account) deadline = Math.min(deadline, mac.deadline);
       if (mac.pending) deadline = Math.min(deadline, mac.pending.deadline);
+      if (mac.rememberProposal) deadline = Math.min(deadline, mac.rememberProposal.deadline);
     }
     for (const record of challenges.values()) deadline = Math.min(deadline, record.deadline);
     for (const record of grants.values()) deadline = Math.min(deadline, record.deadline);
@@ -234,14 +269,30 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     return device;
   }
   function challenge(purpose, fields) {
-    return JSON.stringify({ purpose, origin, ...fields, challenge: secret() });
+    const scoped = purpose.startsWith('remember-');
+    const operation = purpose === 'remember-mac-grant' ? 'grant' : purpose.slice('remember-'.length);
+    return JSON.stringify({ purpose, origin,
+      ...(scoped ? { scope: 'remembered', operation } : {}), ...fields, challenge: secret() });
   }
   function flow(purpose, fields, publicKey, ttl) {
-    return { id: secret(), challenge: challenge(purpose, fields),
+    return { id: secret(), purpose, challenge: challenge(purpose, {
+      ...fields, ...(purpose.startsWith('remember-') ? { challengeExpiresAt: Math.floor(wall + ttl) } : {})
+    }),
       key: publicKey, deadline: mono + ttl, expiresAt: Math.floor(wall + ttl) };
   }
+  function guardResult(value, guard) {
+    acknowledgements.set(value, guard);
+    return value;
+  }
+  function checkResult(value) {
+    check();
+    if (acknowledgements.has(value) && !acknowledgements.get(value)())
+      fail(401, 'Authorization changed before acknowledgement.');
+  }
   function publicFlow(record) {
-    return { id: record.id, challenge: record.challenge, expiresAt: record.expiresAt };
+    return guardResult({ id: record.id, challenge: record.challenge, expiresAt: record.expiresAt },
+      () => record.mac ? challenges.get(record.id) === record && valid(record)
+        : bootstraps.get(record.id) === record && mono < record.deadline);
   }
   function checkedProof(result) {
     if (!identity(result?.issuer) || !identity(result?.subject) ||
@@ -322,9 +373,237 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     check();
     const mac = host(credential), pending = mac.pending;
     return { macID: mac.macID, account: accountCopy(mac.account),
+      rememberPending: mac.rememberProposal?.confirmed ? rememberPending(mac.rememberProposal) : null,
       pending: pending ? { id: pending.id, name: pending.name, deviceID: pending.deviceID,
         publicKey: pending.publicKey, account: accountCopy(pending.account), expiresAt: pending.expiresAt } : null,
-      devices: [...mac.devices.values()].map(({ deviceID, publicKey, name }) => ({ deviceID, publicKey, name })) };
+      devices: [...mac.devices.values()].map(({ deviceID, publicKey, name, remembered }) =>
+        ({ deviceID, publicKey, name, ...(remembered ? { remembered: rememberPublic(remembered) } : {}) })) };
+  }
+  function phoneRequest(req) {
+    if (req?.headers?.origin !== origin || req.headers.authorization !== undefined ||
+      Object.keys(req.headers).some(name => name.startsWith('sec-fetch-')))
+      fail(403, 'Native phone authorization required.');
+  }
+  function rememberFields(mac, device, generation) {
+    return { version: 1, account: accountCopy(mac.account), macID: mac.macID,
+      macPublicKey: mac.publicKey, deviceID: device.deviceID, publicKey: device.publicKey, generation };
+  }
+  function rememberPublic(record) {
+    return { generation: record.generation, authorizationExpiresAt: record.expiresAt,
+      state: wall >= record.expiresAt ? 'expired' : record.state };
+  }
+  function rememberPending(record) {
+    return { id: record.id, generation: record.generation, deviceID: record.device.deviceID,
+      publicKey: record.device.publicKey, name: record.device.name, account: accountCopy(record.mac.account),
+      macID: record.mac.macID, macPublicKey: record.mac.publicKey,
+      expiresAt: record.expiresAt, authorizationExpiresAt: record.authorizationExpiresAt };
+  }
+  function dropRememberProposal(mac) {
+    const record = mac.rememberProposal;
+    if (!record) return;
+    mac.rememberProposal = null;
+    dropChallenge(record);
+  }
+  async function ownedDevice(req, input, fresh) {
+    const accountProof = await proof(req, fresh), mac = macs.get(input.macID);
+    if (!mac || !sameAccount(mac.account, accountProof)) fail(401, 'Device authorization unavailable.');
+    const device = target(mac, input.deviceID);
+    if (!device.approved) fail(401, 'Device authorization unavailable.');
+    return { mac, device, accountProof };
+  }
+  async function beginRemember(req, input) {
+    return accountOperation(async () => {
+      phoneRequest(req);
+      shape(input, ['macID', 'deviceID', 'optIn']);
+      if (!uuid(input.macID) || !uuid(input.deviceID) || input.optIn !== true)
+        fail(400, 'Explicit phone opt-in required.');
+      const { mac, device, accountProof } = await ownedDevice(req, input, true);
+      check();
+      checkedProof(accountProof);
+      if (!current(mac, device)) fail(401, 'Device authorization unavailable.');
+      if (mac.rememberProposal) fail(409, 'Remember decision already pending.');
+      rememberCapacity(device);
+      const generation = secret(), authorizationExpiresAt = wall + REMEMBER_TTL;
+      const record = { ...flow('remember-enable', {
+        ...rememberFields(mac, device, generation), optIn: true, authorizationExpiresAt
+      }, device.key, ENROLL_TTL), mac, device, proof: accountProof,
+      generation, authorizationExpiresAt, issuedAt: wall, confirmed: false };
+      mac.rememberProposal = record;
+      challenges.set(record.id, record);
+      watch(record, accountProof.signal, () => dropRememberProposal(mac));
+      schedule();
+      return guardResult({ ...publicFlow(record), generation, authorizationExpiresAt },
+        () => challenges.get(record.id) === record && valid(record));
+    });
+  }
+  async function finishRemember(req, input) {
+    return accountOperation(async () => {
+      phoneRequest(req);
+      shape(input, ['id', 'signature']);
+      decode(input.id, 32);
+      const record = challenges.get(input.id);
+      if (record?.purpose !== 'remember-enable') fail(401, 'Remember challenge unavailable.');
+      const finishProof = await proof(req, true);
+      check();
+      checkedProof(finishProof);
+      if (!sameAccount(finishProof, record.proof)) fail(401, 'Remember challenge unavailable.');
+      if (challenges.get(input.id) !== record || record.mac.rememberProposal !== record || !valid(record))
+        fail(401, 'Remember challenge unavailable.');
+      dropChallenge(record);
+      try { signed(record, input.signature); }
+      catch (error) { dropRememberProposal(record.mac); throw error; }
+      record.finishProof = finishProof;
+      record.confirmed = true;
+      watch(record, record.proof.signal, () => dropRememberProposal(record.mac));
+      watch(record, finishProof.signal, () => dropRememberProposal(record.mac));
+      schedule();
+      return guardResult(rememberPending(record), () => record.mac.rememberProposal === record && valid(record));
+    });
+  }
+  async function rememberStatus(req, input) {
+    return accountOperation(async () => {
+      phoneRequest(req);
+      shape(input, ['macID', 'deviceID']);
+      if (!uuid(input.macID) || !uuid(input.deviceID)) fail(400, 'Invalid device identifier.');
+      const { mac, device, accountProof } = await ownedDevice(req, input, false);
+      check();
+      checkedProof(accountProof);
+      if (!current(mac, device)) fail(401, 'Device authorization unavailable.');
+      const pending = mac.rememberProposal?.device === device ? mac.rememberProposal : null;
+      const value = { macID: mac.macID, deviceID: device.deviceID,
+        committed: device.remembered ? rememberPublic(device.remembered) : null,
+        push: { enabled: Boolean(device.pushToken), registrationGeneration: device.pushGeneration ?? null },
+        pending: pending ? {
+          ...rememberPending(pending), awaitingMac: pending.confirmed
+        } : null };
+      return guardResult(value, () => !accountProof.signal.aborted && current(mac, device) &&
+        (!pending || (mac.rememberProposal === pending && valid(pending))) &&
+        (!device.remembered || rememberPublic(device.remembered).state === value.committed?.state));
+    });
+  }
+  function decideRemember(credential, input) {
+    check();
+    shape(input, ['id', 'allow']);
+    decode(input.id, 32);
+    if (typeof input.allow !== 'boolean') fail(400, 'Invalid remember decision.');
+    const mac = host(credential), record = mac.rememberProposal;
+    if (!record?.confirmed || record.id !== input.id || !valid(record))
+      fail(401, 'Remember decision unavailable.');
+    dropRememberProposal(mac);
+    if (input.allow) {
+      record.device.remembered = { ...rememberFields(mac, record.device, record.generation),
+        issuedAt: record.issuedAt, expiresAt: record.authorizationExpiresAt, state: 'active' };
+      prune();
+    }
+    schedule();
+    return guardResult({ id: record.id, generation: record.generation, approved: input.allow,
+      authorizationExpiresAt: record.authorizationExpiresAt },
+    () => !input.allow || (valid(record) && record.device.remembered?.generation === record.generation &&
+      wall < record.authorizationExpiresAt));
+  }
+  function rememberedTarget(req, input, { allowRevoked = false, allowProposal = false } = {}) {
+    phoneRequest(req);
+    if (!uuid(input.macID) || !uuid(input.deviceID)) fail(400, 'Invalid device identifier.');
+    decode(input.generation, 32);
+    const mac = macs.get(input.macID), device = mac?.devices.get(input.deviceID);
+    const proof = { ...accountCopy(mac?.account), signal: new AbortController().signal };
+    if (allowProposal && mac?.rememberProposal && mac.rememberProposal.device === device &&
+      mac.rememberProposal.generation === input.generation && valid(mac.rememberProposal))
+      return { mac, device, proposal: mac.rememberProposal, scope: 'remembered', proof };
+    const remembered = device?.remembered;
+    if (!remembered || remembered.generation !== input.generation ||
+      (!allowRevoked && remembered.state !== 'active') || wall >= remembered.expiresAt)
+      fail(401, 'Device authorization unavailable.');
+    return { mac, device, remembered, scope: 'remembered',
+      proof };
+  }
+  function rememberCapacity(device) {
+    if (challenges.size >= 128 || [...challenges.values()].filter(r => r.device === device).length >= 8)
+      fail(429, 'Authorization capacity reached.');
+  }
+  function beginRememberedGrant(req, input) {
+    check();
+    shape(input, ['macID', 'deviceID', 'generation']);
+    const fields = rememberedTarget(req, input);
+    rememberCapacity(fields.device);
+    if (grants.size >= 256) fail(429, 'Routing grant capacity reached.');
+    const record = { ...fields, ...flow('remember-grant', {
+      ...rememberFields(fields.mac, fields.device, input.generation), role: 'phone',
+      authorizationExpiresAt: fields.remembered.expiresAt
+    }, fields.device.key, Math.min(GRANT_TTL, fields.remembered.expiresAt - wall)), role: 'phone' };
+    challenges.set(record.id, record);
+    schedule();
+    return publicFlow(record);
+  }
+  function finishRememberedGrant(req, input) {
+    const record = finishRemembered(req, input, 'remember-grant');
+    record.device.phoneAuthority = record.remembered.generation;
+    return issueGrant(record);
+  }
+  function finishRemembered(req, input, purpose) {
+    check();
+    phoneRequest(req);
+    shape(input, ['id', 'signature']);
+    decode(input.id, 32);
+    const record = challenges.get(input.id);
+    if (record?.purpose !== purpose) fail(401, 'Remember challenge unavailable.');
+    dropChallenge(record);
+    signed(record, input.signature);
+    if (!valid(record)) fail(401, 'Remember authorization expired.');
+    return record;
+  }
+  function beginRememberedRevoke(req, input) {
+    check();
+    shape(input, ['macID', 'deviceID', 'generation']);
+    const fields = rememberedTarget(req, input, { allowRevoked: true, allowProposal: true });
+    rememberCapacity(fields.device);
+    const ttl = Math.min(GRANT_TTL, fields.proposal
+      ? fields.proposal.deadline - mono : fields.remembered.expiresAt - wall);
+    const record = { ...fields, ...flow('remember-revoke',
+      { ...rememberFields(fields.mac, fields.device, input.generation),
+        authorizationExpiresAt: fields.proposal?.authorizationExpiresAt ?? fields.remembered.expiresAt
+      }, fields.device.key, ttl) };
+    challenges.set(record.id, record);
+    schedule();
+    return publicFlow(record);
+  }
+  function finishRememberedRevoke(req, input) {
+    const record = finishRemembered(req, input, 'remember-revoke');
+    const generation = record.proposal?.generation ?? record.remembered.generation;
+    const cancelledPending = Boolean(record.proposal && record.mac.rememberProposal === record.proposal);
+    if (cancelledPending) dropRememberProposal(record.mac);
+    // Keep the revoked generation for guarded push removal, never new registration.
+    else record.device.remembered.state = 'revoked';
+    prune();
+    schedule();
+    return { generation, revoked: true, cancelledPending };
+  }
+  function registrationGuard(value) {
+    if (value !== null) decode(value, 32);
+  }
+  function checkRegistration(device, generation) {
+    if ((device.pushGeneration ?? null) !== generation) fail(409, 'Push registration changed.');
+  }
+  function beginRememberedPush(req, input) {
+    check();
+    shape(input, ['macID', 'deviceID', 'generation', 'token', 'registrationGeneration']);
+    if (!(input.token === null || pushToken(input.token))) fail(400, 'Invalid push registration.');
+    registrationGuard(input.registrationGeneration);
+    const fields = rememberedTarget(req, input, { allowRevoked: input.token === null });
+    rememberCapacity(fields.device);
+    checkRegistration(fields.device, input.registrationGeneration);
+    const record = { ...fields, ...flow('remember-push', {
+      ...rememberFields(fields.mac, fields.device, input.generation),
+      token: input.token, registrationGeneration: input.registrationGeneration,
+      authorizationExpiresAt: fields.remembered.expiresAt
+    }, fields.device.key, Math.min(GRANT_TTL, fields.remembered.expiresAt - wall)),
+    token: input.token, registrationGeneration: input.registrationGeneration, guarded: true };
+    challenges.set(record.id, record);
+    schedule();
+    return publicFlow(record);
+  }
+  function finishRememberedPush(req, input) {
+    return applyPush(finishRemembered(req, input, 'remember-push'));
   }
   function invite(credential) {
     check();
@@ -370,14 +649,24 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
         if (!mac) fail(401, 'Mac enrollment unavailable.');
       }
       const device = target(mac, deviceID);
+      const remembered = role === 'mac' && device.remembered?.state === 'active' &&
+        wall < device.remembered.expiresAt &&
+        (device.phoneAuthority === device.remembered.generation || !device.proof || device.proof.signal.aborted)
+        ? device.remembered : undefined;
+      if (remembered) rememberCapacity(device);
+      if (remembered) accountProof = { ...accountCopy(mac.account), signal: new AbortController().signal };
       accountProof ??= device.proof;
       if (!accountProof || accountProof.signal.aborted) fail(401, 'Account authorization required.');
       if (!sameAccount(accountProof, mac.account ?? device.account)) fail(403, 'Account does not own this device.');
       if (challenges.size >= 128 || grants.size >= 256) fail(429, 'Routing grant capacity reached.');
-      if (role === 'phone' && device.approved) device.proof = accountProof;
-      const ttl = Math.min(GRANT_TTL, device.approved ? GRANT_TTL : device.deadline - mono);
-      const record = { ...flow('grant', { role, macID: mac.macID, deviceID },
-        role === 'mac' ? mac.key : device.key, ttl), role, mac, device, proof: accountProof };
+      if (role === 'phone' && device.approved) { device.proof = accountProof; device.phoneAuthority = undefined; }
+      const ttl = Math.min(GRANT_TTL, device.approved ? GRANT_TTL : device.deadline - mono,
+        remembered ? remembered.expiresAt - wall : Infinity);
+      const record = { ...flow(remembered ? 'remember-mac-grant' : 'grant', { role, macID: mac.macID, deviceID,
+        ...(remembered ? { ...rememberFields(mac, device, remembered.generation),
+          authorizationExpiresAt: remembered.expiresAt } : {}) },
+        role === 'mac' ? mac.key : device.key, ttl), role, mac, device, proof: accountProof,
+        ...(remembered ? { scope: 'remembered', remembered } : {}) };
       challenges.set(record.id, record);
       watch(record, accountProof.signal, () => dropChallenge(record));
       schedule();
@@ -389,7 +678,7 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     shape(input, ['id', 'signature']);
     decode(input.id, 32);
     const record = challenges.get(input.id);
-    if (!record || record.purpose === 'push') fail(401, 'Routing challenge unavailable.');
+    if (!['grant', 'remember-mac-grant'].includes(record?.purpose)) fail(401, 'Routing challenge unavailable.');
     let finishProof;
     if (record.role === 'phone') {
       if (req?.headers?.origin !== origin) fail(403, 'Authorization origin rejected.');
@@ -400,27 +689,41 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     dropChallenge(record);
     signed(record, input.signature);
     if (!valid(record)) fail(401, 'Routing authorization expired.');
+    return issueGrant(record, finishProof);
+  }
+  function issueGrant(record, finishProof) {
     if (grants.size >= 256) fail(429, 'Routing grant capacity reached.');
-    const ttl = Math.min(GRANT_TTL, record.device.approved ? GRANT_TTL : record.device.deadline - mono);
+    const ttl = Math.min(GRANT_TTL, record.device.approved ? GRANT_TTL : record.device.deadline - mono,
+      record.remembered ? record.remembered.expiresAt - wall : Infinity);
     const grant = { ...record, finishProof, unwatch: [], credential: secret(), deadline: mono + ttl,
       expiresAt: Math.floor(wall + ttl), controller: new AbortController(), connected: false };
     grant.renewalChallenge = nextRenewal(grant);
     grants.set(grant.credential, grant);
     watchGrant(grant);
     schedule();
-    return { credential: grant.credential, ...publicLease(grant) };
+    return guardResult({ credential: grant.credential, ...publicLease(grant) },
+      () => grants.get(grant.credential) === grant && valid(grant));
   }
   function nextRenewal(grant) {
-    return challenge('renew', { role: grant.role, macID: grant.mac.macID,
-      deviceID: grant.device.deviceID, connectionID: grant.id });
+    return challenge(grant.scope === 'remembered' ? 'remember-renew' : 'renew', { role: grant.role, macID: grant.mac.macID,
+      deviceID: grant.device.deviceID, connectionID: grant.id,
+      ...(grant.scope === 'remembered' ? {
+        ...rememberFields(grant.mac, grant.device, grant.remembered.generation),
+        authorizationExpiresAt: grant.remembered.expiresAt, challengeExpiresAt: grant.expiresAt
+      } : {}) });
   }
   function publicLease(grant) {
     check();
     const validForMs = Math.floor(grant.deadline - mono);
     if (validForMs <= 0 || !valid(grant)) fail(401, 'Routing authorization expired.');
-    return { expiresAt: grant.expiresAt, validForMs, role: grant.role,
+    return guardResult({ expiresAt: grant.expiresAt, validForMs, role: grant.role, scope: grant.scope ?? 'account',
       macID: grant.mac.macID, deviceID: grant.device.deviceID, approved: grant.device.approved,
-      renewal: { id: grant.id, challenge: grant.renewalChallenge } };
+      ...(grant.scope === 'remembered' ? { scope: 'remembered', generation: grant.remembered.generation,
+        authorizationExpiresAt: grant.remembered.expiresAt,
+        ...(grant.role === 'phone' ? { push: { enabled: Boolean(grant.device.pushToken),
+          registrationGeneration: grant.device.pushGeneration ?? null } } : {}) } : {}),
+      renewal: { id: grant.id, challenge: grant.renewalChallenge } },
+    () => grants.get(grant.credential) === grant && valid(grant));
   }
   function watchGrant(grant) {
     watch(grant, grant.proof.signal, () => dropGrant(grant));
@@ -435,7 +738,15 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
       const grant = [...grants.values()].find(value => value.id === input.id);
       if (!grant?.connected || !valid(grant)) fail(401, 'Connected routing authorization required.');
       let accountProof;
-      if (grant.role === 'phone') {
+      if (grant.scope === 'remembered') {
+        if (grant.role === 'phone') {
+          phoneRequest(req);
+          if (credential !== undefined) fail(403, 'Authorization origin rejected.');
+        } else if (req?.headers?.origin !== undefined || host(credential) !== grant.mac) {
+          fail(403, 'Mac authorization rejected.');
+        }
+        accountProof = grant.proof;
+      } else if (grant.role === 'phone') {
         if (req?.headers?.origin !== origin || credential !== undefined)
           fail(403, 'Authorization origin rejected.');
         accountProof = await proof(req, false);
@@ -448,13 +759,20 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
         fail(401, 'Routing authorization expired.');
       if (!sameAccount(accountProof, grant.proof))
         fail(403, 'Account does not own this connection.');
-      signed({ key: grant.key, challenge: grant.renewalChallenge }, input.signature);
+      const renewalChallenge = grant.renewalChallenge;
+      if (grant.scope === 'remembered') grant.renewalChallenge = undefined;
+      try { signed({ key: grant.key, challenge: renewalChallenge }, input.signature); }
+      catch (error) {
+        if (grant.scope === 'remembered') dropGrant(grant);
+        throw error;
+      }
       check();
       if (grants.get(grant.credential) !== grant || !valid(grant))
         fail(401, 'Routing authorization expired.');
-      const ttl = Math.min(GRANT_TTL, grant.device.approved ? GRANT_TTL : grant.device.deadline - mono);
+      const ttl = Math.min(GRANT_TTL, grant.device.approved ? GRANT_TTL : grant.device.deadline - mono,
+        grant.remembered ? grant.remembered.expiresAt - wall : Infinity);
       unwatch(grant);
-      if (grant.role === 'phone') grant.device.proof = accountProof;
+      if (grant.role === 'phone' && grant.scope !== 'remembered') grant.device.proof = accountProof;
       grant.proof = accountProof;
       grant.finishProof = undefined;
       grant.deadline = mono + ttl;
@@ -524,7 +842,9 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
   }
   async function beginPush(req, input) {
     return accountOperation(async () => {
-      shape(input, ['macID', 'deviceID', 'token']);
+      shape(input, ['macID', 'deviceID', 'token'], ['registrationGeneration']);
+      const guarded = Object.hasOwn(input, 'registrationGeneration');
+      if (guarded) registrationGuard(input.registrationGeneration);
       if (!uuid(input.macID) || !(input.token === null || pushToken(input.token)))
         fail(400, 'Invalid push registration.');
       if (req?.headers?.origin !== origin) fail(403, 'Authorization origin rejected.');
@@ -537,10 +857,15 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
       const device = target(mac, input.deviceID);
       if (!device.approved || !sameAccount(mac.account, accountProof))
         fail(403, 'Approved device and owner required.');
+      if (guarded) checkRegistration(device, input.registrationGeneration);
       if (challenges.size >= 128) fail(429, 'Authorization capacity reached.');
       const record = { ...flow('push', { macID: mac.macID, deviceID: device.deviceID,
-        token: input.token }, device.key, GRANT_TTL), purpose: 'push', mac, device,
-        token: input.token, proof: accountProof };
+        token: input.token, ...(guarded ? { version: 1, scope: 'account', account: accountCopy(mac.account),
+          operation: 'push', challengeExpiresAt: wall + GRANT_TTL,
+          macPublicKey: mac.publicKey, publicKey: device.publicKey,
+          registrationGeneration: input.registrationGeneration } : {})
+      }, device.key, GRANT_TTL), mac, device,
+      token: input.token, proof: accountProof, guarded, registrationGeneration: input.registrationGeneration };
       challenges.set(record.id, record);
       watch(record, accountProof.signal, () => dropChallenge(record));
       schedule();
@@ -560,12 +885,20 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
     dropChallenge(record);
     signed(record, input.signature);
     if (!valid(record) || !record.device.approved) fail(401, 'Push authorization expired.');
+    return applyPush(record);
+  }
+  function applyPush(record) {
+    if (record.guarded) checkRegistration(record.device, record.registrationGeneration);
     if (record.token === null) delete record.device.pushToken;
     else record.device.pushToken = record.token;
+    record.device.pushGeneration = secret();
     // Older outstanding token changes must not overwrite this explicit decision.
     for (const other of challenges.values())
-      if (other.purpose === 'push' && other.device === record.device) dropChallenge(other);
-    return { enabled: record.token !== null };
+      if (['push', 'remember-push'].includes(other.purpose) && other.device === record.device) dropChallenge(other);
+    const generation = record.device.pushGeneration;
+    return guardResult({ enabled: record.token !== null,
+      ...(record.guarded ? { registrationGeneration: generation } : {}) },
+    () => valid(record) && record.device.pushGeneration === generation);
   }
   function attentionEvent(input) {
     shape(input, ['eventID', 'issuedAt']);
@@ -605,14 +938,24 @@ export function createRemoteAuthority({ origin, accounts, now = () => performanc
       macID: mac.macID, publicKey: mac.publicKey, credentialHash: mac.credentialHash,
       account: accountCopy(mac.account),
       ...(mac.attention ? { attention: structuredClone(mac.attention) } : {}),
-      devices: [...mac.devices.values()].map(({ deviceID, publicKey, name, pushToken }) =>
-        ({ deviceID, publicKey, name, ...(pushToken ? { pushToken } : {}) }))
+      devices: [...mac.devices.values()].map(({ deviceID, publicKey, name, pushToken, remembered, pushGeneration }) =>
+        ({ deviceID, publicKey, name, ...(pushToken ? { pushToken } : {}),
+          ...(pushGeneration ? { pushGeneration } : {}),
+          ...(remembered ? { remembered: structuredClone(remembered) } : {}) }))
     })) };
   }
   time();
+  for (const mac of macs.values()) for (const device of mac.devices.values()) {
+    if (device.remembered?.issuedAt > wall) {
+      close();
+      throw new Error('Invalid remote trust storage. Inspect it before starting the service.');
+    }
+  }
   return Object.freeze({ beginMac, registerMac, requestPair, macStatus, invite, decidePair,
+    beginRemember, finishRemember, rememberStatus, decideRemember, beginRememberedGrant, finishRememberedGrant,
+    beginRememberedPush, finishRememberedPush, beginRememberedRevoke, finishRememberedRevoke,
     beginGrant, finishGrant, renewGrant, authorizeRelay, revokeDevice, beginPush, finishPush,
-    reserveAttention, dispatchAttention, close, snapshot });
+    reserveAttention, dispatchAttention, close, snapshot, checkResult });
 }
 
 async function storedAuthority({ store, ...options }) {
@@ -626,7 +969,7 @@ async function storedAuthority({ store, ...options }) {
   const close = () => { closed = true; authority.close(); };
   const result = { close };
   for (const [name, operation] of Object.entries(authority)) {
-    if (['close', 'snapshot'].includes(name)) continue;
+    if (['close', 'snapshot', 'checkResult'].includes(name)) continue;
     result[name] = (...args) => {
       if (closed) return Promise.reject(new RemoteAuthorityError(503, 'Remote authorization unavailable.'));
       if (queued >= 128) return Promise.reject(new RemoteAuthorityError(429, 'Remote authorization capacity reached.'));
@@ -652,6 +995,7 @@ async function storedAuthority({ store, ...options }) {
           fail(503, 'Remote trust storage unavailable.');
         }
         if (closed) fail(503, 'Remote authorization unavailable.');
+        authority.checkResult(value);
         return value;
       });
       serial = pending.then(() => undefined, () => undefined);
