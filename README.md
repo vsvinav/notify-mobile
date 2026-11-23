@@ -10,6 +10,25 @@ Approve a command, pick an option, or write your own answer without returning to
 
 **Choose your connection:** the quickstart below is the same-Wi-Fi web app. Optional internet access uses a separate HTTPS service, passkey sign-in and explicit full-public-key approval on the Mac. Start with the [complete internet / Render / Firebase setup guide](https://github.com/vsvinav/notify/blob/feature/remote-native-identity/docs/remote-setup.md), or see the [hosted deployment contract](docs/render-hosting.md). Users joining an existing service do not need their own Firebase project. Native Android internet access is a separate versioned APK supplied by the operator; it is not the LAN web app.
 
+**Client releases:** [Mac beta 8 / build 18](https://github.com/vsvinav/notify/releases/tag/v0.2.0-beta.8)
+and [Android 0.3.6 / build 9](https://github.com/vsvinav/notify-android/releases/tag/v0.3.6-beta.1)
+include the optional native Dashboard and global pending-request indicator.
+The APK is separate from the LAN web app described below.
+
+**Optional remembered phone:** matching
+Mac, Android and service versions support a separate full-key **Remember this
+phone?** approval. This is not pairing consent. Allow lasts until the displayed
+fixed expiry, at most 30 days, without hourly account sign-in; account sessions
+remain unchanged. Anyone able to use the phone's private key can use this access.
+Denying a new request does not revoke an older authorization. Full device **Revoke**
+still removes all of that device's internet access. Unknown decisions are reconciled
+from exact status, not replayed. Old helpers/services do not imply remembered access.
+Install matching clients and deploy the compatible service before enabling it.
+The required hosted contract is in
+[`0eb6834`](https://github.com/vsvinav/notify-mobile/commit/0eb6834ccee2e69894182ba64abcb2a394401b74);
+deployments already on that revision do not need another deploy for native Dashboard.
+The latest-build physical-phone opt-in/restart flow still needs device acceptance.
+
 ## Keep work moving
 
 - **Approve or deny from your phone.** Review the request and send your decision back to the waiting session.
@@ -46,6 +65,11 @@ Approve a command, pick an option, or write your own answer without returning to
 </p>
 
 ## Quickstart
+
+**Optional Dashboard:** Mac beta 8 and Android 0.3.6 display a local provider's
+tabs, stages, recent activity and reviewed actions. Native Mac access stays local;
+Android uses the existing encrypted connection. Both settings default Off.
+This is not a new web-app screen. [Connect your own dashboard](docs/dashboard-provider.md).
 
 You'll need **Notify running on your Mac**, a phone on the **same Wi-Fi**, and a few minutes for first-time setup. This LAN version installs as a web app from your Mac, not an App Store download.
 

@@ -37,8 +37,18 @@ const FIELDS = new Map([
   ['/v1/remote/mac/decision', [['id', 'allow']]],
   ['/v1/remote/mac/revoke', [['deviceID']]],
   ['/v1/remote/mac/attention', [['eventID', 'issuedAt']]],
-  ['/v1/remote/push/begin', [['macID', 'deviceID', 'token']]],
+  ['/v1/remote/push/begin', [['macID', 'deviceID', 'token'], ['registrationGeneration']]],
   ['/v1/remote/push/finish', [['id', 'signature']]],
+  ['/v1/remote/remember/begin', [['macID', 'deviceID', 'optIn']]],
+  ['/v1/remote/remember/finish', [['id', 'signature']]],
+  ['/v1/remote/remember/status', [['macID', 'deviceID']]],
+  ['/v1/remote/mac/remember/decision', [['id', 'allow']]],
+  ['/v1/remote/remember/grant/begin', [['macID', 'deviceID', 'generation']]],
+  ['/v1/remote/remember/grant/finish', [['id', 'signature']]],
+  ['/v1/remote/remember/push/begin', [['macID', 'deviceID', 'generation', 'token', 'registrationGeneration']]],
+  ['/v1/remote/remember/push/finish', [['id', 'signature']]],
+  ['/v1/remote/remember/revoke/begin', [['macID', 'deviceID', 'generation']]],
+  ['/v1/remote/remember/revoke/finish', [['id', 'signature']]],
   ['/v1/remote/grant/begin', [['role', 'deviceID'], ['macID']]],
   ['/v1/remote/grant/finish', [['id', 'signature']]],
   ['/v1/remote/grant/renew', [['id', 'signature']]]
@@ -262,6 +272,10 @@ export async function createHostedService({ origin, managedIngress, store, trust
         return;
       }
       if (req.url.startsWith('/v1/remote/mac/')) native(req);
+      else if (req.url.startsWith('/v1/remote/remember/')) {
+        browser(req, origin);
+        if (Object.keys(req.headers).some(name => name.startsWith('sec-fetch-'))) fail(403);
+      }
       else if (req.url === '/v1/remote/pair') browser(req, origin);
       bodyHeaders(req);
       const data = await json(req, res);
@@ -278,6 +292,17 @@ export async function createHostedService({ origin, managedIngress, store, trust
         case '/v1/remote/mac/invite': result = await authority.invite(bearer(req)); break;
         case '/v1/remote/mac/decision': result = await authority.decidePair(bearer(req), data); break;
         case '/v1/remote/mac/revoke': result = await authority.revokeDevice(bearer(req), data); break;
+        case '/v1/remote/remember/begin': result = await authority.beginRemember(req, data); break;
+        case '/v1/remote/remember/finish': result = await authority.finishRemember(req, data); break;
+        case '/v1/remote/remember/status': result = await authority.rememberStatus(req, data); break;
+        case '/v1/remote/mac/remember/decision': result = await authority.decideRemember(bearer(req), data); break;
+        case '/v1/remote/remember/grant/begin': result = await authority.beginRememberedGrant(req, data); break;
+        case '/v1/remote/remember/push/begin':
+          if (!fcm && data.token !== null) fail(503);
+          result = await authority.beginRememberedPush(req, data); break;
+        case '/v1/remote/remember/push/finish': result = await authority.finishRememberedPush(req, data); break;
+        case '/v1/remote/remember/revoke/begin': result = await authority.beginRememberedRevoke(req, data); break;
+        case '/v1/remote/remember/revoke/finish': result = await authority.finishRememberedRevoke(req, data); break;
         case '/v1/remote/push/begin':
           browser(req, origin);
           if (!fcm && data.token !== null) fail(503);
@@ -305,8 +330,10 @@ export async function createHostedService({ origin, managedIngress, store, trust
           }
           break;
         case '/v1/remote/grant/finish':
+        case '/v1/remote/remember/grant/finish':
           if (req.headers.origin === undefined) native(req); else browser(req, origin);
-          result = await authority.finishGrant(data, req);
+          result = req.url === '/v1/remote/remember/grant/finish'
+            ? await authority.finishRememberedGrant(req, data) : await authority.finishGrant(data, req);
           if (result.role === 'phone') {
             browser(req, origin);
             const age = Math.min(30, Math.floor((result.expiresAt - Date.now()) / 1000));

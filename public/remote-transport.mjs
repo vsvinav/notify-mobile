@@ -304,7 +304,7 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
   function api(path, data = {}, timeout, signal) {
     return new Promise((resolve, reject) => {
       if (stage !== 'ready') { reject(new Error('An approved, connected Mac is required.')); return; }
-      if (!['state', 'workspace', 'reply', 'control'].includes(path) || !object(data)) { reject(new Error('Unsupported Mac request.')); return; }
+      if (!['state', 'workspace', 'reply', 'control', 'panel', 'panel_action'].includes(path) || !object(data)) { reject(new Error('Unsupported Mac request.')); return; }
       if (pending.size >= 8) { reject(new Error('Connection is busy. Wait for the current requests.')); return; }
       if (signal?.aborted) { reject(Object.assign(new Error('Request cancelled.'), { aborted: true })); return; }
       const id = crypto.randomUUID();
@@ -313,7 +313,7 @@ export function createRemoteTransport({ origin = location.origin, macID, deviceI
       const abort = () => pending.get(id)?.reject(Object.assign(uncertainty(), { aborted: true }));
       pending.set(id, { resolve: finish(resolve), reject: finish(reject) });
       signal?.addEventListener('abort', abort, { once: true });
-      const mutation = path === 'reply' || path === 'control';
+      const mutation = ['reply', 'control', 'panel_action'].includes(path);
       const wait = timeout === undefined ? (mutation ? 25000 : 12000) : timeout;
       timer = setTimeout(abort, Number.isFinite(wait) ? Math.min(mutation ? 30000 : 15000, Math.max(1, wait)) : (mutation ? 25000 : 12000));
       try { encrypted({ id, epoch, payload: { path, data } }); }

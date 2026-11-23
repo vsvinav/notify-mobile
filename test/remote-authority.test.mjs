@@ -20,12 +20,14 @@ function identity() {
 const status = code => error => error.status === code;
 function fixture(t) {
   let mono = 1000, wall = 1800000000000;
-  const proofs = new WeakMap(), calls = [];
+  const proofs = new WeakMap(), authenticatedAt = new WeakMap(), calls = [];
   const accounts = {
     authorize(req, options) {
       calls.push(options);
       const proof = proofs.get(req);
       if (!proof || proof.signal.aborted) throw Object.assign(new Error('Account required.'), { status: 401 });
+      if (options.requireFresh && mono - authenticatedAt.get(req) > 300000)
+        throw Object.assign(new Error('Fresh account required.'), { status: 403 });
       return proof;
     }
   };
@@ -35,6 +37,7 @@ function fixture(t) {
     const controller = new AbortController();
     const req = { headers: { origin } };
     proofs.set(req, Object.freeze({ issuer: origin, subject, signal: controller.signal }));
+    authenticatedAt.set(req, mono);
     return { req, controller };
   };
   const mac = () => {
@@ -117,6 +120,445 @@ test('fractional monotonic deadlines produce whole-millisecond pairing and relay
 
 const renewalInput = (grant, key) => ({
   id: grant.renewal.id, signature: key.sign(grant.renewal.challenge)
+});
+
+const rememberInput = (host, phone) => ({ macID: host.macID, deviceID: phone.deviceID, optIn: true });
+const finishInput = (flow, phone) => ({ id: flow.id, signature: phone.key.sign(flow.challenge) });
+async function rememberedPhone(f, host, phone) {
+  const flow = await f.authority.beginRemember(phone.session.req, rememberInput(host, phone));
+  const pending = await f.authority.finishRemember(phone.session.req, finishInput(flow, phone));
+  await f.authority.decideRemember(host.credential, { id: pending.id, allow: true });
+  return { macID: host.macID, deviceID: phone.deviceID, generation: pending.generation };
+}
+
+test('remembering is opt-in, requires new Mac consent, and outlives only the account cookie', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  assert.equal(typeof f.authority.beginRemember, 'function', 'Pair approval must not silently remember a phone');
+  const target = { macID: host.macID, deviceID: phone.deviceID };
+  assert.equal((await f.authority.rememberStatus(phone.session.req, target)).committed, null);
+  const proposal = await f.authority.beginRemember(phone.session.req, rememberInput(host, phone));
+  const payload = JSON.parse(proposal.challenge);
+  assert.deepEqual(payload.account, phone.account);
+  assert.equal(payload.macPublicKey, host.key.publicKey);
+  assert.equal(payload.publicKey, phone.key.publicKey);
+  assert.equal(payload.authorizationExpiresAt, 1800000000000 + 30 * 86400000);
+  assert.equal(payload.version, 1);
+  assert.equal(payload.purpose, 'remember-enable');
+  assert.equal(f.calls.at(-1).requireFresh, true);
+  const pending = await f.authority.finishRemember(phone.session.req, finishInput(proposal, phone));
+  assert.equal(f.calls.at(-1).requireFresh, true);
+  const input = { ...target, generation: pending.generation };
+  await assert.rejects(async () => f.authority.beginRememberedGrant({ headers: { origin } }, input), status(401));
+  assert.equal(f.authority.macStatus(host.credential).rememberPending.publicKey, phone.key.publicKey);
+  assert.equal(f.authority.macStatus(host.credential).rememberPending.authorizationExpiresAt, payload.authorizationExpiresAt);
+  const approved = f.authority.decideRemember(host.credential, { id: pending.id, allow: true });
+  assert.equal(approved.generation, pending.generation);
+  assert.equal(approved.authorizationExpiresAt, payload.authorizationExpiresAt);
+  phone.session.controller.abort();
+  const req = { headers: { origin } };
+  const flow = f.authority.beginRememberedGrant(req, input);
+  const grant = f.authority.finishRememberedGrant(req, finishInput(flow, phone));
+  assert.equal(grant.scope, 'remembered');
+  assert.equal(grant.generation, pending.generation);
+  assert.equal(grant.validForMs, 30000);
+  assert.equal(f.relay(grant).signal.aborted, false);
+  const macFlow = await f.authority.beginGrant({}, { role: 'mac', deviceID: phone.deviceID, credential: host.credential });
+  assert.equal(JSON.parse(macFlow.challenge).generation, pending.generation);
+  const macGrant = f.authority.finishGrant({ id: macFlow.id, signature: host.key.sign(macFlow.challenge) });
+  assert.equal(macGrant.scope, 'remembered');
+  assert.equal(macGrant.generation, pending.generation);
+  assert.equal(f.relay(macGrant).signal.aborted, false);
+});
+
+test('remembered phone and dependent Mac renewals pin the absolute authority deadline without account access', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const input = await rememberedPhone(f, host, phone), req = { headers: { origin } };
+  phone.session.controller.abort();
+  f.advance(30 * 86400000 - 45000);
+  const flow = f.authority.beginRememberedGrant(req, input);
+  let phoneGrant = f.authority.finishRememberedGrant(req, finishInput(flow, phone));
+  const phoneLive = f.relay(phoneGrant);
+  let macGrant = await f.grant(host, phone, 'mac'), macLive = f.relay(macGrant);
+  const calls = f.calls.length;
+  f.advance(20000);
+  phoneGrant = await f.authority.renewGrant(req, renewalInput(phoneGrant, phone.key));
+  macGrant = await f.authority.renewGrant({ headers: {} }, renewalInput(macGrant, host.key), host.credential);
+  assert.equal(f.calls.length, calls, 'Remembered renewals must not consult accounts');
+  assert.equal(phoneGrant.validForMs, 25000);
+  assert.equal(macGrant.validForMs, 25000);
+  assert.equal(phoneGrant.expiresAt, 1800000000000 + 30 * 86400000);
+  assert.equal(phoneGrant.generation, input.generation);
+  const payload = JSON.parse(macGrant.renewal.challenge);
+  assert.equal(payload.purpose, 'remember-renew');
+  assert.deepEqual(payload.account, phone.account);
+  assert.equal(payload.macPublicKey, host.key.publicKey);
+  assert.equal(payload.publicKey, phone.key.publicKey);
+  assert.equal(payload.generation, input.generation);
+  f.advance(25000);
+  t.mock.timers.tick(30000);
+  assert.equal(phoneLive.signal.aborted, true);
+  assert.equal(macLive.signal.aborted, true);
+  assert.throws(() => f.authority.beginRememberedGrant(req, input), status(401));
+});
+
+test('remembered records restore exact identity and expiry; missing and malformed records never migrate', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const legacy = f.authority.snapshot();
+  const input = await rememberedPhone(f, host, phone), snapshot = f.authority.snapshot();
+  assert.equal(snapshot.macs[0].devices[0].remembered.generation, input.generation);
+  const restore = initialState => createRemoteAuthority({ origin, initialState,
+    now: () => 500, wallNow: () => 1800000001000, accounts: { authorize() { throw new Error('No account'); } } });
+  const restored = restore(snapshot);
+  t.after(() => restored.close());
+  const req = { headers: { origin } };
+  const flow = restored.beginRememberedGrant(req, input);
+  const grant = restored.finishRememberedGrant(req, finishInput(flow, phone));
+  assert.equal(grant.generation, input.generation);
+  assert.equal(grant.authorizationExpiresAt, 1800000000000 + 30 * 86400000);
+  const old = restore(legacy);
+  t.after(() => old.close());
+  assert.throws(() => old.beginRememberedGrant(req, input), status(401));
+  for (const corrupt of [
+    r => { r.generation = 'invalid'; }, r => { r.expiresAt += 1; }, r => { r.issuedAt = -1; },
+    r => { r.account.subject = 'other'; }, r => { r.macID = randomUUID(); },
+    r => { r.deviceID = randomUUID(); }, r => { r.publicKey = identity().publicKey; },
+    r => { r.macPublicKey = identity().publicKey; }, r => { r.state = 'maybe'; },
+    r => { r.issuedAt += 60000; r.expiresAt += 60000; },
+    r => { r.untrusted = true; }
+  ]) {
+    const bad = structuredClone(snapshot);
+    corrupt(bad.macs[0].devices[0].remembered);
+    assert.throws(() => restore(bad), /Invalid remote trust/);
+  }
+});
+
+test('exact-generation self-revoke cancels pending consent and aborts only remembered leases', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host), req = { headers: { origin } };
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const target = { macID: host.macID, deviceID: phone.deviceID };
+  const proposal = await f.authority.beginRemember(phone.session.req, rememberInput(host, phone));
+  const cancel = f.authority.beginRememberedRevoke(req, { ...target, generation: proposal.generation });
+  f.authority.finishRememberedRevoke(req, finishInput(cancel, phone));
+  await assert.rejects(f.authority.finishRemember(phone.session.req, finishInput(proposal, phone)), status(401));
+  assert.equal((await f.authority.rememberStatus(phone.session.req, target)).pending, null);
+  const input = await rememberedPhone(f, host, phone);
+  const flow = f.authority.beginRememberedGrant(req, input);
+  const remembered = f.relay(f.authority.finishRememberedGrant(req, finishInput(flow, phone)));
+  const macLive = f.relay(await f.grant(host, phone, 'mac'));
+  const accountLive = f.relay(await f.grant(host, phone));
+  const revoke = f.authority.beginRememberedRevoke(req, input);
+  assert.equal(f.authority.finishRememberedRevoke(req, finishInput(revoke, phone)).revoked, true);
+  assert.equal(remembered.signal.aborted, true);
+  assert.equal(macLive.signal.aborted, true);
+  assert.equal(accountLive.signal.aborted, false);
+  assert.throws(() => f.authority.beginRememberedGrant(req, input), status(401));
+  const delayed = f.authority.beginRememberedRevoke(req, input);
+  const next = await rememberedPhone(f, host, phone);
+  assert.notEqual(next.generation, input.generation);
+  assert.throws(() => f.authority.finishRememberedRevoke(req, finishInput(delayed, phone)), status(401));
+  assert.equal((await f.authority.rememberStatus(phone.session.req, target)).committed.generation, next.generation);
+  f.authority.revokeDevice(host.credential, { deviceID: phone.deviceID });
+  assert.equal(accountLive.signal.aborted, true);
+  assert.throws(() => f.authority.beginRememberedGrant(req, next), status(401));
+});
+
+test('captured pending cancellation also revokes its exact generation if Mac approval wins the race', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host), req = { headers: { origin } };
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const proposal = await f.authority.beginRemember(phone.session.req, rememberInput(host, phone));
+  await f.authority.finishRemember(phone.session.req, finishInput(proposal, phone));
+  const target = { macID: host.macID, deviceID: phone.deviceID, generation: proposal.generation };
+  const cancel = f.authority.beginRememberedRevoke(req, target);
+  f.authority.decideRemember(host.credential, { id: proposal.id, allow: true });
+  const result = f.authority.finishRememberedRevoke(req, finishInput(cancel, phone));
+  assert.equal(result.generation, proposal.generation);
+  assert.equal(result.revoked, true);
+  assert.equal(result.cancelledPending, false);
+  assert.throws(() => f.authority.beginRememberedGrant(req, target), status(401));
+});
+
+test('authenticated remembered phone grant exposes only push guard metadata to reconcile a lost push success', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host), req = { headers: { origin } };
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const target = await rememberedPhone(f, host, phone);
+  const push = f.authority.beginRememberedPush(req, { ...target, token: 'synthetic-token-lost-response', registrationGeneration: null });
+  const result = f.authority.finishRememberedPush(req, finishInput(push, phone));
+  phone.session.controller.abort();
+  const flow = f.authority.beginRememberedGrant(req, target);
+  const grant = f.authority.finishRememberedGrant(req, finishInput(flow, phone));
+  assert.deepEqual(grant.push, { enabled: true, registrationGeneration: result.registrationGeneration });
+  assert.ok(!JSON.stringify(grant).includes('synthetic-token-lost-response'));
+});
+
+test('remembered push cleanup uses persisted registration CAS across revoke, same-token account login, and re-enable', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host), req = { headers: { origin } };
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const target = { macID: host.macID, deviceID: phone.deviceID };
+  const input = await rememberedPhone(f, host, phone), token = 'same-synthetic-token';
+  let state = await f.authority.rememberStatus(phone.session.req, target);
+  assert.deepEqual(state.push, { enabled: false, registrationGeneration: null });
+  const change = f.authority.beginRememberedPush(req, { ...input, token, registrationGeneration: null });
+  const signedArgs = JSON.parse(change.challenge);
+  assert.equal(signedArgs.token, token);
+  assert.equal(signedArgs.registrationGeneration, null);
+  const first = f.authority.finishRememberedPush(req, finishInput(change, phone));
+  assert.ok(first.registrationGeneration);
+  const cleanup = f.authority.beginRememberedPush(req, {
+    ...input, token: null, registrationGeneration: first.registrationGeneration
+  });
+  const account = await f.authority.beginPush(phone.session.req, { ...target, token,
+    registrationGeneration: first.registrationGeneration });
+  const accountPayload = JSON.parse(account.challenge);
+  assert.equal(accountPayload.operation, 'push');
+  assert.equal(accountPayload.challengeExpiresAt, account.expiresAt);
+  assert.equal(accountPayload.scope, 'account');
+  assert.deepEqual(accountPayload.account, phone.account);
+  const second = f.authority.finishPush(phone.session.req, finishInput(account, phone));
+  assert.notEqual(second.registrationGeneration, first.registrationGeneration);
+  assert.throws(() => f.authority.finishRememberedPush(req, finishInput(cleanup, phone)), status(401));
+  assert.throws(() => f.authority.beginRememberedPush(req, { ...input, token: null,
+    registrationGeneration: first.registrationGeneration }), status(409));
+  const old = f.authority.beginRememberedRevoke(req, input);
+  f.authority.finishRememberedRevoke(req, finishInput(old, phone));
+  const offCleanup = f.authority.beginRememberedPush(req, { ...input, token: null,
+    registrationGeneration: second.registrationGeneration });
+  const cleared = f.authority.finishRememberedPush(req, finishInput(offCleanup, phone));
+  assert.equal(cleared.enabled, false, 'Revoked generation permits only captured guarded push removal');
+  assert.throws(() => f.authority.beginRememberedPush(req, { ...input, token,
+    registrationGeneration: cleared.registrationGeneration }), status(401));
+  const newer = await rememberedPhone(f, host, phone);
+  assert.throws(() => f.authority.beginRememberedPush(req, { ...input, token: null,
+    registrationGeneration: cleared.registrationGeneration }), status(401));
+  const fresh = f.authority.beginRememberedPush(req, { ...newer, token,
+    registrationGeneration: cleared.registrationGeneration });
+  f.authority.finishRememberedPush(req, finishInput(fresh, phone));
+  const legacy = await f.authority.beginPush(phone.session.req, { ...target, token });
+  f.authority.finishPush(phone.session.req, finishInput(legacy, phone));
+  state = await f.authority.rememberStatus(phone.session.req, target);
+  assert.equal(state.push.enabled, true);
+  assert.notEqual(state.push.registrationGeneration, cleared.registrationGeneration);
+  assert.ok(!JSON.stringify(state).includes(token));
+  assert.equal(f.authority.snapshot().macs[0].devices[0].pushGeneration, state.push.registrationGeneration);
+});
+
+test('remember proofs explicitly bind scope, operation, both keys, expiry and every mutable argument', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const proposal = await f.authority.beginRemember(phone.session.req, rememberInput(host, phone));
+  const p = JSON.parse(proposal.challenge);
+  assert.equal(p.scope, 'remembered');
+  assert.equal(p.operation, 'enable');
+  assert.equal(p.challengeExpiresAt, proposal.expiresAt);
+  await f.authority.finishRemember(phone.session.req, finishInput(proposal, phone));
+  f.authority.decideRemember(host.credential, { id: proposal.id, allow: true });
+  const target = { macID: host.macID, deviceID: phone.deviceID, generation: proposal.generation };
+  const req = { headers: { origin } }, flow = f.authority.beginRememberedGrant(req, target);
+  const payload = JSON.parse(flow.challenge);
+  assert.equal(payload.authorizationExpiresAt, p.authorizationExpiresAt);
+  assert.equal(payload.operation, 'grant');
+  for (const field of ['account', 'macID', 'macPublicKey', 'deviceID', 'publicKey', 'generation', 'scope'])
+    assert.deepEqual(payload[field], p[field]);
+  const grant = f.authority.finishRememberedGrant(req, finishInput(flow, phone));
+  assert.equal(JSON.parse(grant.renewal.challenge).operation, 'renew');
+  const macFlow = await f.authority.beginGrant({}, { role: 'mac', deviceID: phone.deviceID, credential: host.credential });
+  assert.equal(JSON.parse(macFlow.challenge).purpose, 'remember-mac-grant');
+  assert.equal((await f.grant(host, phone)).scope, 'account');
+});
+
+test('durable remembered grants cannot acknowledge a lease that expired during the fence check', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const input = await rememberedPhone(f, host, phone);
+  let wall = 1800000000000, mono = 1000, delay = false;
+  const store = { read: async () => f.authority.snapshot(), write: async () => {},
+    check: async () => { if (delay) { wall += 30001; mono += 30001; } } };
+  const authority = await createRemoteAuthority({ origin, accounts: { authorize() { throw Error(); } },
+    store, now: () => mono, wallNow: () => wall });
+  t.after(() => authority.close());
+  const req = { headers: { origin } }, flow = await authority.beginRememberedGrant(req, input);
+  delay = true;
+  await assert.rejects(authority.finishRememberedGrant(req, finishInput(flow, phone)), status(401));
+});
+
+test('remember status and guarded push finish recheck their account or device authority after async persistence', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const input = await rememberedPhone(f, host, phone);
+  let wall = 1800000000000, mono = 1000, delay = false, expireAccount = true;
+  const controller = new AbortController();
+  const store = { read: async () => f.authority.snapshot(),
+    write: async () => { if (delay) { wall += 30001; mono += 30001; } },
+    check: async () => { if (expireAccount) controller.abort(); } };
+  const authority = await createRemoteAuthority({ origin,
+    accounts: { authorize: () => ({ ...phone.account, signal: controller.signal }) },
+    store, now: () => mono, wallNow: () => wall });
+  t.after(() => authority.close());
+  await assert.rejects(authority.rememberStatus(phone.session.req,
+    { macID: host.macID, deviceID: phone.deviceID }), status(401));
+  expireAccount = false;
+  const req = { headers: { origin } };
+  const flow = await authority.beginRememberedPush(req, { ...input, token: 'synthetic-token-post-check', registrationGeneration: null });
+  delay = true;
+  await assert.rejects(authority.finishRememberedPush(req, finishInput(flow, phone)), status(401));
+});
+
+test('remember begin cannot publish a proposal when its proof aborts across an async continuation', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const controller = new AbortController();
+  const authority = createRemoteAuthority({ origin, initialState: f.authority.snapshot(),
+    now: () => 1000, wallNow: () => 1800000000000,
+    accounts: { authorize() {
+      queueMicrotask(() => queueMicrotask(() => controller.abort()));
+      return { ...phone.account, signal: controller.signal };
+    } } });
+  t.after(() => authority.close());
+  await assert.rejects(authority.beginRemember(phone.session.req, rememberInput(host, phone)), status(401));
+  assert.equal(authority.macStatus(host.credential).rememberPending, null);
+});
+
+test('remember enable requires explicit native opt-in and fresh proofs at both endpoints', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  for (const input of [
+    { macID: host.macID, deviceID: phone.deviceID },
+    { ...rememberInput(host, phone), optIn: false },
+    { ...rememberInput(host, phone), publicKey: phone.key.publicKey },
+    { ...rememberInput(host, phone), account: phone.account }
+  ]) await assert.rejects(f.authority.beginRemember(phone.session.req, input), status(400));
+  const browser = f.account();
+  browser.req.headers['sec-fetch-site'] = 'same-origin';
+  await assert.rejects(f.authority.beginRemember(browser.req, rememberInput(host, phone)), status(403));
+  await assert.rejects(f.authority.beginRemember(f.account('other').req, rememberInput(host, phone)), status(401));
+  f.advance(299000);
+  const flow = await f.authority.beginRemember(phone.session.req, rememberInput(host, phone));
+  f.advance(1001);
+  await assert.rejects(f.authority.finishRemember(phone.session.req, finishInput(flow, phone)), status(403));
+  f.advance(180000);
+  await assert.rejects(f.authority.beginRemember(phone.session.req, rememberInput(host, phone)), status(403));
+  phone.session = f.account();
+  const fresh = await f.authority.beginRemember(phone.session.req, rememberInput(host, phone));
+  const finishing = f.account();
+  await f.authority.finishRemember(finishing.req, finishInput(fresh, phone));
+  finishing.controller.abort();
+  assert.equal(f.authority.macStatus(host.credential).rememberPending, null);
+  assert.throws(() => f.authority.decideRemember(host.credential, { id: fresh.id, allow: true }), status(401));
+});
+
+test('consent denial, expiry and exact pending cancellation cannot reset lifetime or cancel newer consent', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host), req = { headers: { origin } };
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const old = await f.authority.beginRemember(phone.session.req, rememberInput(host, phone));
+  const oldInput = { macID: host.macID, deviceID: phone.deviceID, generation: old.generation };
+  const cancel = f.authority.beginRememberedRevoke(req, oldInput);
+  await f.authority.finishRemember(phone.session.req, finishInput(old, phone));
+  f.authority.decideRemember(host.credential, { id: old.id, allow: false });
+  const next = await f.authority.beginRemember(phone.session.req, rememberInput(host, phone));
+  assert.throws(() => f.authority.finishRememberedRevoke(req, finishInput(cancel, phone)), status(401));
+  await f.authority.finishRemember(phone.session.req, finishInput(next, phone));
+  f.advance(180000);
+  assert.equal(f.authority.macStatus(host.credential).rememberPending, null);
+  assert.throws(() => f.authority.decideRemember(host.credential, { id: next.id, allow: true }), status(401));
+  assert.throws(() => f.authority.beginRememberedGrant(req, oldInput), status(401));
+  const last = await f.authority.beginRemember(phone.session.req, rememberInput(host, phone));
+  f.advance(10000);
+  await f.authority.finishRemember(phone.session.req, finishInput(last, phone));
+  f.advance(10000);
+  const committed = f.authority.decideRemember(host.credential, { id: last.id, allow: true });
+  assert.equal(committed.authorizationExpiresAt, last.authorizationExpiresAt, 'Approval never starts a new 30-day clock');
+});
+
+test('remembered proofs reject cross-purpose finishers, replay, key and argument substitution', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host), req = { headers: { origin } };
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const target = await rememberedPhone(f, host, phone);
+  for (const operation of ['Grant', 'Push', 'Revoke']) {
+    const input = operation === 'Push' ? { ...target, token: 'synthetic-push-token', registrationGeneration: null } : target;
+    const flow = f.authority[`beginRemembered${operation}`](req, input);
+    const signed = finishInput(flow, phone);
+    assert.throws(() => f.authority.finishGrant(signed, phone.session.req), status(401));
+    assert.throws(() => f.authority.finishPush(phone.session.req, signed), status(401));
+    await assert.rejects(f.authority.finishRemember(phone.session.req, signed), status(401));
+    for (const other of ['Grant', 'Push', 'Revoke'].filter(other => other !== operation))
+      assert.throws(() => f.authority[`finishRemembered${other}`](req, signed), status(401));
+    const payload = JSON.parse(flow.challenge);
+    payload.macPublicKey = identity().publicKey;
+    assert.throws(() => f.authority[`finishRemembered${operation}`](req,
+      { id: flow.id, signature: phone.key.sign(JSON.stringify(payload)) }), status(401));
+    assert.throws(() => f.authority[`finishRemembered${operation}`](req, signed), status(401), 'Invalid signature consumes challenge');
+  }
+  const flow = f.authority.beginRememberedGrant(req, target);
+  f.authority.finishRememberedGrant(req, finishInput(flow, phone));
+  assert.throws(() => f.authority.finishRememberedGrant(req, finishInput(flow, phone)), status(401));
+  for (const bad of [{ ...target, macID: f.mac().macID }, { ...target, deviceID: randomUUID() },
+    { ...target, macID: randomUUID() }, { ...target, generation: Buffer.alloc(32).toString('base64url') }]) {
+    assert.throws(() => f.authority.beginRememberedGrant(req, bad), status(401));
+    assert.throws(() => f.authority.beginRememberedRevoke(req, bad), status(401));
+  }
+  const wrongKey = f.authority.beginRememberedGrant(req, target);
+  assert.throws(() => f.authority.finishRememberedGrant(req,
+    { id: wrongKey.id, signature: host.key.sign(wrongKey.challenge) }), status(401));
+});
+
+test('remembered challenge issuance has per-device and global bounds and no durable authentication side effects', async t => {
+  const f = fixture(t), targets = [], req = { headers: { origin } };
+  for (let i = 0; i < 3; i++) {
+    const host = f.mac();
+    for (let n = 0; n < (i === 2 ? 1 : 8); n++) {
+      const phone = await f.pair(host);
+      f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+      targets.push(await rememberedPhone(f, host, phone));
+    }
+  }
+  const saved = f.authority.snapshot(), calls = f.calls.length;
+  for (const input of targets.slice(0, 16)) {
+    for (let n = 0; n < 8; n++) f.authority.beginRememberedGrant(req, input);
+    assert.throws(() => f.authority.beginRememberedGrant(req, input), status(429));
+  }
+  assert.throws(() => f.authority.beginRememberedGrant(req, targets[16]), status(429));
+  assert.equal(f.calls.length, calls);
+  assert.deepEqual(f.authority.snapshot(), saved);
+  f.advance(30000);
+  assert.ok(f.authority.beginRememberedGrant(req, targets[16]).id);
+});
+
+test('dependent remembered Mac challenges share the same per-device abuse bound', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host);
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  await rememberedPhone(f, host, phone);
+  phone.session.controller.abort();
+  const input = { role: 'mac', deviceID: phone.deviceID, credential: host.credential };
+  for (let i = 0; i < 8; i++) await f.authority.beginGrant({}, input);
+  await assert.rejects(f.authority.beginGrant({}, input), status(429));
+  phone.session = f.account();
+  await assert.rejects(f.authority.beginRemember(phone.session.req, rememberInput(host, phone)), status(429));
+});
+
+test('remembered renewals consume invalid proofs and never upgrade to a replacement generation', async t => {
+  const f = fixture(t), host = f.mac(), phone = await f.pair(host), req = { headers: { origin } };
+  f.authority.decidePair(host.credential, { id: phone.id, allow: true });
+  const target = await rememberedPhone(f, host, phone);
+  const connect = () => {
+    const flow = f.authority.beginRememberedGrant(req, target);
+    const grant = f.authority.finishRememberedGrant(req, finishInput(flow, phone));
+    return { grant, live: f.relay(grant) };
+  };
+  const first = connect();
+  await assert.rejects(f.authority.renewGrant(req, renewalInput(first.grant, host.key)), status(401));
+  assert.equal(first.live.signal.aborted, true);
+  await assert.rejects(f.authority.renewGrant(req, renewalInput(first.grant, phone.key)), status(401));
+  const second = connect(), proof = renewalInput(second.grant, phone.key);
+  const results = await Promise.allSettled([f.authority.renewGrant(req, proof), f.authority.renewGrant(req, proof)]);
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  const third = connect();
+  const next = await rememberedPhone(f, host, phone);
+  assert.equal(third.live.signal.aborted, true);
+  await assert.rejects(f.authority.renewGrant(req, renewalInput(third.grant, phone.key)), status(401));
+  assert.notEqual(target.generation, next.generation);
 });
 
 test('push registration requires live owner and approved device signature over exact token', async t => {
@@ -244,8 +686,10 @@ async function durableFixture(t) {
   const req = { headers: { origin } }, otherReq = { headers: { origin } };
   const accounts = { authorize: request => ({ issuer: origin,
     subject: request === req ? 'owner' : 'other', signal: controller.signal }) };
+  let latestStores;
   const start = async () => {
     const stores = await createFirestoreStores({ firestore: db.firestore, origin });
+    latestStores = stores;
     const authority = await createRemoteAuthority({ origin, accounts, store: stores.trust });
     t.after(() => authority.close());
     return authority;
@@ -256,8 +700,79 @@ async function durableFixture(t) {
   const host = await authority.registerMac({ id: flow.id, signature: mac.sign(flow.challenge) });
   const pending = await authority.requestPair(req, { setupID: host.setupID, deviceID,
     publicKey: phone.publicKey, name: 'Phone' });
-  return { db, authority, start, req, otherReq, controller, mac, phone, macID, deviceID, host, pending };
+  return { db, authority, start, req, otherReq, controller, mac, phone, macID, deviceID, host, pending,
+    accounts, get stores() { return latestStores; } };
 }
+
+test('remember decision commits before acknowledgement and uncertain commit reloads exact generation without extension', async t => {
+  const f = await durableFixture(t);
+  await f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true });
+  const proposal = await f.authority.beginRemember(f.req, { macID: f.macID, deviceID: f.deviceID, optIn: true });
+  await f.authority.finishRemember(f.req, { id: proposal.id, signature: f.phone.sign(proposal.challenge) });
+  let release, entered, acknowledged = false;
+  const blocked = new Promise(resolve => { entered = resolve; });
+  f.db.beforeCommit(async () => { entered(); await new Promise(resolve => { release = resolve; }); });
+  const commit = f.authority.decideRemember(f.host.credential, { id: proposal.id, allow: true })
+    .then(value => { acknowledged = true; return value; });
+  await blocked;
+  assert.equal(acknowledged, false);
+  release();
+  const first = await commit;
+  f.db.beforeCommit(undefined);
+  const replacement = await f.authority.beginRemember(f.req, { macID: f.macID, deviceID: f.deviceID, optIn: true });
+  await f.authority.finishRemember(f.req, { id: replacement.id, signature: f.phone.sign(replacement.challenge) });
+  const fence = f.db.documents.get('notifyState/fence').generation;
+  f.db.afterCommit(writes => {
+    if (writes.some(([path]) => path === 'notifyState/trust'))
+      throw Object.assign(new Error('Synthetic lost commit response'), { code: 14 });
+  });
+  await assert.rejects(f.authority.decideRemember(f.host.credential, { id: replacement.id, allow: true }), status(503));
+  f.db.afterCommit(undefined);
+  const stores = await f.stores.recover();
+  const restored = await createRemoteAuthority({ origin, accounts: f.accounts, store: stores.trust });
+  t.after(() => restored.close());
+  assert.equal(f.db.documents.get('notifyState/fence').generation, fence);
+  const state = await restored.rememberStatus(f.req, { macID: f.macID, deviceID: f.deviceID });
+  assert.equal(state.pending, null);
+  assert.equal(state.committed.generation, replacement.generation);
+  assert.equal(state.committed.authorizationExpiresAt, replacement.authorizationExpiresAt);
+  assert.notEqual(state.committed.generation, first.generation);
+  const req = { headers: { origin } }, input = { macID: f.macID, deviceID: f.deviceID, generation: replacement.generation };
+  const writes = f.db.metrics.writes;
+  const flow = await restored.beginRememberedGrant(req, input);
+  const grant = await restored.finishRememberedGrant(req, { id: flow.id, signature: f.phone.sign(flow.challenge) });
+  const live = await restored.authorizeRelay({ headers: { origin, cookie: `__Host-notify-relay=${grant.credential}` } });
+  const renewed = await restored.renewGrant(req, { id: grant.renewal.id, signature: f.phone.sign(grant.renewal.challenge) });
+  assert.equal(f.db.metrics.writes, writes, 'Status, reconnect and renewal never slide or write authorization');
+  await f.start();
+  await assert.rejects(restored.renewGrant(req, { id: renewed.renewal.id,
+    signature: f.phone.sign(renewed.renewal.challenge) }), status(503));
+  assert.equal(live.signal.aborted, true);
+});
+
+test('a stale remembered decision cannot commit after takeover and an old cleanup cannot erase a persisted newer push', async t => {
+  const f = await durableFixture(t);
+  await f.authority.decidePair(f.host.credential, { id: f.pending.id, allow: true });
+  const target = { macID: f.macID, deviceID: f.deviceID };
+  const proposal = await f.authority.beginRemember(f.req, { ...target, optIn: true });
+  await f.authority.finishRemember(f.req, { id: proposal.id, signature: f.phone.sign(proposal.challenge) });
+  const replacement = await f.start();
+  await assert.rejects(f.authority.decideRemember(f.host.credential, { id: proposal.id, allow: true }), status(503));
+  assert.equal((await replacement.rememberStatus(f.req, target)).committed, null);
+  const fresh = await replacement.beginRemember(f.req, { ...target, optIn: true });
+  await replacement.finishRemember(f.req, { id: fresh.id, signature: f.phone.sign(fresh.challenge) });
+  await replacement.decideRemember(f.host.credential, { id: fresh.id, allow: true });
+  const input = { ...target, generation: fresh.generation }, req = { headers: { origin } };
+  const initial = await replacement.beginRememberedPush(req, { ...input, token: 'same-token-persisted', registrationGeneration: null });
+  const first = await replacement.finishRememberedPush(req, { id: initial.id, signature: f.phone.sign(initial.challenge) });
+  const account = await replacement.beginPush(f.req, { ...target, token: 'same-token-persisted' });
+  await replacement.finishPush(f.req, { id: account.id, signature: f.phone.sign(account.challenge) });
+  const restored = await f.start();
+  await assert.rejects(restored.beginRememberedPush(req, {
+    ...input, token: null, registrationGeneration: first.registrationGeneration
+  }), status(409));
+  assert.equal((await restored.rememberStatus(f.req, target)).push.enabled, true);
+});
 
 test('push routes persist without grants; failed rotation and removal cannot acknowledge or erase the previous route', async t => {
   const f = await durableFixture(t);

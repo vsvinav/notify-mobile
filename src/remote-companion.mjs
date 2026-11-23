@@ -17,6 +17,16 @@ import { leaseStart, localLease } from '../public/remote-lease.mjs';
 const execute = promisify(execFile);
 const uuid = value => typeof value === 'string' && /^[a-f\d]{8}(-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(value);
 const text = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit && !/[\0-\x1f\x7f]/.test(value);
+const b32 = value => typeof value === 'string' && /^[\w-]{43}$/.test(value) &&
+  Buffer.from(value, 'base64url').toString('base64url') === value;
+const time = value => Number.isSafeInteger(value) && value > 0;
+const shape = (value, keys) => object(value) && Object.keys(value).length === keys.length && keys.every(k => Object.hasOwn(value, k));
+const sameOwner = (a, b) => shape(a, ['issuer', 'subject']) && !!b && a.issuer === b.issuer && a.subject === b.subject;
+const rememberKeys = ['id', 'generation', 'deviceID', 'publicKey', 'name', 'account', 'macID', 'macPublicKey', 'expiresAt', 'authorizationExpiresAt'];
+const nativeProposal = p => p ? { ...p, publicKey: Buffer.from(p.publicKey, 'base64url').toString('base64'),
+  macPublicKey: Buffer.from(p.macPublicKey, 'base64url').toString('base64') } : null;
+const sameProposal = (a, b) => shape(a, rememberKeys) && shape(b, rememberKeys) &&
+  rememberKeys.every(k => k === 'account' ? sameOwner(a.account, b.account) : a[k] === b[k]);
 const hash = key => createHash('sha256').update(Buffer.from(key, 'base64url')).digest('hex');
 const ownerMismatchMessage = 'This account differs from the locally approved owner. Sign in with the original Notify passkey on your phone. If you cannot, turn off Enable internet and choose "Start fresh internet setup" on this Mac. Existing trust was not transferred.';
 const fail = (status, message) => { throw Object.assign(new Error(message), { status }); };
@@ -62,9 +72,10 @@ export async function createRemoteCompanion({ directory, origin, emit,
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '1';
   await privateDirectory(directory);
   const file = join(directory, 'identity.json');
-  let state, writer = Promise.resolve(), auth, signer, signerWork, policyWork;
+  let state, writer = Promise.resolve(), auth, signer, signerWork, policyWork, policyRevision = 0;
   let closed = false, paused = false, polling, pollController, registration, pending, approving, setupID, serverDevices = [];
   let invitationWork, invitationUnavailable = false;
+  let rememberPending, rememberDecision, rememberWork, rememberWindow, rememberRevision = 0;
   let message = 'Waiting for phone sign-in.', fault, enrollmentError;
   const channels = new Map();
   const channelWork = new Set(), lifetime = new AbortController();
@@ -107,9 +118,10 @@ export async function createRemoteCompanion({ directory, origin, emit,
     return next;
   }
   async function updatePolicy(work) {
+    policyRevision++;
     policyWork = work;
     try { await work; }
-    finally { if (policyWork === work) policyWork = undefined; }
+    finally { policyRevision++; if (policyWork === work) policyWork = undefined; }
   }
   const actions = new RemoteActions({
     attention() { if (!genericAttention) publishAttention(true, true); },
@@ -187,11 +199,15 @@ export async function createRemoteCompanion({ directory, origin, emit,
   function status() {
     if (closed) return;
     const devices = state.devices.map(device => ({ id: device.id, name: device.name,
-      online: !!channels.get(device.id)?.handle && !channels.get(device.id).signal.aborted, pushEnabled: false }));
+      publicKey: Buffer.from(device.publicKey, 'base64url').toString('base64'),
+      online: !!channels.get(device.id)?.handle && !channels.get(device.id).signal.aborted, pushEnabled: false,
+      ...(serverDevices.find(d => d.deviceID === device.id && d.publicKey === device.publicKey)?.remembered
+        ? { remembered: serverDevices.find(d => d.deviceID === device.id && d.publicKey === device.publicKey).remembered } : {}) }));
     const active = devices.some(d => d.online);
     emit({ type: 'status', status: {
       state: fault || enrollmentError ? 'error' : paused ? 'paused' : active ? 'connected' : pending ? 'pairing' : 'connecting',
       url: origin, devices, pendingPairingIDs: pending ? [pending.id] : [],
+      rememberPending: nativeProposal(rememberPending),
       ...(setupID && !invitationUnavailable ? { setupURL: `${origin}/#setup=${encodeURIComponent(setupID)}&mac=${state.macID}&key=${state.publicKey}` } : {}),
       ...(message || attentionError ? { message: fault || enrollmentError ? message : attentionError ?? message } : {})
     } });
@@ -255,6 +271,75 @@ export async function createRemoteCompanion({ directory, origin, emit,
     const identity = await verifiedSigner();
     return bytes(await identity.call('sign', { bytes: [...Buffer.from(challenge)] })).toString('base64url');
   }
+  function rememberedFor(device) {
+    if (!state.devices.some(d => d.id === device.id && d.publicKey === device.publicKey)) return undefined;
+    return serverDevices.find(d => d.deviceID === device.id && d.publicKey === device.publicKey)?.remembered;
+  }
+  function validateRememberedStatus(remote) {
+    const hasMetadata = remote.rememberPending != null || remote.devices.some(d => Object.hasOwn(d, 'remembered'));
+    if (hasMetadata && !sameOwner(remote.account, state.owner)) fail(502, 'Remembered phone owner changed.');
+    for (const device of remote.devices) {
+      if (!Object.hasOwn(device, 'remembered')) continue;
+      const r = device.remembered;
+      if (!state.devices.some(d => d.id === device.deviceID && d.publicKey === device.publicKey) ||
+        !shape(r, ['generation', 'authorizationExpiresAt', 'state']) || !b32(r.generation) ||
+        !time(r.authorizationExpiresAt) || !['active', 'revoked', 'expired'].includes(r.state))
+        fail(502, 'Invalid remembered phone authorization.');
+      const previous = serverDevices.find(d => d.deviceID === device.deviceID && d.publicKey === device.publicKey)?.remembered;
+      if (previous?.generation === r.generation && (previous.authorizationExpiresAt !== r.authorizationExpiresAt ||
+        (previous.state !== 'active' && r.state === 'active')))
+        fail(502, 'Remembered authorization changed without a new generation.');
+    }
+    const p = remote.rememberPending;
+    if (p != null && (!shape(p, rememberKeys) || !b32(p.id) || !b32(p.generation) ||
+      p.macID !== state.macID || p.macPublicKey !== state.publicKey || !sameOwner(p.account, state.owner) ||
+      !remote.devices.some(d => d.deviceID === p.deviceID && d.publicKey === p.publicKey) ||
+      !state.devices.some(d => d.id === p.deviceID && d.publicKey === p.publicKey) ||
+      !text(p.name, 100) || !time(p.expiresAt) || !time(p.authorizationExpiresAt) ||
+      p.authorizationExpiresAt <= p.expiresAt || p.authorizationExpiresAt - p.expiresAt > 30 * 86400000))
+      fail(502, 'Invalid remembered phone proposal.');
+    if (p && rememberWindow?.id !== p.id)
+      rememberWindow = { id: p.id, wallEnd: Date.now() + 180000, deadline: performance.now() + 180000 };
+    return p && p.expiresAt > Date.now() && Date.now() < rememberWindow.wallEnd && performance.now() < rememberWindow.deadline
+      ? Object.freeze({ ...p, account: Object.freeze({ ...p.account }) }) : undefined;
+  }
+  function validateProof(raw, channel, flow, previous) {
+    const r = rememberedFor(channel.device);
+    let proof;
+    try { proof = JSON.parse(raw); } catch { fail(502, 'Invalid internet authorization challenge JSON.'); }
+    const remembered = previous ? previous.scope === 'remembered'
+      : proof?.scope === 'remembered' || proof?.purpose?.startsWith('remember-');
+    if (!remembered) {
+      if (proof && (proof.scope !== undefined || proof.generation !== undefined ||
+        proof.authorizationExpiresAt !== undefined)) fail(502, 'Unexpected account authorization scope.');
+      if (!shape(proof, ['purpose', 'origin', 'role', 'macID', 'deviceID', 'challenge', ...(previous ? ['connectionID'] : [])]) ||
+        proof.purpose !== (previous ? 'renew' : 'grant') || proof.origin !== origin || proof.role !== 'mac' ||
+        proof.macID !== state.macID || proof.deviceID !== channel.device.id || !b32(proof.challenge) ||
+        (previous && proof.connectionID !== previous.renewal.id))
+        fail(502, 'Invalid account authorization challenge.');
+      return 'account';
+    }
+    const expected = previous ?? r;
+    const keys = ['purpose', 'origin', 'scope', 'operation', 'version', 'account', 'macID', 'macPublicKey',
+      'deviceID', 'publicKey', 'generation', 'authorizationExpiresAt', 'challengeExpiresAt', 'challenge', 'role',
+      ...(previous ? ['connectionID'] : [])];
+    if (!shape(proof, keys) || JSON.stringify(proof) !== raw ||
+      !r || r.state !== 'active' || r.generation !== expected.generation ||
+      r.authorizationExpiresAt !== expected.authorizationExpiresAt ||
+      proof.purpose !== (previous ? 'remember-renew' : 'remember-mac-grant') ||
+      proof.operation !== (previous ? 'renew' : 'grant') || proof.version !== 1 || proof.scope !== 'remembered' ||
+      proof.origin !== origin || !sameOwner(proof.account, state.owner) ||
+      proof.macID !== state.macID || proof.macPublicKey !== state.publicKey ||
+      proof.deviceID !== channel.device.id || proof.publicKey !== channel.device.publicKey || proof.role !== 'mac' ||
+      proof.generation !== expected.generation || proof.authorizationExpiresAt !== expected.authorizationExpiresAt ||
+      !b32(proof.challenge) || !time(proof.challengeExpiresAt) ||
+      proof.challengeExpiresAt !== flow.expiresAt || proof.challengeExpiresAt > proof.authorizationExpiresAt ||
+      (!previous && proof.challengeExpiresAt <= Date.now()) ||
+      proof.authorizationExpiresAt <= Date.now() ||
+      (previous && proof.connectionID !== previous.renewal.id))
+      fail(502, 'Remembered Mac authorization context changed.');
+    return 'remembered';
+  }
   function validateGrant(grant, channel, id, started, previous) {
     const renewal = grant?.renewal;
     if (!object(grant) || grant.role !== 'mac' || grant.macID !== state.macID || grant.deviceID !== channel.device.id ||
@@ -264,6 +349,15 @@ export async function createRemoteCompanion({ directory, origin, emit,
       renewal.challenge === previous?.renewal.challenge ||
       (!grant.approved && channel.enrollmentExpiresAt && grant.expiresAt > channel.enrollmentExpiresAt))
       fail(502, 'Invalid Mac relay grant.');
+    const scope = grant.scope ?? 'account';
+    if (!['account', 'remembered'].includes(scope) || scope !== (previous?.scope ?? channel.scope ?? 'account') ||
+      (scope === 'remembered' && (!grant.approved || !time(grant.validForMs) || grant.validForMs > 30000 ||
+        grant.generation !== channel.remembered?.generation ||
+        grant.authorizationExpiresAt !== channel.remembered?.authorizationExpiresAt ||
+        grant.expiresAt > grant.authorizationExpiresAt)) ||
+      (scope === 'account' && (Object.hasOwn(grant, 'generation') || Object.hasOwn(grant, 'authorizationExpiresAt'))))
+      fail(502, 'Mac relay authorization scope changed.');
+    validateProof(renewal.challenge, channel, grant, { ...grant, scope });
     return localLease(grant, started);
   }
   function register(signal) {
@@ -321,6 +415,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
       try {
         if (!unexpired()) fail(403, 'Mac relay authorization expired.');
         const { id, challenge } = grant.renewal;
+        validateProof(challenge, channel, grant, grant);
         const signature = await sign(challenge);
         if (!current()) return;
         const started = leaseStart();
@@ -334,8 +429,10 @@ export async function createRemoteCompanion({ directory, origin, emit,
         channel.expiresAt = timing.expiresAt;
         channel.deadline = timing.deadline;
         grant = next;
-      } catch {
+      } catch (error) {
         // The service may have consumed the nonce even when its reply was lost.
+        if (grant?.scope === 'remembered' && !closed && !paused && !fault)
+          message = `Remembered connection stopped; no proof was replayed. ${text(error.message, 350) ? error.message : 'Authorization was not confirmed.'}`;
         controller.abort();
       }
     }
@@ -348,9 +445,15 @@ export async function createRemoteCompanion({ directory, origin, emit,
     }
     channel.signal.addEventListener('abort', () => clearTimeout(renewalTimer), { once: true });
     try {
+      const challengeStart = leaseStart();
       const challenge = await api('grant/begin', { role: 'mac', deviceID: device.id }, state.credential, channel.signal);
       if (typeof challenge.id !== 'string' || !/^[\w-]{43}$/.test(challenge.id))
         fail(502, 'Invalid Mac authorization challenge.');
+      channel.scope = validateProof(challenge.challenge, channel, challenge);
+      if (channel.scope === 'remembered') {
+        localLease({ expiresAt: challenge.expiresAt, validForMs: 30000 }, challengeStart);
+        channel.remembered = { ...rememberedFor(device) };
+      }
       const signature = await sign(challenge.challenge);
       const started = leaseStart();
       grant = await api('grant/finish', { id: challenge.id, signature }, undefined, channel.signal);
@@ -402,7 +505,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
           }
           if (!channel.handle || !auth) fail(403, 'Approve this phone locally before accessing sessions.');
           if (!uuid(value.id) || typeof value.epoch !== 'string' || !object(value.payload) ||
-            !['state', 'reply', 'workspace', 'control'].includes(value.payload.path) || !object(value.payload.data) ||
+            !['state', 'reply', 'workspace', 'control', 'panel', 'panel_action'].includes(value.payload.path) || !object(value.payload.data) ||
             Object.keys(value).some(k => !['id', 'epoch', 'payload'].includes(k)) ||
             Object.keys(value.payload).some(k => !['path', 'data'].includes(k))) fail(400, 'Invalid encrypted action envelope.');
           const payload = Buffer.from(JSON.stringify(value.payload));
@@ -423,7 +526,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
               id: device.id, name: device.name, expires: channel.expiresAt
             }, channel.signal);
           // Read polling cannot exhaust the mutation replay ledger.
-          const operation = ['reply', 'control'].includes(value.payload.path)
+          const operation = ['reply', 'control', 'panel_action'].includes(value.payload.path)
             ? auth.dispatch(channel.handle, { id: value.id, epoch: value.epoch, payload }, invoke)
             : invoke();
           void operation
@@ -464,6 +567,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
   async function poll(signal) {
     let credential;
     try {
+      const revision = rememberRevision, localPolicy = policyRevision;
       if (!state.credential) await register(signal);
       credential = state.credential;
       const remote = await api('mac/status', {}, credential, signal);
@@ -473,9 +577,12 @@ export async function createRemoteCompanion({ directory, origin, emit,
         !remote.devices.every(d => uuid(d.deviceID) && validKey(d.publicKey) && text(d.name, 100)))
         fail(502, 'Invalid registered-phone state.');
       while (policyWork) await policyWork;
+      while (rememberWork) await rememberWork;
       signal.throwIfAborted();
-      if (credential !== state.credential) return;
+      if (credential !== state.credential || revision !== rememberRevision || localPolicy !== policyRevision) return;
+      rememberPending = validateRememberedStatus(remote);
       serverDevices = remote.devices;
+      reconcileRememberDecision();
       if (auth) auth.enable();
       if (remote.pending !== null) {
         const p = remote.pending;
@@ -488,6 +595,12 @@ export async function createRemoteCompanion({ directory, origin, emit,
       } else pending = undefined;
       setupID = state.setupID ?? undefined;
       for (const channel of channels.values()) {
+        if (channel.scope === 'remembered') {
+          const r = rememberedFor(channel.device);
+          if (!r || r.state !== 'active' || r.generation !== channel.remembered?.generation ||
+            r.authorizationExpiresAt !== channel.remembered?.authorizationExpiresAt ||
+            r.authorizationExpiresAt <= Date.now()) channel.controller.abort();
+        }
         if (channel.candidateID && pending?.id !== channel.candidateID &&
           !serverDevices.some(d => d.deviceID === channel.device.id && d.publicKey === channel.device.publicKey)) channel.controller.abort();
       }
@@ -507,7 +620,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
         message = error.status === 401
           ? 'This Mac pairing registration expired or is no longer accepted. Choose "Pair an internet device" on this Mac for a fresh invitation. Signing in again on the phone cannot restore the Mac registration.'
           : error.message;
-        setupID = undefined; pending = undefined; serverDevices = [];
+        setupID = undefined; pending = undefined; rememberPending = undefined; serverDevices = [];
         auth?.disable();
         for (const channel of channels.values()) channel.controller.abort();
         status();
@@ -554,6 +667,65 @@ export async function createRemoteCompanion({ directory, origin, emit,
       status();
     }
   }
+  function rememberResult(decision, outcome, message) {
+    if (closed) return;
+    decision.outcome = outcome;
+    emit({ type: 'remember-result', requestID: decision.requestID, proposalID: decision.proposal.id,
+      generation: decision.proposal.generation, authorizationExpiresAt: decision.proposal.authorizationExpiresAt,
+      outcome, ...(message ? { message: message.slice(0, 500) } : {}) });
+  }
+  function reconcileRememberDecision() {
+    const d = rememberDecision;
+    if (!d || d.outcome !== 'unknown' || !d.allow) return;
+    const r = serverDevices.find(v => v.deviceID === d.proposal.deviceID &&
+      Buffer.from(v.publicKey, 'base64url').toString('base64') === d.proposal.publicKey)?.remembered;
+    if (r?.generation === d.proposal.generation && r.authorizationExpiresAt === d.proposal.authorizationExpiresAt) {
+      rememberResult(d, r.state === 'active' && r.authorizationExpiresAt > Date.now() ? 'approved' : 'error',
+        r.state === 'active' ? undefined : 'This remembered authorization is no longer active.');
+    }
+  }
+  async function decideRemember(input) {
+    const decision = { requestID: input.requestID, proposal: input.proposal, allow: input.allow };
+    let dispatched = false;
+    try {
+      if (!shape(input, ['type', 'requestID', 'proposal', 'allow']) || !uuid(input.requestID) ||
+        typeof input.allow !== 'boolean' || !sameProposal(input.proposal, nativeProposal(rememberPending)) ||
+        !rememberPending || rememberPending.expiresAt <= Date.now() || paused || enrollmentError ||
+        rememberDecision?.proposal.id === input.proposal.id)
+        fail(409, 'The remembered-phone prompt changed, expired, or was already sent. Check its full key and current status.');
+      const credential = state.credential;
+      // Re-read before dispatch: a poll snapshot is not authority for a later click.
+      const remote = await api('mac/status', {}, credential);
+      const current = validateRememberedStatus(remote);
+      if (closed || paused || credential !== state.credential || remote.macID !== state.macID ||
+        !sameProposal(input.proposal, nativeProposal(current)))
+        fail(409, 'The remembered-phone prompt changed. Nothing was sent.');
+      rememberDecision = decision;
+      rememberRevision++;
+      dispatched = true;
+      const result = await api('mac/remember/decision', { id: current.id, allow: input.allow }, credential);
+      if (!shape(result, ['id', 'generation', 'approved', 'authorizationExpiresAt']) ||
+        result.id !== current.id || result.generation !== current.generation ||
+        result.authorizationExpiresAt !== current.authorizationExpiresAt || result.approved !== input.allow)
+        fail(502, 'The remembered-phone response did not confirm this exact decision.');
+      if (closed || credential !== state.credential || !state.devices.some(d => d.id === current.deviceID && d.publicKey === current.publicKey))
+        fail(409, 'The locally approved phone changed while the decision was in progress.');
+      if (input.allow) {
+        serverDevices = serverDevices.map(d => d.deviceID === current.deviceID && d.publicKey === current.publicKey
+          ? { ...d, remembered: { generation: current.generation, authorizationExpiresAt: current.authorizationExpiresAt, state: 'active' } } : d);
+      }
+      rememberResult(decision, input.allow ? 'approved' : 'denied');
+      if (rememberPending?.id === current.id && rememberPending.generation === current.generation) rememberPending = undefined;
+    } catch (error) {
+      if (uuid(input.requestID) && shape(input.proposal, rememberKeys))
+        rememberResult(decision, dispatched ? 'unknown' : 'error',
+          dispatched ? `Decision not confirmed. Checking status; it will not be sent again. ${error.message}` : error.message);
+      else fail(400, 'Invalid remembered-phone decision.');
+    } finally {
+      if (dispatched) rememberRevision++;
+    }
+    status();
+  }
   async function command(input) {
     if (!object(input) || closed || fault) fail(503, 'Internet helper is unavailable.');
     if (input.type === 'offline') {
@@ -575,6 +747,12 @@ export async function createRemoteCompanion({ directory, origin, emit,
     }
     if (input.type === 'invite') {
       return invite();
+    }
+    if (input.type === 'remember-decision') {
+      if (rememberWork) fail(409, 'A remembered-phone decision is already being checked.');
+      rememberWork = decideRemember(input);
+      try { await rememberWork; } finally { rememberWork = undefined; }
+      return;
     }
     if (input.type === 'pair') {
       if (!pending || pending.id !== input.id || pending.expiresAt <= Date.now()) fail(409, 'Phone pairing expired.');
@@ -605,6 +783,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
     if (input.type === 'revoke') {
       if (!uuid(input.id) || !auth) fail(400, 'Invalid phone revocation.');
       await updatePolicy(auth.revokeDevice(input.id));
+      if (rememberPending?.deviceID === input.id) rememberPending = undefined;
       channels.get(input.id)?.controller.abort();
       await api('mac/revoke', { deviceID: input.id }, state.credential);
       status(); return;
@@ -625,7 +804,7 @@ export async function createRemoteCompanion({ directory, origin, emit,
     for (const channel of channels.values()) channel.controller.abort();
     await signer.close();
     await polling;
-    await Promise.allSettled([invitationWork]);
+    await Promise.allSettled([invitationWork, rememberWork]);
     await attentionWork;
     await Promise.all(channelWork);
     await writer;

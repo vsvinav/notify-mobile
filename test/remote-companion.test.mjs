@@ -5,6 +5,7 @@ import { createECDH, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { permission } from './fixtures.mjs';
+import http from 'node:http';
 import https from 'node:https';
 import { once } from 'node:events';
 import { execFile } from 'node:child_process';
@@ -13,6 +14,10 @@ import { certificates } from '../src/certificates.mjs';
 import { createRemoteAuthority } from '../src/remote-authority.mjs';
 
 const key = () => { const ecdh = createECDH('prime256v1'); ecdh.generateKeys(); return ecdh.getPublicKey().toString('base64url'); };
+const accountChallenge = (origin, macID, deviceID, connectionID, nonce = 0) => JSON.stringify({
+  purpose: connectionID ? 'renew' : 'grant', origin, role: 'mac', macID, deviceID,
+  ...(connectionID ? { connectionID } : {}), challenge: Buffer.alloc(32, nonce).toString('base64url')
+});
 
 test('generic attention reaches an enrolled background phone without a live relay', async t => {
   const root = join(process.cwd(), '.test-data');
@@ -629,10 +634,10 @@ test('helper requires full-key local approval and native ACK (injected crypto fi
       macID, pending: decisions ? null : pending,
       devices: decisions ? [{ deviceID, publicKey: phoneKey, name: 'Phone' }] : []
     });
-    if (path.endsWith('/grant/begin')) return Response.json({ id: 'g'.repeat(43), challenge: 'fixture challenge' });
+    if (path.endsWith('/grant/begin')) return Response.json({ id: 'g'.repeat(43), challenge: accountChallenge(origin, macID, deviceID) });
     if (path.endsWith('/grant/finish')) return Response.json({
       role: 'mac', macID, deviceID, approved: !!decisions, expiresAt: Date.now() + 29000, credential: 'g'.repeat(43),
-      renewal: { id: 'g'.repeat(43), challenge: 'fixture renewal' }
+      renewal: { id: 'g'.repeat(43), challenge: accountChallenge(origin, macID, deviceID, 'g'.repeat(43)) }
     });
 
     if (path.endsWith('/mac/decision')) {
@@ -718,7 +723,7 @@ async function renewalFixture(t, { pendingApproval = false, renew, status, finis
   }), { mode: 0o600 });
   let receiver, relaySignal, closeRelay, approved = !pendingApproval, revoked = false;
   const grant = () => ({ role: 'mac', macID, deviceID, approved, expiresAt: Date.now() + 30000,
-    credential: 'r'.repeat(43), renewal: { id, challenge: `renew-${requests.length}` } });
+    credential: 'r'.repeat(43), renewal: { id, challenge: accountChallenge(origin, macID, deviceID, id, requests.length) } });
   const helper = await createRemoteCompanion({
     directory, origin, emit: event => events.push(event),
     cryptoProcess: () => wrapCrypto({
@@ -740,7 +745,7 @@ async function renewalFixture(t, { pendingApproval = false, renew, status, finis
           devices: approved ? [{ deviceID, publicKey: phoneKey, name: 'Phone' }] : [] };
         return status ? status(value, options) : Response.json(value);
       }
-      if (path.endsWith('/grant/begin')) return Response.json({ id, challenge: 'initial' });
+      if (path.endsWith('/grant/begin')) return Response.json({ id, challenge: accountChallenge(origin, macID, deviceID, undefined, requests.length) });
       if (path.endsWith('/grant/finish')) return finish ? await finish(grant(), options) : Response.json(grant());
       if (path.endsWith('/grant/renew')) {
         assert.equal(options.headers.Authorization, `Bearer ${'c'.repeat(43)}`);
@@ -1147,4 +1152,47 @@ test('companion close aborts and drains outstanding renewal HTTP without late le
   const count = f.requests.length;
   t.mock.timers.tick(60000); await settle();
   assert.equal(f.requests.length, count);
+});
+
+test('panel_action is replay-guarded by the mutation ledger while panel reads are not', async t => {
+  const token = 'P'.repeat(43), calls = [];
+  const server = http.createServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    calls.push(request.url);
+    response.writeHead(request.headers.authorization === `Bearer ${token}` ? 200 : 401, { 'Content-Type': 'application/json' })
+      .end(JSON.stringify(request.url === '/api/panel' ? { version: 1, tabs: [] } : { ok: true, sent: true, wasBusy: false }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const root = join(process.cwd(), '.test-data');
+  await mkdir(root, { recursive: true });
+  const directory = await mkdtemp(join(root, 'panel-companion-'));
+  const file = join(directory, 'panel.json');
+  await writeFile(file, JSON.stringify({ version: 1, port: server.address().port, token }), { mode: 0o600 });
+  const previous = process.env.NOTIFY_PANEL_FILE;
+  process.env.NOTIFY_PANEL_FILE = file;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.NOTIFY_PANEL_FILE; else process.env.NOTIFY_PANEL_FILE = previous;
+    server.close(); await rm(directory, { recursive: true });
+  });
+  const f = await renewalFixture(t);
+  const epoch = f.frames.find(frame => frame.type === 'ready').epoch;
+  const reply = async id => { await until(() => f.frames.some(frame => frame.id === id)); return f.frames.findLast(frame => frame.id === id); };
+  const read = randomUUID();
+  await f.receive({ id: read, epoch, payload: { path: 'panel', data: {} } });
+  assert.deepEqual((await reply(read)).data, { available: true, panel: { version: 1, tabs: [] } });
+  f.frames.length = 0;
+  await f.receive({ id: read, epoch, payload: { path: 'panel', data: {} } });
+  assert.equal((await reply(read)).status, 200, 'Reads bypass the replay ledger');
+  const id = randomUUID(), payload = { path: 'panel_action',
+    data: { actionId: 'status:APA-1', preview: false, confirmationToken: 'C'.repeat(43) } };
+  await f.receive({ id, epoch, payload });
+  assert.deepEqual(await reply(id), { id, status: 200, data: { ok: true, sent: true, wasBusy: false } });
+  f.frames.length = 0;
+  await f.receive({ id, epoch, payload });
+  const replay = await reply(id);
+  assert.equal(replay.status, 409);
+  assert.match(replay.data.error, /already dispatched/);
+  assert.equal(calls.filter(url => url === '/api/panel/action').length, 1);
 });
