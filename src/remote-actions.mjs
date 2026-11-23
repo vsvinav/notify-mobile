@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { Workspace } from './workspace.mjs';
-import { object, validSnapshot, validReply } from './validation.mjs';
+import { object, validSnapshot, validReply, attentionProjection } from './validation.mjs';
+import { readPanel, panelAction } from './panel-provider.mjs';
 
 const fail = (status, message) => { throw Object.assign(new Error(message), { status }); };
 const keyOf = item => `${item.sessionID}\0${item.request.id}\0${item.ticket}`;
@@ -11,6 +12,7 @@ export class RemoteActions {
   #emit; #now; #workspace; #requests = []; #total = 0; #updated = -Infinity;
   #pending = new Map(); #blocked = new Set(); #ackTimeout;
   #seen = new Set(); #attention;
+  #attentionProjection;
   constructor({ emit, devices, now = Date.now, ackTimeout = 20000, attention = () => {} }) {
     this.#emit = emit; this.#now = now; this.#ackTimeout = ackTimeout;
     this.#attention = attention;
@@ -39,6 +41,7 @@ export class RemoteActions {
       this.close(); fail(503, 'Native snapshot is invalid. Internet actions are paused.');
     }
     this.#requests = message.requests; this.#total = message.total; this.#updated = this.#now();
+    this.#attentionProjection = attentionProjection(message.attention);
     const keys = new Set(this.#requests.map(keyOf));
     const newlyWaiting = this.#requests.some(item => !item.sending && !this.#seen.has(keyOf(item)));
     this.#seen = keys;
@@ -53,7 +56,8 @@ export class RemoteActions {
     if (path === 'state') return { status: 200, data: {
       paired: true, device: { id: device.id, name: device.name }, connected: fresh,
       requests: fresh ? this.#requests.map(item => ({ ...item, sending: item.sending || this.#blocked.has(keyOf(item)) })) : [],
-      total: fresh ? this.#total : 0, lease: 12000, pushEnabled: false
+      total: fresh ? this.#total : 0, lease: 12000, pushEnabled: false,
+      ...(fresh && this.#attentionProjection ? { attention: this.#attentionProjection } : {})
     } };
     if (path === 'workspace') {
       const response = new EventEmitter();
@@ -62,6 +66,11 @@ export class RemoteActions {
       try { return await this.#workspace.read(input, device, response); }
       finally { signal?.removeEventListener('abort', abort); }
     }
+    if (path === 'panel') {
+      if (Object.keys(input).length) fail(400, 'Invalid panel request.');
+      return readPanel({ signal });
+    }
+    if (path === 'panel_action') return panelAction(input, { signal });
     if (path === 'control') {
       try { return await this.#workspace.control(input, device); }
       catch (error) {
@@ -99,6 +108,7 @@ export class RemoteActions {
   }
   close() {
     this.#updated = -Infinity; this.#requests = []; this.#total = 0;
+    this.#attentionProjection = undefined;
     this.#workspace.invalidate('Internet connection lost. Pending control outcomes are unknown.');
     for (const [id] of this.#pending) this.#finish(id, 503, {
       ok: false, error: 'Internet connection lost. Reply outcome is unknown.'

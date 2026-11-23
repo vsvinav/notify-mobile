@@ -3,6 +3,21 @@ const text = (value, max = 65535) => typeof value === 'string' && value.length <
 const nonempty = (value, max) => text(value, max) && value.length > 0;
 export { object };
 
+export function attentionProjection(value) {
+  const id = v => nonempty(v, 128) && !v.includes('\0');
+  if (!object(value) || value.version !== 1 ||
+    typeof value.epoch !== 'string' || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value.epoch) ||
+    !Number.isSafeInteger(value.revision) || value.revision < 1 ||
+    !Number.isInteger(value.additionalCount) || value.additionalCount < 0 || value.additionalCount > 256) return;
+  const c = value.current;
+  if (c === null ? value.additionalCount !== 0 :
+    !object(c) || !id(c.sessionID) || !id(c.requestID) || !text(c.sessionName, 256) ||
+    !nonempty(c.requestTitle, 300) || c.sessionName.includes('\0') || c.requestTitle.includes('\0')) return;
+  return { version: 1, epoch: value.epoch, revision: value.revision,
+    current: c === null ? null : { sessionID: c.sessionID, requestID: c.requestID,
+      sessionName: c.sessionName, requestTitle: c.requestTitle }, additionalCount: value.additionalCount };
+}
+
 export function validSnapshot(message) {
   if (!Array.isArray(message.requests) || message.requests.length > 256 ||
     !Number.isSafeInteger(message.total) || message.total !== message.requests.length) return false;
