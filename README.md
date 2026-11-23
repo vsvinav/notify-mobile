@@ -166,8 +166,9 @@ Mac sleep/wake. No conversation or command data is added to push. Android 0.3.1
 also accepts foreground alerts and removes a redundant client cooldown.
 An installed-build, real-internet locked-phone check confirmed delivery and
 physical vibration; sound and other device/network configurations remain
-unverified. Internet must be explicitly re-enabled after Notify launches, and
-the Mac must be awake and online. These are native-helper/client changes, not a
+unverified. Internet is initially Off; Mac build 14 and later remembers explicit
+On/Off across restarts. Enable it once after upgrading from an older Mac build.
+The Mac must be awake and online. These are native-helper/client changes, not a
 requirement to redeploy the hosted service.
 
 **Native Android source preview:** matching updated Android and Mac builds can
